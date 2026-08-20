@@ -1,0 +1,137 @@
+services:
+  mongo-keyfile-init:
+    image: alpine:3.21
+    restart: "no"
+    environment:
+      MONGO_REPLICA_KEY: ${MONGO_REPLICA_KEY:?Set MONGO_REPLICA_KEY in .env.production}
+    command: >-
+      sh -c "umask 077 && printf '%s' \"$$MONGO_REPLICA_KEY\" > /keyfile/mongo-keyfile
+      && chown 999:999 /keyfile/mongo-keyfile && chmod 400 /keyfile/mongo-keyfile"
+    volumes:
+      - mongo_keyfile:/keyfile
+
+  mongodb:
+    image: mongo:7.0
+    restart: unless-stopped
+    depends_on:
+      mongo-keyfile-init:
+        condition: service_completed_successfully
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--auth", "--keyFile", "/keyfile/mongo-keyfile"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in .env.production}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-money_lending_production}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-money_lending_app}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?Set MONGO_APP_PASSWORD in .env.production}
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo_data:/data/db
+      - mongo_keyfile:/keyfile:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --host localhost --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'quit(db.adminCommand({ping:1}).ok ? 0 : 2)' || exit 1"]
+      interval: 15s
+      timeout: 15s
+      retries: 20
+      start_period: 30s
+
+  mongo-app-user-init:
+    image: mongo:7.0
+    restart: "no"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in .env.production}
+      MONGO_DATABASE: ${MONGO_DATABASE:-money_lending_production}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-money_lending_app}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?Set MONGO_APP_PASSWORD in .env.production}
+    entrypoint: ["bash", "-c"]
+    command:
+      - >-
+        mongosh --host mongodb --username "$$MONGO_ROOT_USERNAME" --password "$$MONGO_ROOT_PASSWORD"
+        --authenticationDatabase admin --eval
+        'const appDb=db.getSiblingDB(process.env.MONGO_DATABASE); if (!appDb.getUser(process.env.MONGO_APP_USERNAME)) { appDb.createUser({user:process.env.MONGO_APP_USERNAME,pwd:process.env.MONGO_APP_PASSWORD,roles:[{role:"readWrite",db:process.env.MONGO_DATABASE}]}) }'
+
+  mongo-replica-init:
+    image: mongo:7.0
+    restart: "no"
+    depends_on:
+      mongo-app-user-init:
+        condition: service_completed_successfully
+    environment:
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Set MONGO_ROOT_PASSWORD in .env.production}
+    entrypoint: ["bash", "-c"]
+    command:
+      - >-
+        mongosh --host mongodb --username "$$MONGO_ROOT_USERNAME" --password "$$MONGO_ROOT_PASSWORD"
+        --authenticationDatabase admin --eval
+        'try { rs.status().ok } catch (e) { rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]}) }'
+
+  backend:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - server/.env
+    environment:
+      APP_ENV: production
+      MONGO_ENABLED: "true"
+      ALLOW_MEMORY_FALLBACK: "false"
+      MONGO_HOST: mongodb
+      MONGO_DB: ${MONGO_DATABASE:-money_lending_production}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:?Set MONGO_APP_USERNAME in .env.production}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?Set MONGO_APP_PASSWORD in .env.production}
+      BACKUP_DIR: /var/lib/money-lending/backups
+      AUDIT_ARCHIVE_DIR: /var/lib/money-lending/audit-archive
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      mongo-app-user-init:
+        condition: service_completed_successfully
+      mongo-replica-init:
+        condition: service_completed_successfully
+    expose:
+      - "8000"
+    volumes:
+      - backup_data:/var/lib/money-lending/backups
+      - audit_archive:/var/lib/money-lending/audit-archive
+    stop_grace_period: 30s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    restart: unless-stopped
+    expose:
+      - "80"
+
+  gateway:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    ports:
+      - "${APP_HTTP_BIND:-127.0.0.1}:${APP_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./infra/gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./infra/gateway/maintenance.html:/usr/share/nginx/html/maintenance.html:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/gateway-health || exit 1"]
+      interval: 20s
+      timeout: 4s
+      start_period: 10s
+      retries: 4
+
+volumes:
+  mongo_data:
+  mongo_keyfile:
+  backup_data:
+  audit_archive:

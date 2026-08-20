@@ -1,0 +1,20 @@
+services:
+  mongodb:
+    environment:
+      MONGO_INITDB_DATABASE: ${STAGING_MONGO_DATABASE:-money_lending_staging}
+    ports:
+      - "127.0.0.1:27018:27017"
+
+  mongo-app-user-init:
+    environment:
+      MONGO_DATABASE: ${STAGING_MONGO_DATABASE:-money_lending_staging}
+
+  backend:
+    environment:
+      APP_ENV: staging
+      MONGO_DB: ${STAGING_MONGO_DATABASE:-money_lending_staging}
+      CORS_ORIGINS: ${STAGING_CORS_ORIGINS:-http://127.0.0.1:8081}
+
+  gateway:
+    ports:
+      - "127.0.0.1:${STAGING_HTTP_PORT:-8081}:80"

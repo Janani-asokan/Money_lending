@@ -1,0 +1,13 @@
+.git/
+.env*
+server/.env
+client/node_modules/
+client/dist/
+client/dist-prod/
+server/.venv/
+server/node_modules/
+work/
+backups/
+audit-archive/
+**/__pycache__/
+*.pyc
