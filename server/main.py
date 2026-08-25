@@ -157,10 +157,15 @@ def validate_production_config() -> None:
         problems.append("ALLOW_MEMORY_FALLBACK must be false")
     if not MONGO_ENABLED:
         problems.append("MONGO_ENABLED must be true")
-    if "@" not in MONGO_URL or "authSource=" not in MONGO_URL:
-        problems.append("MONGO_URL must use an authenticated database user and authSource")
-    if "replicaSet=" not in MONGO_URL:
-        problems.append("MONGO_URL must connect to a replica set")
+    mongo_srv = MONGO_URL.startswith("mongodb+srv://")
+    if "@" not in MONGO_URL:
+        problems.append("MONGO_URL must use an authenticated database user")
+    if not mongo_srv and "authSource=" not in MONGO_URL:
+        problems.append("non-SRV MONGO_URL must specify authSource")
+    # mongodb+srv discovers the Atlas replica set through DNS. A standard
+    # mongodb:// URL must identify the replica set explicitly.
+    if not mongo_srv and "replicaSet=" not in MONGO_URL:
+        problems.append("non-SRV MONGO_URL must specify replicaSet")
     if "w=majority" not in MONGO_URL or "journal=true" not in MONGO_URL:
         problems.append("MONGO_URL must require majority and journaled writes")
     if any(origin == "*" for origin in CORS_ORIGINS):

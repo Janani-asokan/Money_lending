@@ -9,6 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def configure_mongo_url() -> None:
+    # Managed providers such as MongoDB Atlas supply the complete connection
+    # string. Preserve it instead of rebuilding a local Docker-only URL.
+    if os.getenv("MONGO_URL", "").strip():
+        return
     username = os.environ.pop("MONGO_APP_USERNAME", "")
     password = os.environ.pop("MONGO_APP_PASSWORD", "")
     database = os.getenv("MONGO_DB", "money_lending_production")
@@ -26,7 +30,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "server.main:app",
         host="0.0.0.0",
-        port=8000,
+        port=int(os.getenv("PORT", "8000")),
         proxy_headers=True,
         forwarded_allow_ips="*",
         access_log=True,
