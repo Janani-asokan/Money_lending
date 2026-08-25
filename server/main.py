@@ -1258,7 +1258,15 @@ async def shutdown() -> None:
 
 def set_auth_cookies(response: Response, request: Request, access_token: str, refresh_token: str) -> None:
     loopback = request.url.hostname in {"127.0.0.1", "localhost", "::1"}
-    common = {"httponly": True, "secure": COOKIE_SECURE and not loopback, "samesite": "strict", "path": "/"}
+    secure_cookie = COOKIE_SECURE and not loopback
+    # Render hosts the static frontend and API on separate HTTPS origins.
+    # Cross-origin credentialed requests require SameSite=None + Secure.
+    common = {
+        "httponly": True,
+        "secure": secure_cookie,
+        "samesite": "none" if secure_cookie else "lax",
+        "path": "/",
+    }
     response.set_cookie(ACCESS_COOKIE, access_token, max_age=ACCESS_TOKEN_MINUTES * 60, **common)
     response.set_cookie(REFRESH_COOKIE, refresh_token, max_age=REFRESH_TOKEN_DAYS * 86400, **common)
 
