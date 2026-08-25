@@ -1012,6 +1012,35 @@ async def seed_data() -> None:
     global STORE
     existing = await find_many("users")
     if existing:
+        # Keep the production owner aligned with the password managed by the
+        # hosting platform. The keyed fingerprint avoids storing the password
+        # itself and prevents re-hashing it on every restart.
+        if APP_ENV == "production":
+            admin_password = os.getenv("INITIAL_ADMIN_PASSWORD", "")
+            admin_username = os.getenv("INITIAL_ADMIN_USERNAME", "owner")
+            if len(admin_password) < 12:
+                raise RuntimeError("INITIAL_ADMIN_PASSWORD (12+ characters) is required for production startup")
+            if USE_MEMORY:
+                raise RuntimeError("Production owner synchronization requires MongoDB")
+            owner = await db.users.find_one({"username": admin_username, "role": "owner"})
+            if not owner:
+                raise RuntimeError(f"Owner account '{admin_username}' was not found")
+            password_fingerprint = hmac.new(
+                APP_SECRET_KEY.encode(), admin_password.encode(), hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(owner.get("initial_password_fingerprint", ""), password_fingerprint):
+                await db.users.update_one(
+                    {"_id": owner["_id"]},
+                    {"$set": {
+                        "password_hash": pwd_context.hash(admin_password),
+                        "initial_password_fingerprint": password_fingerprint,
+                        "active": True,
+                        "must_change_password": True,
+                        "password_synced_at": iso(now()),
+                    }},
+                )
+                # Existing sessions should not survive an administrative password reset.
+                await db.auth_sessions.delete_many({"user_id": owner["id"]})
         return
     STORE = {name: [] for name in [
         "users", "auth_sessions", "areas", "customers", "loans", "payments", "audit_logs", "overdue_alerts", "backups",
@@ -1031,7 +1060,11 @@ async def seed_data() -> None:
             "id": "USR-001", "username": os.getenv("INITIAL_ADMIN_USERNAME", "owner"),
             "name": os.getenv("INITIAL_ADMIN_NAME", "Owner"), "email": os.getenv("INITIAL_ADMIN_EMAIL", ""),
             "role": "owner", "area": AREAS[0]["code"], "active": True,
-            "password_hash": pwd_context.hash(admin_password), "must_change_password": True,
+            "password_hash": pwd_context.hash(admin_password),
+            "initial_password_fingerprint": hmac.new(
+                APP_SECRET_KEY.encode(), admin_password.encode(), hashlib.sha256
+            ).hexdigest(),
+            "must_change_password": True,
         })
         return
     for area in AREAS:
