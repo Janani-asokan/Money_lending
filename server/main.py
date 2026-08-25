@@ -1243,6 +1243,7 @@ async def health() -> dict[str, Any]:
         "ready": True,
         "database": database_status,
         "environment": APP_ENV,
+        "release": os.getenv("RENDER_GIT_COMMIT", "local")[:8],
         "durability": "memory-demo" if USE_MEMORY else "majority-journaled",
         "backup": backup_status,
         "time": iso(now()),
