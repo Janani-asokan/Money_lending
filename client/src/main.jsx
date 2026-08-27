@@ -347,7 +347,7 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user }) {
   return (
     <div className="content-grid">
       <section className="welcome-strip">
-        <div><span className="welcome-label">Portfolio pulse</span><h2>{collectionRate}% of this month’s target collected</h2><p>Your team has {totals.active_loans} active loans across {data.area_summary.length} service areas.</p></div>
+        <div><span className="welcome-label">Portfolio pulse</span><h2>{collectionRate}% of this month’s target collected</h2><p>Your team has {totals.active_loans} active loans across {collectibleAreas.length} {collectibleAreas.length === 1 ? 'area' : 'areas'} requiring collection.</p></div>
         <div className="quick-actions">
           <button onClick={() => onNavigate('customers')}><Users size={17} /> New customer</button>
           <button onClick={() => onNavigate('loans')}><CreditCard size={17} /> Enter loan amount</button>
