@@ -311,6 +311,8 @@ td small { display: block; color: var(--muted); margin-top: 3px; }
 .frequency-counts small { margin: 0; font-size: 10px; text-align: center; }
 
 .bar-chart { height: 280px; display: grid; grid-template-columns: repeat(auto-fit, minmax(58px, 1fr)); align-items: end; gap: 12px; padding: 12px 0 0; }
+.empty-chart { min-height: 96px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; color: var(--muted); text-align: center; }
+.empty-chart strong { color: var(--text); }
 .bar-col { height: 100%; display: grid; grid-template-rows: 1fr auto; gap: 8px; text-align: center; }
 .bar { align-self: end; min-height: 8px; border-radius: 8px 8px 3px 3px; background: linear-gradient(180deg, var(--accent-2), var(--accent)); position: relative; }
 .bar span { position: absolute; left: 50%; bottom: calc(100% + 6px); transform: translateX(-50%); color: var(--muted); font-size: 11px; white-space: nowrap; }
@@ -796,6 +798,9 @@ html, body, #root { width: 100%; max-width: 100%; overflow-x: hidden; }
 .area-drilldowns details { border: 1px solid var(--line); border-radius: 3px 14px 3px 14px; background: var(--surface-alt); }
 .area-drilldowns summary { cursor: pointer; padding: 14px 16px; font-weight: 750; }
 .area-drilldowns details[open] summary { border-bottom: 1px solid var(--line); }
+.table-link { appearance: none; border: 0; padding: 0; background: transparent; color: var(--accent); font: inherit; font-weight: 800; cursor: pointer; text-align: left; }
+.table-link:hover { text-decoration: underline; }
+.confirm-delete { width: min(560px, 100%); display: grid; gap: 14px; }
 
 @media (max-width: 1100px) {
   .login-page {

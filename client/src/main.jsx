@@ -135,6 +135,7 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [assistantOpen, setAssistantOpen] = useState(false);
+  const [selectedCustomerId, setSelectedCustomerId] = useState('');
   const api = useApi(setUser);
   const t = lang === 'ta' ? {
     ...TEXT.en,
@@ -235,9 +236,9 @@ function App() {
         {toast && <div className="toast">{toast}</div>}
         {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} onSelect={id => { setView(id); setPaletteOpen(false); }} />}
         {notificationsOpen && <NotificationCenter api={api} onClose={() => setNotificationsOpen(false)} />}
-        {view === 'dashboard' && <Dashboard api={api} onNavigate={setView} user={user} />}
+        {view === 'dashboard' && <Dashboard api={api} onNavigate={setView} onOpenCustomer={id => { setSelectedCustomerId(id); setView('profile'); }} user={user} />}
         {view === 'customers' && <Customers api={api} user={user} notify={setToast} />}
-        {view === 'profile' && <Customer360 api={api} />}
+        {view === 'profile' && <Customer360 api={api} initialCustomerId={selectedCustomerId} />}
         {view === 'loans' && <Loans api={api} notify={setToast} user={user} />}
         {view === 'collections' && <Collections api={api} user={user} notify={setToast} />}
         {view === 'planner' && <EmiPlanner />}
@@ -333,7 +334,7 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
   );
 }
 
-function Dashboard({ api, onNavigate, user }) {
+function Dashboard({ api, onNavigate, onOpenCustomer, user }) {
   const [data, setData] = useState(null);
   const [dueFilter, setDueFilter] = useState('All');
   useEffect(() => { api('/api/dashboard').then(setData); }, []);
@@ -342,6 +343,7 @@ function Dashboard({ api, onNavigate, user }) {
   const expectedCollection = Math.round(totals.monthly_collection + totals.outstanding * 0.06);
   const collectionRate = Math.min(100, Math.round((totals.monthly_collection / Math.max(expectedCollection, 1)) * 100));
   const visibleDues = (data.pending_dues || []).filter(d => dueFilter === 'All' || dueFilter === 'Overdue' ? (dueFilter === 'All' || d.overdue) : d.frequency === dueFilter);
+  const collectibleAreas = data.area_summary.filter(area => area.outstanding > 0 || area.customer_dues.length > 0);
   return (
     <div className="content-grid">
       <section className="welcome-strip">
@@ -369,7 +371,7 @@ function Dashboard({ api, onNavigate, user }) {
           <Metric icon={ReceiptIndianRupee} label="Monthly collection" value={money(totals.monthly_collection)} />
           <Metric icon={AlertTriangle} label="Pending collection" value={money(Math.max(expectedCollection - totals.monthly_collection, 0))} />
         </div>
-        <BarChart data={data.cashflow} x="month" y="collection" />
+        {data.cashflow.length ? <BarChart data={data.cashflow} x="month" y="collection" /> : <div className="empty-chart"><FileBarChart2 size={24}/><strong>No collections posted yet</strong><span>The monthly trend will appear after the first payment.</span></div>}
       </section>
       <section className="panel">
         <div className="panel-head"><h2>Loan portfolio mix</h2><span>Daily, weekly and monthly plans</span></div>
@@ -382,14 +384,8 @@ function Dashboard({ api, onNavigate, user }) {
         <div className="table-scroll"><table><thead><tr><th>Due date</th><th>Client</th><th>Plan</th><th>Installment</th><th>Amount due</th><th>Plan balance</th><th>Status</th></tr></thead><tbody>{visibleDues.map(d=><tr key={`${d.loan_id}-${d.installment_number}`}><td>{date(d.next_due_date)}</td><td>{d.customer_name}<small>{d.customer_id} · {d.mobile}</small></td><td>{d.frequency}<small>{d.loan_id}</small></td><td>#{d.installment_number}</td><td>{money(d.amount_due)}</td><td>{money(d.plan_balance)}</td><td><Status value={d.overdue ? `Overdue ${d.days_overdue}d` : 'Upcoming'} /></td></tr>)}</tbody></table></div>
       </section>
       <section className="panel wide area-performance">
-        <div className="panel-head"><h2>Area performance</h2><span>Customers, exposure, and today’s collection</span></div>
-        <div className="table-scroll area-performance-scroll">
-          <table>
-            <thead><tr><th>Area</th><th>Customers</th><th>Daily / Weekly / Monthly</th><th>Disbursed</th><th>Outstanding</th><th>Today</th><th>This month</th></tr></thead>
-            <tbody>{data.area_summary.map(a => <tr key={a.area}><td data-label="Area"><b>{a.area}</b><small>{a.name}</small></td><td data-label="Customers">{a.customers}</td><td data-label="Loan plans"><span className="frequency-counts"><b>{a.daily_loans}</b><small>Daily</small><b>{a.weekly_loans}</b><small>Weekly</small><b>{a.monthly_loans}</b><small>Monthly</small></span></td><td data-label="Disbursed">{money(a.total_disbursed)}</td><td data-label="Outstanding">{money(a.outstanding)}</td><td data-label="Today">{money(a.today_collection)}</td><td data-label="This month">{money(a.monthly_collection)}</td></tr>)}</tbody>
-          </table>
-        </div>
-        <div className="area-drilldowns">{data.area_summary.map(area => <details key={area.area} open={area.customer_dues.length > 0}><summary>{area.area} · {area.name} — {area.customers} customers · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.length ? area.customer_dues.map(item => <tr key={item.loan_id}><td>{item.customer_name}<small>{item.customer_id}</small></td><td>{item.frequency}<small>{item.loan_id}</small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? date(item.next_due_date) : 'Completed'}</td></tr>) : <tr><td colSpan="7">No active amount to collect in this area.</td></tr>}</tbody></table></div></details>)}</div>
+        <div className="panel-head"><h2>Areas requiring collection</h2><span>Click an area, then click a customer for their complete profile</span></div>
+        {collectibleAreas.length ? <div className="area-drilldowns">{collectibleAreas.map(area => <details key={area.area}><summary>{area.area} · {area.name} — {area.customers_with_dues} customers to collect · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.map(item => <tr key={item.loan_id}><td><button className="table-link" onClick={() => onOpenCustomer(item.customer_id)}>{item.customer_name}</button><small>{item.customer_id}</small></td><td>{item.frequency}<small>{item.loan_id}</small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? date(item.next_due_date) : 'Completed'}</td></tr>)}</tbody></table></div></details>)}</div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No area requires collection</strong><span>All active balances are clear.</span></div>}
       </section>
       <section className="panel">
         <div className="panel-head"><h2>Collector performance</h2><span>Collection volume and receipt count</span></div>
@@ -422,6 +418,9 @@ function Customers({ api, user, notify }) {
   const [providerStatus, setProviderStatus] = useState({ configured:false, provider:null });
   const [onboardingOtp, setOnboardingOtp] = useState({ customer_id:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, masked_destination:'', verified_at:'' });
   const [otpBusy, setOtpBusy] = useState(false);
+  const [updatingCustomerId, setUpdatingCustomerId] = useState('');
+  const [deleteCandidate, setDeleteCandidate] = useState(null);
+  const [deleteForm, setDeleteForm] = useState({ confirmation:'', reason:'', understood:false });
   const load = async (query = customerQuery) => {
     const boot = await api('/api/bootstrap');
     setAreas(boot.areas);
@@ -497,22 +496,28 @@ function Customers({ api, user, notify }) {
     catch(err){setFormError(err.message);} finally{setOtpBusy(false);}
   }
   async function verify(id, status) {
-    await api(`/api/customers/${id}/verification`, { method: 'PATCH', body: JSON.stringify({ status, reason: `${status} from customer registry` }) });
-    notify(`Verification status updated to ${status}.`);
-    await load();
-  }
-  async function deleteCustomer(row) {
-    if (!row.can_delete_profile) return setFormError('This customer cannot be deleted until every loan is completed and the balance is zero.');
-    if (!window.confirm(`Delete the active profile for ${row.name} (${row.customer_id})? Loan, payment, receipt, ledger, and audit history will be retained.`)) return;
-    const confirmation = window.prompt(`Type ${row.customer_id} to confirm:`);
-    if (confirmation === null) return;
-    const reason = window.prompt('Enter the deletion reason (minimum 5 characters):');
-    if (!reason) return;
+    setFormError(''); setUpdatingCustomerId(id);
     try {
-      await api(`/api/customers/${encodeURIComponent(row.customer_id)}`, { method: 'DELETE', body: JSON.stringify({ confirmation, reason }) });
-      notify(`Customer ${row.customer_id} removed from the active registry. Financial history was retained.`);
+      await api(`/api/customers/${id}/verification`, { method: 'PATCH', body: JSON.stringify({ status, reason: `${status} selected from customer registry` }) });
+      notify(`Customer ${id} is now ${status}.`);
+      await load();
+    } catch (err) { setFormError(err.message || 'Customer status could not be updated.'); }
+    finally { setUpdatingCustomerId(''); }
+  }
+  function requestDelete(row) {
+    if (!row.can_delete_profile) return setFormError('This customer cannot be deleted until every loan is completed and the balance is zero.');
+    setDeleteCandidate(row); setDeleteForm({ confirmation:'', reason:'', understood:false }); setFormError('');
+  }
+  async function deleteCustomer() {
+    if (!deleteCandidate) return;
+    try {
+      setUpdatingCustomerId(deleteCandidate.customer_id);
+      await api(`/api/customers/${encodeURIComponent(deleteCandidate.customer_id)}`, { method: 'DELETE', body: JSON.stringify({ confirmation:deleteForm.confirmation, reason:deleteForm.reason }) });
+      notify(`Customer ${deleteCandidate.customer_id} removed from the active registry. Financial history was retained.`);
+      setDeleteCandidate(null);
       await load();
     } catch (err) { setFormError(err.message); }
+    finally { setUpdatingCustomerId(''); }
   }
   async function unmask(id) {
     const purpose = window.prompt('Specific purpose for viewing Aadhaar:');
@@ -562,7 +567,7 @@ function Customers({ api, user, notify }) {
         <div className="table-scroll">
           <table>
             <thead><tr><th>ID</th><th>Name</th><th>Aadhaar</th><th>Status</th><th>Risk</th><th>Area</th><th>Actions</th></tr></thead>
-            <tbody>{rows.map(r => <tr key={r.customer_id}><td>{r.customer_id}</td><td><div className="table-person"><span>{r.name.split(' ').map(x => x[0]).join('').slice(0,2)}</span><div>{r.name}<small>{r.mobile}</small></div></div></td><td>{fullAadhaar[r.customer_id] || r.aadhaar_masked}{r.aadhaar_verified_at && <small>Verified {date(r.aadhaar_verified_at)}</small>}</td><td><Status value={r.status} /></td><td><Risk score={r.risk_score} /></td><td>{r.area}</td><td><div className="action-row">{['owner','manager'].includes(user.role) && <>{r.has_aadhaar && <button className="ghost" onClick={() => unmask(r.customer_id)}><Eye size={15} /> Unmask</button>}{(!r.has_aadhaar || !providerStatus.configured) && <button className="ghost" onClick={() => verify(r.customer_id, 'Manual Verification Approved')}><CheckCircle2 size={15} /> Approve manually</button>}<button className="ghost danger" onClick={() => verify(r.customer_id, 'Verification Failed')}><AlertTriangle size={15} /> Fail</button></>}{user.role === 'owner' && <button className="ghost danger" disabled={!r.can_delete_profile} title={r.can_delete_profile ? 'Requires two confirmations and a reason' : 'Complete all loans and clear every balance first'} onClick={() => deleteCustomer(r)}><X size={15} /> {r.can_delete_profile ? 'Delete customer' : 'Loan active'}</button>}</div></td></tr>)}</tbody>
+            <tbody>{rows.map(r => <tr key={r.customer_id}><td>{r.customer_id}</td><td><div className="table-person"><span>{r.name.split(' ').map(x => x[0]).join('').slice(0,2)}</span><div>{r.name}<small>{r.mobile}</small></div></div></td><td>{fullAadhaar[r.customer_id] || r.aadhaar_masked}{r.aadhaar_verified_at && <small>Verified {date(r.aadhaar_verified_at)}</small>}</td><td><Status value={r.status} /></td><td><Risk score={r.risk_score} /></td><td>{r.area}</td><td><div className="action-row">{['owner','manager'].includes(user.role) && <><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Pending Verification'} onClick={() => verify(r.customer_id, 'Pending Verification')}>Pending</button><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Manual Verification Approved'} onClick={() => verify(r.customer_id, 'Manual Verification Approved')}><CheckCircle2 size={15} /> Approve</button><button className="ghost danger" disabled={updatingCustomerId===r.customer_id || r.status==='Verification Failed'} onClick={() => verify(r.customer_id, 'Verification Failed')}><AlertTriangle size={15} /> Fail</button></>}{user.role === 'owner' && <button className="ghost danger" disabled={updatingCustomerId===r.customer_id || !r.can_delete_profile} title={r.can_delete_profile ? 'Requires two confirmations and a reason' : 'Complete all loans and clear every balance first'} onClick={() => requestDelete(r)}><X size={15} /> {r.can_delete_profile ? 'Delete customer' : 'Loan active'}</button>}</div></td></tr>)}</tbody>
           </table>
         </div>
       </section>
@@ -570,12 +575,13 @@ function Customers({ api, user, notify }) {
         <div className="panel-head"><h2>Aadhaar access control</h2><span>Purpose-bound, independently approved, one-time views</span></div>
         <div className="table-scroll"><table><thead><tr><th>Request</th><th>Customer</th><th>Purpose</th><th>Requester</th><th>Status</th><th>Action</th></tr></thead><tbody>{aadhaarRequests.map(r=><tr key={r.request_id}><td>{r.request_id}<small>{r.case_reference}</small></td><td>{r.customer_id}</td><td>{r.purpose}</td><td>{r.requested_by}</td><td>{r.status}</td><td>{r.status==='Pending' && user.role==='owner' && r.requested_by_id!==user.id ? <div className="action-row"><button className="primary small" onClick={()=>decideAccess(r.request_id,'Approve')}>Approve</button><button className="ghost danger" onClick={()=>decideAccess(r.request_id,'Reject')}>Reject</button></div> : r.status==='Approved' && r.requested_by_id===user.id && r.remaining_views>0 ? <button className="ghost" onClick={()=>viewApproved(r)}>One-time view</button> : '—'}</td></tr>)}</tbody></table></div>
       </section>}
+      {deleteCandidate && <div className="modal-backdrop" onClick={() => setDeleteCandidate(null)}><div className="modal confirm-delete" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Double confirmation required</span><h2>Delete {deleteCandidate.name}?</h2></div><button className="icon-btn" onClick={()=>setDeleteCandidate(null)}><X size={18}/></button></div><div className="error-banner">This removes personal details from the active registry. Loan, payment, receipt, ledger, and audit history will remain immutable.</div><label>Type customer ID <strong>{deleteCandidate.customer_id}</strong><input autoFocus value={deleteForm.confirmation} onChange={e=>setDeleteForm({...deleteForm,confirmation:e.target.value})}/></label><label>Deletion reason<input minLength="5" value={deleteForm.reason} onChange={e=>setDeleteForm({...deleteForm,reason:e.target.value})} placeholder="Wrong entry or completed relationship"/></label><label className="check-row"><input type="checkbox" checked={deleteForm.understood} onChange={e=>setDeleteForm({...deleteForm,understood:e.target.checked})}/> I understand this profile will disappear from the customer list.</label><div className="action-row"><button className="ghost" onClick={()=>setDeleteCandidate(null)}>Cancel</button><button className="primary danger" disabled={updatingCustomerId===deleteCandidate.customer_id || deleteForm.confirmation.trim().toUpperCase()!==deleteCandidate.customer_id.toUpperCase() || deleteForm.reason.trim().length<5 || !deleteForm.understood} onClick={deleteCustomer}>Confirm profile deletion</button></div></div></div>}
       {receipt && <ReceiptModal title={receipt.type} onClose={() => setReceipt(null)} data={receipt} />}
     </div>
   );
 }
 
-function Customer360({ api }) {
+function Customer360({ api, initialCustomerId = '' }) {
   const [customers, setCustomers] = useState([]);
   const [loans, setLoans] = useState([]);
   const [payments, setPayments] = useState([]);
@@ -595,7 +601,7 @@ function Customer360({ api }) {
       setPayments(ps);
       setVerificationEvents(ve);
       setIdentityLogs(il);
-      setSelectedId(cs[0]?.customer_id || '');
+      setSelectedId(current => initialCustomerId && cs.some(c => c.customer_id === initialCustomerId) ? initialCustomerId : current || cs[0]?.customer_id || '');
     }
     load();
   }, []);
