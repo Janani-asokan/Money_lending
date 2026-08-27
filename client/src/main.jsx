@@ -20,6 +20,7 @@ const CreditCard = Icons.CreditCard || FallbackIcon;
 const DatabaseBackup = Icons.DatabaseBackup || Icons.Database || FallbackIcon;
 const Download = Icons.Download || FallbackIcon;
 const Eye = Icons.Eye || FallbackIcon;
+const EyeOff = Icons.EyeOff || FallbackIcon;
 const FileBarChart2 = Icons.FileBarChart2 || Icons.FileChartColumn || Icons.FileText || FallbackIcon;
 const FileText = Icons.FileText || FallbackIcon;
 const Globe2 = Icons.Globe2 || Icons.Globe || FallbackIcon;
@@ -267,6 +268,7 @@ function viewTitle(view, t) {
 function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
   const [username, setUsername] = useState(IS_DEMO ? 'owner' : '');
   const [password, setPassword] = useState(IS_DEMO ? 'owner123' : '');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const accounts = [
     ['owner', 'owner123', 'Owner full access'],
@@ -312,7 +314,7 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
           </div>
         </div>
         <label>Username<input required autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} /></label>
-        <label>Password<input required autoComplete="current-password" type="password" value={password} onChange={e => setPassword(e.target.value)} /></label>
+        <label>Password<div className="password-field"><input required autoComplete="current-password" type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} /><button type="button" className="password-toggle" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword(value => !value)}>{showPassword ? <EyeOff size={19}/> : <Eye size={19}/>}</button></div></label>
         {error && <div className="error">{error}</div>}
         <button className="primary">Enter secure workspace <ChevronRight size={18} /></button>
         {IS_DEMO && <div className="demo-accounts">
@@ -401,6 +403,7 @@ function Dashboard({ api, onNavigate, user }) {
 
 function Customers({ api, user, notify }) {
   const [rows, setRows] = useState([]);
+  const [knownCustomers, setKnownCustomers] = useState([]);
   const [areas, setAreas] = useState([]);
   const [form, setForm] = useState({ name: '', father_name: '', mobile: '', aadhaar: '', address: '', area: 'KUN', guarantor: '', status: 'Pending Verification', aadhaar_consent_given: false, aadhaar_consent_purpose: 'Identity verification for loan application', aadhaar_consent_reference: '' });
   const [fullAadhaar, setFullAadhaar] = useState({});
@@ -416,7 +419,9 @@ function Customers({ api, user, notify }) {
   const load = async (query = customerQuery) => {
     const boot = await api('/api/bootstrap');
     setAreas(boot.areas);
-    setRows(await api(`/api/customers?q=${encodeURIComponent(query)}`));
+    const customerRows = await api(`/api/customers?q=${encodeURIComponent(query)}`);
+    setRows(customerRows);
+    if (!query.trim()) setKnownCustomers(customerRows);
     setAadhaarRequests(['owner','manager'].includes(user.role) ? await api('/api/aadhaar/access-requests') : []);
     if (['owner','manager'].includes(user.role)) setProviderStatus(await api('/api/aadhaar/provider-status'));
   };
@@ -425,6 +430,20 @@ function Customers({ api, user, notify }) {
     const timer = setTimeout(() => load(customerQuery), 250);
     return () => clearTimeout(timer);
   }, [customerQuery]);
+  const previousMatches = useMemo(() => {
+    const name = form.name.trim().toLowerCase();
+    const mobile = form.mobile.trim();
+    if (name.length < 3 && mobile.length < 4) return [];
+    return knownCustomers.filter(customer =>
+      (mobile.length >= 4 && customer.mobile?.includes(mobile)) ||
+      (name.length >= 3 && customer.name?.toLowerCase().includes(name))
+    ).slice(0, 4);
+  }, [knownCustomers, form.name, form.mobile]);
+  function usePreviousCustomer(customer) {
+    setForm(current => ({ ...current, name: customer.name || '', father_name: customer.father_name || '', mobile: customer.mobile || '', address: customer.address || '', area: customer.area || current.area, guarantor: customer.guarantor || '' }));
+    setReceipt({ type: 'Existing Customer Selected', ack: customer.customer_id, customer });
+    notify(`Loaded existing customer ${customer.customer_id}. Create another loan from the Loans page; no duplicate profile was created.`);
+  }
   async function submit(e) {
     e.preventDefault();
     if (saving) return;
@@ -514,6 +533,7 @@ function Customers({ api, user, notify }) {
           <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code}>{a.code}</option>)}</select></label>
           <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
         </div>
+        {previousMatches.length > 0 && <div className="customer-suggestions" role="listbox" aria-label="Existing customer suggestions"><strong>Existing customer found</strong><small>Select the previous profile instead of creating a duplicate.</small>{previousMatches.map(customer => <button type="button" key={customer.customer_id} onClick={() => usePreviousCustomer(customer)}><span>{customer.name}<small>{customer.customer_id} · {customer.mobile}</small></span><ChevronRight size={17}/></button>)}</div>}
         <label>Address<textarea required value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></label>
         <label>Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
         {formError && <div className="error" role="alert">{formError}</div>}
@@ -644,6 +664,8 @@ function Loans({ api, notify, user }) {
   const [identityError, setIdentityError] = useState('');
   const [identityBusy, setIdentityBusy] = useState(false);
   const [quote, setQuote] = useState(null);
+  const [loanError, setLoanError] = useState('');
+  const [savingLoan, setSavingLoan] = useState(false);
   const [service, setService] = useState({ loan_id: '', amount: '', strategy: 'Reduce EMI', effective_date: new Date().toISOString().slice(0,10), consent: '', annual_rate: 12, periods: 12, moratorium: 0, approval: '', reason: '' });
   const load = async () => {
     const b = await api('/api/bootstrap');
@@ -660,14 +682,23 @@ function Loans({ api, notify, user }) {
   useEffect(() => { setQuote(null); }, [form]);
   async function submit(e) {
     e.preventDefault();
+    setLoanError('');
     const body = { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null };
-    await api('/api/loans', { method: 'POST', body: JSON.stringify(body) });
-    notify('Loan disbursed and acknowledgement ready.');
-    await load();
+    setSavingLoan(true);
+    try {
+      await api('/api/loans', { method: 'POST', body: JSON.stringify(body) });
+      notify('Loan disbursed and acknowledgement ready.');
+      setQuote(null);
+      await load();
+    } catch (err) {
+      setLoanError(err.message || 'Loan could not be created.');
+    } finally { setSavingLoan(false); }
   }
   async function preview() {
+    setLoanError('');
     const body = { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null };
-    setQuote(await api('/api/loan-quotes', { method: 'POST', body: JSON.stringify(body) }));
+    try { setQuote(await api('/api/loan-quotes', { method: 'POST', body: JSON.stringify(body) })); }
+    catch (err) { setQuote(null); setLoanError(err.message || 'Loan preview could not be generated.'); }
   }
   async function servicePost(path, body, message) { await api(path, { method:'POST', body:JSON.stringify(body) }); notify(message); await load(); }
   async function startIdentityOtp() { setIdentityError(''); setIdentityBusy(true); try { const result=await api('/api/aadhaar/otp/start',{method:'POST',body:JSON.stringify({customer_id:form.customer_id,purpose:identity.purpose,consent_reference:identity.consent_reference,proposed_disbursal_amount:Number(form.principal),owner_notes:identity.owner_notes})}); setIdentity({...identity,...result,verification_id:result.verification_id,otp:''}); notify(`OTP sent to ${result.masked_destination}.`); } catch(err) { setIdentityError(err.message); } finally { setIdentityBusy(false); } }
@@ -681,7 +712,7 @@ function Loans({ api, notify, user }) {
         <label>Customer<select value={form.customer_id} onChange={e => setForm({ ...form, customer_id: e.target.value })}>{customers.map(c => <option key={c.customer_id}>{c.customer_id}</option>)}</select></label>
         <div className="two-col">
           <label>Principal<input type="number" value={form.principal} onChange={e => setForm({ ...form, principal: e.target.value })} /></label>
-          <label>Interest %<input type="number" min="0" max="100" step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /></label>
+          <label>Annual interest %<input type="number" value="2.14" readOnly aria-readonly="true" /><small>Approved fixed rate</small></label>
           <label>Loan type<select value={form.loan_type} onChange={e => setForm({ ...form, loan_type: e.target.value, repayment_period: e.target.value.includes('Daily') ? 100 : e.target.value === 'Weekly' ? 52 : 12 })}>{boot.loan_types.map(x => <option key={x}>{x}</option>)}</select></label>
           <label>Period<input type="number" value={form.repayment_period} onChange={e => setForm({ ...form, repayment_period: e.target.value })} /></label>
           <label>Interest method<select value={form.interest_method} onChange={e=>setForm({...form,interest_method:e.target.value})}><option>Reducing</option><option>Flat</option></select></label>
@@ -697,7 +728,8 @@ function Loans({ api, notify, user }) {
         <label>KFS borrower acknowledgement reference<input required value={form.kfs_acknowledgement_reference} onChange={e=>setForm({...form,kfs_acknowledgement_reference:e.target.value})} placeholder="Signed/OTP acknowledgement ID"/></label>
         {providerStatus.configured && <div className="servicing-box"><h3>Fresh Aadhaar OTP before money handover</h3><label>Purpose<input value={identity.purpose} onChange={e=>setIdentity({...identity,purpose:e.target.value})}/></label><label>Consent reference<input value={identity.consent_reference} onChange={e=>setIdentity({...identity,consent_reference:e.target.value})}/></label><label>Owner handover note<input value={identity.owner_notes} onChange={e=>setIdentity({...identity,owner_notes:e.target.value})}/></label><div className="action-row"><button type="button" className="ghost" disabled={identityBusy} onClick={startIdentityOtp}>{identityBusy ? 'Please wait…' : 'Send Aadhaar-linked OTP'}</button>{identity.verification_id && <><input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" placeholder="4 or 6-digit OTP" value={identity.otp} onChange={e=>setIdentity({...identity,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/><button type="button" className="primary small" disabled={identityBusy || ![4,6].includes(identity.otp.length)} onClick={verifyIdentityOtp}>Verify OTP</button><button type="button" className="ghost small" disabled={identityBusy || identity.resends_remaining === 0} onClick={resendIdentityOtp}>Resend OTP</button></>}</div>{identity.verification_id && !form.identity_verification_id && <small>{identity.attempts_remaining} verification attempts · {identity.resends_remaining} resends remaining. OTPs expire automatically.</small>}{identityError && <div className="error-banner" role="alert">{identityError}</div>}{form.identity_verification_id && <small>Verified reference: {form.identity_verification_id}</small>}</div>}
         <button type="button" className="ghost" onClick={preview}><FileText size={18}/> Preview APR, KFS and schedule</button>
-        <button className="primary" disabled={!quote}><FileText size={18} /> Create loan after KFS acceptance</button>
+        {loanError && <div className="error" role="alert">{loanError}</div>}
+        <button className="primary" disabled={!quote || savingLoan}><FileText size={18} /> {savingLoan ? 'Creating loan…' : 'Create loan after KFS acceptance'}</button>
         {quote && <div className="locked-note">APR {quote.apr}% · Net disbursed {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
       </form>
       <section className="panel">
@@ -1014,7 +1046,7 @@ function SettingsView({ api, notify }) {
 
 function EmiPlanner() {
   const [principal, setPrincipal] = useState(250000);
-  const [rate, setRate] = useState(18);
+  const rate = 2.14;
   const [months, setMonths] = useState(24);
   const monthlyRate = rate / 1200;
   const emi = monthlyRate ? principal * monthlyRate * Math.pow(1 + monthlyRate, months) / (Math.pow(1 + monthlyRate, months) - 1) : principal / months;
@@ -1024,7 +1056,7 @@ function EmiPlanner() {
       <section className="panel planner-controls">
         <div className="panel-head"><div><span className="section-kicker">Instant estimate</span><h2>Build a comfortable repayment plan</h2></div><Calculator size={24} /></div>
         <label>Loan amount <strong>{money(principal)}</strong><input type="range" min="10000" max="2000000" step="10000" value={principal} onChange={e => setPrincipal(Number(e.target.value))} /></label>
-        <label>Annual interest <strong>{rate}%</strong><input type="range" min="6" max="36" step="0.5" value={rate} onChange={e => setRate(Number(e.target.value))} /></label>
+        <label>Annual interest <strong>{rate}%</strong><input type="range" min="2.14" max="2.14" step="0.01" value={rate} readOnly aria-label="Approved annual interest rate 2.14 percent" /><small>Fixed approved rate</small></label>
         <label>Repayment tenure <strong>{months} months</strong><input type="range" min="3" max="60" value={months} onChange={e => setMonths(Number(e.target.value))} /></label>
         <div className="planner-note"><ShieldCheck size={18} /><span>This is an indicative reducing-balance estimate. Final terms should follow the approved sanction.</span></div>
       </section>

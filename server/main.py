@@ -1370,10 +1370,15 @@ async def me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
 
 @app.get("/api/bootstrap")
 async def bootstrap(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    collectors = [public_user(x) for x in await find_many("users", {"role": "collector", "active": True})]
+    if not collectors and user.get("role") in {"owner", "manager"}:
+        self_managed = public_user(user)
+        self_managed["name"] = f"{self_managed['name']} (self-managed)"
+        collectors = [self_managed]
     return {
         "user": public_user(user),
         "areas": await find_many("areas"),
-        "collectors": [public_user(x) for x in await find_many("users", {"role": "collector"})],
+        "collectors": collectors,
         "payment_modes": PAYMENT_MODES,
         "loan_types": LOAN_TYPES,
     }
@@ -1866,6 +1871,8 @@ async def loans(q: str = "", status_filter: str = "", loan_type: str = "", area:
 
 @app.post("/api/loan-quotes")
 async def loan_quote(payload: LoanIn, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+    if abs(payload.interest_rate - 2.14) > 0.000001:
+        raise HTTPException(422, "New loans must use the approved annual interest rate of 2.14%")
     borrow = parse_date(payload.borrow_date)
     schedule = build_amortization(payload, borrow)
     return {
@@ -2083,9 +2090,11 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
         raise HTTPException(409, "Verified handover amount does not match the loan principal")
     if payload.loan_type not in LOAN_TYPES:
         raise HTTPException(422, "Invalid loan type")
+    if abs(payload.interest_rate - 2.14) > 0.000001:
+        raise HTTPException(422, "New loans must use the approved annual interest rate of 2.14%")
     collector = await find_one("users", {"id": payload.collector_id})
-    if not collector or collector.get("role") != "collector" or not collector.get("active", True):
-        raise HTTPException(422, "Select an active collector")
+    if not collector or collector.get("role") not in {"collector", "owner", "manager"} or not collector.get("active", True):
+        raise HTTPException(422, "Select an active collector or the self-managed owner")
     borrow = parse_date(payload.borrow_date)
     schedule = build_amortization(payload, borrow)
     loan_seq = await next_sequence("LN", "loan_id", "loans")
