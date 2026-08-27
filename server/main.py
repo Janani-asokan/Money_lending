@@ -810,7 +810,6 @@ async def ensure_indexes() -> None:
         await db.audit_chain_state.update_one({"_id": "primary"}, {"$setOnInsert": {"sequence": int(latest.get("chain_sequence", 0)) if latest else 0, "head_hash": latest.get("entry_hash", "GENESIS") if latest else "GENESIS", "epoch": 1}}, upsert=True)
     else:
         await db.audit_chain_state.update_one({"_id": "primary", "epoch": {"$exists": False}}, {"$set": {"epoch": 1}})
-    await db.customers.create_index("mobile", name="idx_customers_mobile")
     await db.customers.create_index("name", name="idx_customers_name")
     await db.customers.create_index(
         [("name", "text"), ("customer_id", "text"), ("mobile", "text")],
