@@ -327,6 +327,7 @@ class PaymentIn(BaseModel):
     mode: str
     collector_id: Optional[str] = None
     request_id: Optional[str] = Field(default=None, min_length=8, max_length=100)
+    payment_reference: Optional[str] = Field(default=None, max_length=120)
 
     @field_validator("mode")
     @classmethod
@@ -334,6 +335,10 @@ class PaymentIn(BaseModel):
         if value not in PAYMENT_MODES:
             raise ValueError("Invalid payment mode")
         return value
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.mode == "UPI" and len((self.payment_reference or "").strip()) < 3:
+            raise ValueError("UPI transaction/reference ID is required")
 
 
 class ExpenseIn(BaseModel):
@@ -2324,6 +2329,7 @@ async def create_payment(payload: PaymentIn, request: Request, user: dict[str, A
             "receipt_no": receipt_no, "loan_id": payload.loan_id, "customer_id": loan["customer_id"],
             "amount": from_paise(amount_paise), "mode": payload.mode, "collector_id": collector_id,
             "timestamp": iso(stamp), "status": "Posted", "journal_entry_id": entry_id,
+            "payment_reference": (payload.payment_reference or "").strip() or None,
             "allocation": {"penalty_paise": penalty_part, "interest_paise": interest_part, "principal_paise": principal_part},
             "identity_verified_at_disbursal": bool(loan.get("identity_verification_id")),
             "identity_verification_id": loan.get("identity_verification_id"),
@@ -2376,6 +2382,7 @@ async def receipt_payload(payment: dict[str, Any]) -> dict[str, Any]:
         "collector": collector["name"] if collector else "Collector",
         "amount": payment["amount"],
         "mode": payment["mode"],
+        "payment_reference": payment.get("payment_reference"),
         "timestamp": payment["timestamp"],
         "balance_after": loan["balance"],
         "allocation": payment.get("allocation", {}),

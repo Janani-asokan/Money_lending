@@ -784,21 +784,30 @@ function Loans({ api, notify, user }) {
 
 function Collections({ api, user, notify }) {
   const [loans, setLoans] = useState([]);
+  const [payments, setPayments] = useState([]);
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState(null);
   const [amount, setAmount] = useState('');
   const [mode, setMode] = useState('Cash');
+  const [paymentReference, setPaymentReference] = useState('');
   const [receipt, setReceipt] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const load = async () => {
-    const rows = await api('/api/loans');
+    const [rows, paymentRows] = await Promise.all([api('/api/loans'), api('/api/payments')]);
     const collectible = rows.filter(row => row.balance > 0 && row.status !== 'Closed');
     setLoans(collectible);
-    if (!selected && collectible[0]) setSelected(collectible[0]);
+    setPayments(paymentRows);
+    setSelected(current => collectible.find(row => row.loan_id === current?.loan_id) || collectible[0] || null);
   };
   useEffect(() => { load(); }, []);
   const filtered = loans.filter(l => !query || `${l.loan_id} ${l.customer_id} ${l.customer_name}`.toLowerCase().includes(query.toLowerCase()));
+  const todayKey = indiaDayKey(new Date());
+  const paymentsForLoan = loanId => payments.filter(payment => payment.loan_id === loanId && payment.status !== 'Reversed');
+  const selectedPayments = selected ? paymentsForLoan(selected.loan_id).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)) : [];
+  const lastPayment = selectedPayments[0];
+  const paidToday = selectedPayments.filter(payment => indiaDayKey(payment.timestamp) === todayKey);
+  const paidTodayAmount = paidToday.reduce((sum,payment)=>sum+Number(payment.amount || 0),0);
   async function submit(e) {
     e.preventDefault();
     if (!selected || saving) return;
@@ -809,10 +818,11 @@ function Collections({ api, user, notify }) {
       const res = await api('/api/payments', {
         method: 'POST',
         headers: { 'Idempotency-Key': requestId },
-        body: JSON.stringify({ loan_id: selected.loan_id, amount: Number(amount), mode, request_id: requestId })
+        body: JSON.stringify({ loan_id: selected.loan_id, amount: Number(amount), mode, payment_reference: mode === 'UPI' ? paymentReference.trim() : null, request_id: requestId })
       });
       setReceipt(res.receipt);
       setAmount('');
+      setPaymentReference('');
       notify('Payment saved safely. Receipt generated.');
       await load();
     } catch (err) {
@@ -826,7 +836,7 @@ function Collections({ api, user, notify }) {
       <section className="panel loan-picker">
         <div className="panel-head"><h2>Find loan</h2><span>Loan ID or Customer ID</span></div>
         <div className="searchbox"><Search size={18} /><input placeholder="Search loan..." value={query} onChange={e => setQuery(e.target.value)} /></div>
-        <div className="loan-list">{filtered.slice(0, 16).map(l => <button key={l.loan_id} className={selected?.loan_id === l.loan_id ? 'loan-item selected' : 'loan-item'} onClick={() => { setSelected(l); setAmount(l.installment); }}><strong>{l.loan_id}</strong><span>{l.customer_name} · {money(l.balance)}</span></button>)}</div>
+        <div className="loan-list">{filtered.slice(0, 24).map(l => { const todayPayments=paymentsForLoan(l.loan_id).filter(payment=>indiaDayKey(payment.timestamp)===todayKey); const todayTotal=todayPayments.reduce((sum,payment)=>sum+Number(payment.amount||0),0); return <button key={l.loan_id} className={selected?.loan_id === l.loan_id ? 'loan-item selected' : 'loan-item'} onClick={() => { setSelected(l); setAmount(Math.min(l.installment,l.balance)); setPaymentReference(''); }}><span className="loan-item-head"><strong>{l.customer_name}</strong><Status value={todayTotal>0?'Paid today':'Not paid today'}/></span><span>{l.customer_id} · {l.loan_id} · {l.frequency}</span><span>{money(l.balance)} remaining · installment {money(l.installment)}</span>{todayTotal>0&&<small>{money(todayTotal)} received today</small>}</button>})}</div>
       </section>
       <form className="panel collection-card" onSubmit={submit}>
         <div className="panel-head"><h2>Collection entry</h2><span>Simple field workflow with locked server timestamp</span></div>
@@ -834,13 +844,17 @@ function Collections({ api, user, notify }) {
           <>
             <div className="summary-card">
               <strong>{selected.customer_name}</strong>
-              <span>{selected.loan_id} · {selected.loan_type}</span>
+              <span>{selected.customer_id} · {selected.loan_id} · {selected.frequency}</span>
               <div className="amount-line">{money(selected.balance)} <small>outstanding</small></div>
+              <div className="collection-facts"><span><b>{money(selected.paid)}</b><small>Total paid</small></span><span><b>{money(selected.installment)}</b><small>Current installment</small></span><span><b>{selected.remaining_installments}</b><small>Installments left</small></span></div>
+              <div className={paidTodayAmount>0?'locked-note paid-state':'locked-note unpaid-state'}>{paidTodayAmount>0?<><CheckCircle2 size={16}/> Paid {money(paidTodayAmount)} today</>:<><AlertTriangle size={16}/> No payment recorded today</>}</div>
+              {lastPayment&&<small>Last payment: {money(lastPayment.amount)} via {lastPayment.mode}{lastPayment.payment_reference?` · Ref ${lastPayment.payment_reference}`:''} · {date(lastPayment.timestamp)}</small>}
             </div>
             <div className="two-col">
-              <label>Amount<input type="number" required value={amount} onChange={e => setAmount(e.target.value)} /></label>
-              <label>Mode<select value={mode} onChange={e => setMode(e.target.value)}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>
+              <label>Amount received<input type="number" required min="0.01" step="0.01" max={selected.balance} value={amount} onChange={e => setAmount(e.target.value)} /></label>
+              <label>Received through<select value={mode} onChange={e => { setMode(e.target.value); setPaymentReference(''); }}><option>Cash</option><option>UPI</option></select></label>
             </div>
+            {mode==='UPI'&&<label>UPI transaction/reference ID<input required minLength="3" maxLength="120" value={paymentReference} onChange={e=>setPaymentReference(e.target.value)} placeholder="Example: UPI123456789"/><small>Required for settlement and reconciliation.</small></label>}
             <div className="locked-note"><LockKeyhole size={16} /> Date/time is captured on the server and cannot be edited by staff.</div>
             {error && <div className="error" role="alert">{error}</div>}
             <button className="primary" disabled={saving}><ReceiptIndianRupee size={18} /> {saving ? 'Saving payment…' : 'Save payment and print receipt'}</button>
@@ -1284,6 +1298,10 @@ function Skeleton() {
 
 function money(value) {
   return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(value || 0);
+}
+
+function indiaDayKey(value) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Kolkata', year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date(value));
 }
 
 function date(value) {
