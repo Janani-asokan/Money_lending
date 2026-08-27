@@ -238,7 +238,7 @@ function App() {
         {notificationsOpen && <NotificationCenter api={api} onClose={() => setNotificationsOpen(false)} />}
         {view === 'dashboard' && <Dashboard api={api} onNavigate={setView} onOpenCustomer={id => { setSelectedCustomerId(id); setView('profile'); }} user={user} />}
         {view === 'customers' && <Customers api={api} user={user} notify={setToast} />}
-        {view === 'profile' && <Customer360 api={api} initialCustomerId={selectedCustomerId} />}
+        {view === 'profile' && <Customer360 api={api} initialCustomerId={selectedCustomerId} user={user} notify={setToast} />}
         {view === 'loans' && <Loans api={api} notify={setToast} user={user} />}
         {view === 'collections' && <Collections api={api} user={user} notify={setToast} />}
         {view === 'planner' && <EmiPlanner />}
@@ -581,30 +581,47 @@ function Customers({ api, user, notify }) {
   );
 }
 
-function Customer360({ api, initialCustomerId = '' }) {
+function Customer360({ api, initialCustomerId = '', user, notify }) {
   const [customers, setCustomers] = useState([]);
   const [loans, setLoans] = useState([]);
   const [payments, setPayments] = useState([]);
   const [verificationEvents, setVerificationEvents] = useState([]);
   const [identityLogs, setIdentityLogs] = useState([]);
   const [selectedId, setSelectedId] = useState('');
+  const [deleteCandidate, setDeleteCandidate] = useState(null);
+  const [deleteForm, setDeleteForm] = useState({ confirmation:'', reason:'', understood:false });
+  const [deleteError, setDeleteError] = useState('');
+  const [deleting, setDeleting] = useState(false);
 
-  useEffect(() => {
-    async function load() {
-      const cs = await api('/api/customers');
-      const ls = await api('/api/loans');
-      const ps = await api('/api/payments');
-      const ve = await api('/api/verification-events');
-      const il = await api('/api/identity-verifications');
-      setCustomers(cs);
-      setLoans(ls);
-      setPayments(ps);
-      setVerificationEvents(ve);
-      setIdentityLogs(il);
-      setSelectedId(current => initialCustomerId && cs.some(c => c.customer_id === initialCustomerId) ? initialCustomerId : current || cs[0]?.customer_id || '');
-    }
-    load();
-  }, []);
+  async function load() {
+    const cs = await api('/api/customers');
+    const ls = await api('/api/loans');
+    const ps = await api('/api/payments');
+    const ve = await api('/api/verification-events');
+    const il = await api('/api/identity-verifications');
+    setCustomers(cs);
+    setLoans(ls);
+    setPayments(ps);
+    setVerificationEvents(ve);
+    setIdentityLogs(il);
+    setSelectedId(current => initialCustomerId && cs.some(c => c.customer_id === initialCustomerId) ? initialCustomerId : cs.some(c => c.customer_id === current) ? current : cs[0]?.customer_id || '');
+  }
+  useEffect(() => { load(); }, []);
+
+  function requestDelete(customer) {
+    if (!customer.can_delete_profile) return setDeleteError('Complete every loan and clear the full balance before deleting this customer profile.');
+    setDeleteError(''); setDeleteCandidate(customer); setDeleteForm({ confirmation:'', reason:'', understood:false });
+  }
+  async function confirmDelete() {
+    if (!deleteCandidate || deleting) return;
+    setDeleting(true); setDeleteError('');
+    try {
+      await api(`/api/customers/${encodeURIComponent(deleteCandidate.customer_id)}`, { method:'DELETE', body:JSON.stringify({ confirmation:deleteForm.confirmation, reason:deleteForm.reason }) });
+      notify(`Customer ${deleteCandidate.customer_id} removed from the active registry. Financial history was retained.`);
+      setDeleteCandidate(null); setSelectedId(''); await load();
+    } catch (err) { setDeleteError(err.message || 'Customer could not be deleted.'); }
+    finally { setDeleting(false); }
+  }
 
   const customer = customers.find(c => c.customer_id === selectedId) || customers[0];
   if (!customer) return <Skeleton />;
@@ -637,9 +654,8 @@ function Customer360({ api, initialCustomerId = '' }) {
           <span className="pill">Risk {customer.risk_score}</span>
           <span className="pill">Aadhaar {customer.aadhaar_masked}</span>
         </div>
-        <div className="document-grid">
-          {['Aadhaar', 'PAN', 'Agreement', 'Photo', 'Signature', 'Guarantor'].map(item => <div key={item}><FileText size={16} /><span>{item}</span><small>Version ready</small></div>)}
-        </div>
+        {user.role === 'owner' && <button className="ghost danger profile-delete" disabled={!customer.can_delete_profile} title={customer.can_delete_profile ? 'Delete with confirmation' : 'Active or unpaid loans must be completed first'} onClick={()=>requestDelete(customer)}><X size={16}/>{customer.can_delete_profile ? 'Delete customer' : 'Cannot delete — loan active'}</button>}
+        {deleteError && <div className="error-banner" role="alert">{deleteError}</div>}
       </section>
 
       <section className="panel wide">
@@ -667,6 +683,7 @@ function Customer360({ api, initialCustomerId = '' }) {
           <span><Sparkles size={15} /> Natural language search ready</span>
         </div>
       </section>
+      {deleteCandidate && <div className="modal-backdrop" onClick={()=>setDeleteCandidate(null)}><div className="modal confirm-delete" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Double confirmation required</span><h2>Delete {deleteCandidate.name}?</h2></div><button className="icon-btn" onClick={()=>setDeleteCandidate(null)}><X size={18}/></button></div><div className="error-banner">The active profile and personal details will be removed. Loan, payment, receipt, ledger, and audit history will remain protected.</div><label>Type customer ID <strong>{deleteCandidate.customer_id}</strong><input autoFocus value={deleteForm.confirmation} onChange={e=>setDeleteForm({...deleteForm,confirmation:e.target.value})}/></label><label>Deletion reason<input minLength="5" value={deleteForm.reason} onChange={e=>setDeleteForm({...deleteForm,reason:e.target.value})} placeholder="Wrong entry or completed relationship"/></label><label className="check-row"><input type="checkbox" checked={deleteForm.understood} onChange={e=>setDeleteForm({...deleteForm,understood:e.target.checked})}/> I understand this profile will disappear from the active customer list.</label><div className="action-row"><button className="ghost" onClick={()=>setDeleteCandidate(null)}>Cancel</button><button className="primary danger" disabled={deleting || deleteForm.confirmation.trim().toUpperCase()!==deleteCandidate.customer_id.toUpperCase() || deleteForm.reason.trim().length<5 || !deleteForm.understood} onClick={confirmDelete}>{deleting?'Deleting safely…':'Confirm profile deletion'}</button></div></div></div>}
     </div>
   );
 }
