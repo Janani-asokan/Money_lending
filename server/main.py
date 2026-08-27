@@ -1516,6 +1516,8 @@ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
         area_loans = [l for l in loans if l["customer_id"] in {c["customer_id"] for c in area_customers}]
         area_today = [p for p in today_payments if p["customer_id"] in {c["customer_id"] for c in area_customers}]
         area_month = [p for p in month_payments if p["customer_id"] in {c["customer_id"] for c in area_customers}]
+        customers_with_dues = {l["customer_id"] for l in area_loans if l["status"] not in {"Closed", "Written Off"} and l["balance"] > 0}
+        paid_customer_ids_today = {p["customer_id"] for p in area_today}
         area_summary.append({
             "area": code,
             "name": area["name"],
@@ -1524,6 +1526,9 @@ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
             "outstanding": round(sum(l["balance"] for l in area_loans), 2),
             "today_collection": round(sum(p["amount"] for p in area_today), 2),
             "monthly_collection": round(sum(p["amount"] for p in area_month), 2),
+            "paid_customers_today": len(paid_customer_ids_today),
+            "customers_yet_to_pay": len(customers_with_dues - paid_customer_ids_today),
+            "customers_with_dues": len(customers_with_dues),
             "total_disbursed": round(sum(l["principal"] for l in area_loans), 2),
             "daily_loans": len([l for l in area_loans if l["loan_type"] == "Daily 100-Day"]),
             "weekly_loans": len([l for l in area_loans if l["loan_type"] == "Weekly"]),
