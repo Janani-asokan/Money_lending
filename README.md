@@ -1,3 +1,9 @@
+
+Demo - https://money-lending-app.onrender.com/
+
+
+
+
 # Sri Sakthi Thirumurugan Finance - Money Lending Management System
 
 Money-lending operations platform using React, FastAPI, and MongoDB. It supports a convenient demo mode and a fail-closed production mode.
