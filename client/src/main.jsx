@@ -5,6 +5,7 @@ import './styles.css';
 
 const API = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 const IS_DEMO = import.meta.env.VITE_SHOW_DEMO_ACCOUNTS === 'true';
+let CSRF_TOKEN = sessionStorage.getItem('stf_csrf') || '';
 const FallbackIcon = ({ size = 18 }) => <span style={{ width: size, height: size, display: 'inline-block' }} />;
 const AlertTriangle = Icons.AlertTriangle || Icons.TriangleAlert || FallbackIcon;
 const AreaChart = Icons.AreaChart || Icons.ChartArea || Icons.BarChart3 || FallbackIcon;
@@ -91,6 +92,7 @@ function useApi(setUser) {
         signal: options.signal || controller.signal,
         headers: {
           'Content-Type': 'application/json',
+          ...(CSRF_TOKEN ? { 'X-CSRF-Token': CSRF_TOKEN } : {}),
           ...(options.headers || {})
         }
       });
@@ -103,7 +105,7 @@ function useApi(setUser) {
     if (res.status === 401 && !path.startsWith('/api/auth/')) {
       const refreshed = await fetch(`${API}/api/auth/refresh`, { method: 'POST', credentials: 'include' });
       if (refreshed.ok) {
-        return fetch(`${API}${path}`, { ...options, credentials: 'include', headers: { 'Content-Type': 'application/json', ...(options.headers || {}) } }).then(async retry => {
+        return fetch(`${API}${path}`, { ...options, credentials: 'include', headers: { 'Content-Type': 'application/json', ...(CSRF_TOKEN ? { 'X-CSRF-Token': CSRF_TOKEN } : {}), ...(options.headers || {}) } }).then(async retry => {
           if (!retry.ok) throw new Error((await retry.json().catch(()=>({}))).detail || 'Request failed');
           return retry.json();
         });
@@ -117,7 +119,9 @@ function useApi(setUser) {
       }
       throw new Error(body.detail || 'Request failed');
     }
-    return res.json();
+    const data = await res.json();
+    if (data?.csrf_token) { CSRF_TOKEN = data.csrf_token; sessionStorage.setItem('stf_csrf', CSRF_TOKEN); }
+    return data;
   };
 }
 
@@ -148,7 +152,7 @@ function App() {
   }, [lang]);
 
   useEffect(() => {
-    api('/api/me').then(setUser).catch(() => setUser(null)).finally(() => setAuthChecked(true));
+    api('/api/me').then(async userData => { await api('/api/auth/csrf'); setUser(userData); }).catch(() => setUser(null)).finally(() => setAuthChecked(true));
   }, []);
 
   useEffect(() => {
@@ -344,6 +348,7 @@ function Dashboard({ api, onNavigate, user }) {
         <div><span className="welcome-label">Portfolio pulse</span><h2>{collectionRate}% of this month’s target collected</h2><p>Your team has {totals.active_loans} active loans across {data.area_summary.length} service areas.</p></div>
         <div className="quick-actions">
           <button onClick={() => onNavigate('customers')}><Users size={17} /> New customer</button>
+          <button onClick={() => onNavigate('loans')}><CreditCard size={17} /> Enter loan amount</button>
           <button onClick={() => onNavigate('collections')}><ReceiptIndianRupee size={17} /> Record payment</button>
           {['owner','manager','accountant'].includes(user.role) && <button onClick={() => onNavigate('accounting')}><WalletCards size={17} /> Open accounting</button>}
           <button onClick={() => onNavigate('planner')}><Calculator size={17} /> Plan a loan</button>
@@ -384,6 +389,7 @@ function Dashboard({ api, onNavigate, user }) {
             <tbody>{data.area_summary.map(a => <tr key={a.area}><td data-label="Area"><b>{a.area}</b><small>{a.name}</small></td><td data-label="Customers">{a.customers}</td><td data-label="Loan plans"><span className="frequency-counts"><b>{a.daily_loans}</b><small>Daily</small><b>{a.weekly_loans}</b><small>Weekly</small><b>{a.monthly_loans}</b><small>Monthly</small></span></td><td data-label="Disbursed">{money(a.total_disbursed)}</td><td data-label="Outstanding">{money(a.outstanding)}</td><td data-label="Today">{money(a.today_collection)}</td><td data-label="This month">{money(a.monthly_collection)}</td></tr>)}</tbody>
           </table>
         </div>
+        <div className="area-drilldowns">{data.area_summary.map(area => <details key={area.area}><summary>{area.area} · {area.name} — {area.customer_dues.length} active plans · {money(area.outstanding)} to collect</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.length ? area.customer_dues.map(item => <tr key={item.loan_id}><td>{item.customer_name}<small>{item.customer_id}</small></td><td>{item.frequency}<small>{item.loan_id}</small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td>{money(item.outstanding)}</td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? date(item.next_due_date) : 'Completed'}</td></tr>) : <tr><td colSpan="7">No active amount to collect in this area.</td></tr>}</tbody></table></div></details>)}</div>
       </section>
       <section className="panel">
         <div className="panel-head"><h2>Collector performance</h2><span>Collection volume and receipt count</span></div>
@@ -574,6 +580,7 @@ function Customer360({ api }) {
   const [loans, setLoans] = useState([]);
   const [payments, setPayments] = useState([]);
   const [verificationEvents, setVerificationEvents] = useState([]);
+  const [identityLogs, setIdentityLogs] = useState([]);
   const [selectedId, setSelectedId] = useState('');
 
   useEffect(() => {
@@ -582,10 +589,12 @@ function Customer360({ api }) {
       const ls = await api('/api/loans');
       const ps = await api('/api/payments');
       const ve = await api('/api/verification-events');
+      const il = await api('/api/identity-verifications');
       setCustomers(cs);
       setLoans(ls);
       setPayments(ps);
       setVerificationEvents(ve);
+      setIdentityLogs(il);
       setSelectedId(cs[0]?.customer_id || '');
     }
     load();
@@ -596,6 +605,7 @@ function Customer360({ api }) {
   const customerLoans = loans.filter(l => l.customer_id === customer.customer_id);
   const customerPayments = payments.filter(p => p.customer_id === customer.customer_id);
   const customerVerificationEvents = verificationEvents.filter(v => v.customer_id === customer.customer_id);
+  const customerIdentityLogs = identityLogs.filter(v => v.client_id === customer.customer_id);
   const totals = customerLoans.reduce((acc, loan) => ({
     borrowed: acc.borrowed + loan.principal,
     paid: acc.paid + loan.paid,
@@ -605,6 +615,7 @@ function Customer360({ api }) {
     { time: customer.created_at, icon: Users, title: 'Customer Created', detail: `${customer.customer_id} registered with ${customer.status}` },
     ...customerLoans.map(loan => ({ time: loan.borrow_date, icon: CreditCard, title: 'Loan Issued', detail: `${loan.loan_id} for ${money(loan.principal)}` })),
     ...customerPayments.map(payment => ({ time: payment.timestamp, icon: ReceiptIndianRupee, title: 'Payment Received', detail: `${payment.receipt_no} for ${money(payment.amount)} via ${payment.mode}` })),
+    ...customerIdentityLogs.map(log => ({ time: log.verified_at || log.attempted_at, icon: ShieldCheck, title: 'OTP verified before money handover', detail: `${log.verification_id} · ${log.otp_status} · verified amount ${money(log.disbursed_amount)} · ${log.provider} · ${log.owner_notes || log.purpose}` })),
     ...customerVerificationEvents.map(event => ({ time: event.timestamp, icon: ShieldCheck, title: 'Verification Done', detail: event.verification_id ? `${event.status} through ${event.provider} · proof ${event.verification_id}` : `${event.from_status || 'New'} to ${event.to_status || event.status} by ${event.user || event.updated_by}` }))
   ].sort((a, b) => new Date(b.time) - new Date(a.time));
 
@@ -1010,6 +1021,8 @@ function SettingsView({ api, notify }) {
   const [areas, setAreas] = useState([]);
   const [backups, setBackups] = useState([]);
   const [area, setArea] = useState({ code: '', name: '' });
+  const [passwords, setPasswords] = useState({ current_password: '', new_password: '', confirm_password: '' });
+  const [passwordError, setPasswordError] = useState('');
   const load = async () => {
     setAreas((await api('/api/bootstrap')).areas);
     setBackups(await api('/api/backups'));
@@ -1027,6 +1040,15 @@ function SettingsView({ api, notify }) {
     notify('Manual backup completed and logged.');
     load();
   }
+  async function changePassword(e) {
+    e.preventDefault(); setPasswordError('');
+    if (passwords.new_password !== passwords.confirm_password) return setPasswordError('New passwords do not match.');
+    try {
+      await api('/api/auth/change-password', { method:'POST', body:JSON.stringify({ current_password:passwords.current_password, new_password:passwords.new_password }) });
+      setPasswords({ current_password:'', new_password:'', confirm_password:'' });
+      notify('Password changed. All other signed-in sessions were revoked.');
+    } catch(err) { setPasswordError(err.message); }
+  }
   return (
     <div className="split-layout">
       <form className="panel form-panel" onSubmit={addArea}>
@@ -1040,6 +1062,14 @@ function SettingsView({ api, notify }) {
         <button className="primary" onClick={backup}><DatabaseBackup size={18} /> Run manual backup</button>
         <table><thead><tr><th>ID</th><th>Timestamp</th><th>Status</th></tr></thead><tbody>{backups.map(b => <tr key={b.id}><td>{b.id}</td><td>{date(b.timestamp)}</td><td><CheckCircle2 size={16} /> {b.status}</td></tr>)}</tbody></table>
       </section>
+      <form className="panel form-panel" onSubmit={changePassword}>
+        <div className="panel-head"><h2>Change owner password</h2><span>Revokes every other active session</span></div>
+        <label>Current password<input required type="password" autoComplete="current-password" value={passwords.current_password} onChange={e=>setPasswords({...passwords,current_password:e.target.value})}/></label>
+        <label>New password<input required type="password" minLength="12" autoComplete="new-password" value={passwords.new_password} onChange={e=>setPasswords({...passwords,new_password:e.target.value})}/><small>12+ characters with uppercase, lowercase, number and symbol.</small></label>
+        <label>Confirm new password<input required type="password" minLength="12" autoComplete="new-password" value={passwords.confirm_password} onChange={e=>setPasswords({...passwords,confirm_password:e.target.value})}/></label>
+        {passwordError && <div className="error" role="alert">{passwordError}</div>}
+        <button className="primary">Update password securely</button>
+      </form>
     </div>
   );
 }
@@ -1116,7 +1146,7 @@ function AiAssistant({ api, onClose }) {
         const list = payments.filter(p => Number(p.amount) > 10000);
         answer = `${list.length} payments above ₹10,000 found${list.length ? `: ${list.slice(0,6).map(p => `${p.receipt_no} ${money(p.amount)}`).join(', ')}.` : '.'}`;
       } else if (lower.includes('profit') || lower.includes('interest income')) {
-        const projected = loans.reduce((sum,l) => sum + Number(l.principal||0) * Number(l.interest_rate||0) / 100, 0);
+        const projected = loans.reduce((sum,l) => sum + Number(l.contract_interest||0), 0);
         answer = `Projected portfolio interest is ${money(projected)}. For a period-specific realised figure, open Reports → Profit Report.`;
       } else if (lower.includes('cash balance') || lower.includes('cash in hand')) {
         const cash = payments.filter(p => p.mode === 'Cash').reduce((sum,p) => sum + Number(p.amount||0),0);
@@ -1169,7 +1199,7 @@ function CommandPalette({ onSelect, onClose }) {
 }
 
 function LoanTable({ rows }) {
-  return <div className="table-scroll"><table><thead><tr><th>Loan</th><th>Customer</th><th>Scheme</th><th>Installment</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead><tbody>{rows.map(l => <tr key={l.loan_id}><td>{l.loan_id}<small>{date(l.borrow_date)}</small></td><td>{l.customer_name || l.customer_id}<small>{l.area}</small></td><td>{l.loan_type}</td><td>{money(l.installment)}</td><td>{money(l.paid)}</td><td>{money(l.balance)}</td><td><Status value={l.status} /></td></tr>)}</tbody></table></div>;
+  return <div className="table-scroll"><table><thead><tr><th>Loan</th><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th><th>Status</th></tr></thead><tbody>{rows.map(l => <tr key={l.loan_id}><td>{l.loan_id}<small>{date(l.borrow_date)}</small></td><td>{l.customer_name || l.customer_id}<small>{l.area}</small></td><td>{l.frequency || l.loan_type}</td><td>{money(l.installment)}</td><td>{money(l.paid)}</td><td>{money(l.balance)}</td><td>{l.remaining_installments ?? '—'}<small>{l.frequency ? `${l.frequency} installments` : ''}</small></td><td>{l.next_due_date ? date(l.next_due_date) : 'Completed'}</td><td><Status value={l.status} /></td></tr>)}</tbody></table></div>;
 }
 
 function ReceiptModal({ title, data, onClose }) {

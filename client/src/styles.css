@@ -792,6 +792,10 @@ html, body, #root { width: 100%; max-width: 100%; overflow-x: hidden; }
 .customer-suggestions button { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 3px 12px 3px 12px; color: var(--text); background: var(--panel); text-align: left; }
 .customer-suggestions button span { display: grid; gap: 2px; }
 .customer-suggestions button small { color: var(--muted); }
+.area-drilldowns { display: grid; gap: 10px; margin-top: 16px; }
+.area-drilldowns details { border: 1px solid var(--line); border-radius: 3px 14px 3px 14px; background: var(--surface-alt); }
+.area-drilldowns summary { cursor: pointer; padding: 14px 16px; font-weight: 750; }
+.area-drilldowns details[open] summary { border-bottom: 1px solid var(--line); }
 
 @media (max-width: 1100px) {
   .login-page {

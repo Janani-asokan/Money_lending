@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from bson import json_util
@@ -128,6 +129,21 @@ VERIFICATION_STATUSES = {
 async def production_headers(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))[:100]
     started = time.perf_counter()
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {"/api/auth/login", "/api/auth/refresh"}:
+        origin = request.headers.get("Origin")
+        if origin and origin not in CORS_ORIGINS:
+            return Response(content='{"detail":"Untrusted request origin"}', status_code=403, media_type="application/json")
+        access_token = request.cookies.get(ACCESS_COOKIE, "")
+        if access_token:
+            try:
+                token_payload = jwt.decode(access_token, APP_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+                auth_session = await find_one("auth_sessions", {"session_id": token_payload.get("sid")})
+                supplied_csrf = request.headers.get("X-CSRF-Token", "")
+                expected_hash = auth_session.get("csrf_hash", "") if auth_session else ""
+                if not supplied_csrf or not expected_hash or not hmac.compare_digest(hashlib.sha256(supplied_csrf.encode()).hexdigest(), expected_hash):
+                    return Response(content='{"detail":"Invalid or missing CSRF token"}', status_code=403, media_type="application/json")
+            except JWTError:
+                pass
     response: Response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -181,6 +197,18 @@ def validate_production_config() -> None:
 class LoginIn(BaseModel):
     username: str = Field(min_length=2, max_length=80)
     password: str = Field(min_length=6, max_length=200)
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str = Field(min_length=6, max_length=200)
+    new_password: str = Field(min_length=12, max_length=200)
+
+    @field_validator("new_password")
+    @classmethod
+    def strong_password(cls, value: str) -> str:
+        if not all((any(c.islower() for c in value), any(c.isupper() for c in value), any(c.isdigit() for c in value), any(not c.isalnum() for c in value))):
+            raise ValueError("New password must include uppercase, lowercase, number, and symbol")
+        return value
 
 
 class CustomerIn(BaseModel):
@@ -456,6 +484,21 @@ def now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+BUSINESS_TIMEZONE = ZoneInfo(os.getenv("BUSINESS_TIMEZONE", "Asia/Kolkata"))
+
+
+def business_now() -> datetime:
+    return now().astimezone(BUSINESS_TIMEZONE)
+
+
+def business_date_key(value: str) -> str:
+    return parse_date(value).astimezone(BUSINESS_TIMEZONE).date().isoformat()
+
+
+def business_month_key(value: str) -> str:
+    return parse_date(value).astimezone(BUSINESS_TIMEZONE).strftime("%Y-%m")
+
+
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
@@ -657,7 +700,7 @@ def create_token(user: dict[str, Any], session_id: str) -> str:
 
 
 def public_user(user: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in user.items() if k != "password_hash"}
+    return {k: v for k, v in user.items() if k not in {"password_hash", "initial_password_fingerprint"}}
 
 
 async def find_many(collection: str, query: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
@@ -702,6 +745,7 @@ async def ensure_indexes() -> None:
     if USE_MEMORY:
         return
     await db.customers.create_index("customer_id", name="idx_customers_customer_id", unique=True)
+    await db.customers.create_index("mobile", name="idx_customers_mobile", unique=True)
     indexes = await db.customers.index_information()
     aadhaar_index = indexes.get("idx_customers_aadhaar_hash")
     expected_partial = {"aadhaar_hash": {"$type": "string"}}
@@ -712,6 +756,9 @@ async def ensure_indexes() -> None:
         partialFilterExpression=expected_partial,
     )
     await db.loans.create_index("loan_id", name="idx_loans_loan_id", unique=True)
+    await db.users.create_index("username", name="idx_users_username", unique=True)
+    await db.auth_sessions.create_index("session_id", name="idx_auth_session_id", unique=True)
+    await db.auth_sessions.create_index("expires_at", name="idx_auth_session_expiry", expireAfterSeconds=0)
     await db.payments.create_index("receipt_no", name="idx_payments_receipt_no", unique=True)
     await db.payments.create_index("request_id", name="idx_payments_request_id", unique=True, sparse=True)
     await db.audit_logs.create_index("id", name="idx_audit_id", unique=True)
@@ -912,7 +959,7 @@ def loan_schedule(loan: dict[str, Any]) -> dict[str, Any]:
             "expected_completion": loan.get("maturity_date"),
         }
     borrow = parse_date(loan["borrow_date"])
-    total_payable = round(float(loan["principal"]) * (1 + float(loan.get("interest_rate", 0)) / 100), 2)
+    total_payable = round(float(loan.get("total_repayment", float(loan["principal"]) + float(loan.get("contract_interest", 0)))), 2)
     if loan["loan_type"] == "Daily 100-Day":
         installment = round(total_payable / 100, 2)
         expected = borrow + timedelta(days=100)
@@ -935,6 +982,19 @@ async def enrich_loan(loan: dict[str, Any]) -> dict[str, Any]:
     borrow = parse_date(loan["borrow_date"])
     elapsed = max((now() - borrow).days, 0)
     schedule = loan_schedule(loan)
+    schedule_doc = await find_one("loan_schedules", {"loan_id": loan["loan_id"], "version": int(loan.get("schedule_version", 1))})
+    repayment_rows = [row for row in (schedule_doc or {}).get("rows", []) if not row.get("moratorium") and float(row.get("payment", 0)) > 0]
+    paid_remaining = Decimal(str(paid))
+    installments_paid = 0
+    next_due_date = None
+    for row in repayment_rows:
+        due = Decimal(str(row.get("payment", 0)))
+        if paid_remaining >= due:
+            installments_paid += 1; paid_remaining -= due
+        elif next_due_date is None:
+            next_due_date = row.get("due_date")
+    remaining_installments = max(len(repayment_rows) - installments_paid, 0)
+    frequency = "Daily" if loan["loan_type"] == "Daily 100-Day" else "Weekly" if loan["loan_type"] == "Weekly" else "Monthly"
     status_value = loan.get("status", "Active")
     if balance <= 0:
         status_value = "Closed"
@@ -949,6 +1009,8 @@ async def enrich_loan(loan: dict[str, Any]) -> dict[str, Any]:
         "principal_balance": from_paise(balances["principal_balance_paise"]),
         "interest_balance": from_paise(balances["interest_balance_paise"]),
         "penalty_balance": from_paise(balances["penalty_balance_paise"]),
+        "frequency": frequency, "installments_paid": installments_paid,
+        "remaining_installments": remaining_installments, "next_due_date": next_due_date,
         "days_elapsed": elapsed, "status": status_value,
     }
 
@@ -1028,7 +1090,8 @@ async def seed_data() -> None:
             password_fingerprint = hmac.new(
                 APP_SECRET_KEY.encode(), admin_password.encode(), hashlib.sha256
             ).hexdigest()
-            if not hmac.compare_digest(owner.get("initial_password_fingerprint", ""), password_fingerprint):
+            managed_fingerprint = owner.get("initial_password_fingerprint", "")
+            if managed_fingerprint != "user-managed" and not hmac.compare_digest(managed_fingerprint, password_fingerprint):
                 await db.users.update_one(
                     {"_id": owner["_id"]},
                     {"$set": {
@@ -1238,9 +1301,15 @@ async def health() -> dict[str, Any]:
                 "last_completed_at": latest.get("timestamp"),
                 "last_backup_present": (BACKUP_DIR / latest.get("filename", "")).is_file(),
             })
+    production_gaps = []
+    if APP_ENV == "production" and OFFSITE_BACKUP_DIR is None: production_gaps.append("offsite_backup_not_configured")
+    if APP_ENV == "production" and not os.getenv("AUDIT_ARCHIVE_DIR", "").strip(): production_gaps.append("external_audit_archive_not_configured")
+    if APP_ENV == "production" and not (AADHAAR_AUTH_PROVIDER_URL and AADHAAR_AUTH_PROVIDER_KEY): production_gaps.append("aadhaar_provider_not_configured")
     return {
         "ok": True,
         "ready": True,
+        "production_ready": not production_gaps,
+        "production_gaps": production_gaps,
         "database": database_status,
         "environment": APP_ENV,
         "release": os.getenv("RENDER_GIT_COMMIT", "local")[:8],
@@ -1287,9 +1356,11 @@ async def login(payload: LoginIn, request: Request, response: Response) -> dict[
     attempts.clear()
     session_id = str(uuid.uuid4())
     refresh_token = secrets.token_urlsafe(48)
+    csrf_token = secrets.token_urlsafe(32)
     session_record = {
         "session_id": session_id, "user_id": user["id"],
         "refresh_hash": hashlib.sha256(refresh_token.encode()).hexdigest(),
+        "csrf_hash": hashlib.sha256(csrf_token.encode()).hexdigest(),
         "created_at": iso(now()), "last_rotated_at": iso(now()),
         "expires_at": now() + timedelta(days=REFRESH_TOKEN_DAYS), "revoked_at": None,
         "ip": request.client.host if request.client else "local",
@@ -1299,7 +1370,7 @@ async def login(payload: LoginIn, request: Request, response: Response) -> dict[
     token = create_token(user, session_id)
     set_auth_cookies(response, request, token, refresh_token)
     await audit(user, "login", "user", user["id"], {"session_id": session_id, "user_agent": session_record["user_agent"]}, request)
-    return {"token": token, "user": public_user(user), "session_expires_in_seconds": ACCESS_TOKEN_MINUTES * 60}
+    return {"user": public_user(user), "csrf_token": csrf_token, "session_expires_in_seconds": ACCESS_TOKEN_MINUTES * 60}
 
 
 @app.post("/api/auth/refresh")
@@ -1331,6 +1402,41 @@ async def refresh_session(request: Request, response: Response) -> dict[str, Any
     return {"user": public_user(user), "session_expires_in_seconds": ACCESS_TOKEN_MINUTES * 60}
 
 
+@app.get("/api/auth/csrf")
+async def issue_csrf(request: Request, user: dict[str, Any] = Depends(current_user)) -> dict[str, str]:
+    token = request.cookies.get(ACCESS_COOKIE, "")
+    payload = jwt.decode(token, APP_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    csrf_token = secrets.token_urlsafe(32)
+    csrf_hash = hashlib.sha256(csrf_token.encode()).hexdigest()
+    if USE_MEMORY:
+        session = await find_one("auth_sessions", {"session_id": payload["sid"]})
+        session["csrf_hash"] = csrf_hash
+        await replace_one("auth_sessions", {"session_id": payload["sid"]}, session)
+    else:
+        await db.auth_sessions.update_one({"session_id": payload["sid"], "user_id": user["id"]}, {"$set": {"csrf_hash": csrf_hash}})
+    return {"csrf_token": csrf_token}
+
+
+@app.post("/api/auth/change-password")
+async def change_password(payload: PasswordChangeIn, request: Request, user: dict[str, Any] = Depends(current_user)) -> dict[str, str]:
+    if not pwd_context.verify(payload.current_password, user["password_hash"]):
+        raise HTTPException(422, "Current password is incorrect")
+    if pwd_context.verify(payload.new_password, user["password_hash"]):
+        raise HTTPException(422, "New password must be different")
+    access = request.cookies.get(ACCESS_COOKIE, "")
+    token_payload = jwt.decode(access, APP_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    updates = {"password_hash": pwd_context.hash(payload.new_password), "must_change_password": False, "password_changed_at": iso(now()), "initial_password_fingerprint": "user-managed"}
+    if USE_MEMORY:
+        user.update(updates); await replace_one("users", {"id": user["id"]}, user)
+        for session in await find_many("auth_sessions", {"user_id": user["id"]}):
+            if session["session_id"] != token_payload["sid"]: session["revoked_at"] = iso(now()); await replace_one("auth_sessions", {"session_id": session["session_id"]}, session)
+    else:
+        await db.users.update_one({"id": user["id"]}, {"$set": updates})
+        await db.auth_sessions.update_many({"user_id": user["id"], "session_id": {"$ne": token_payload["sid"]}}, {"$set": {"revoked_at": iso(now())}})
+    await audit(user, "password_changed", "user", user["id"], {"other_sessions_revoked": True}, request)
+    return {"status": "Password changed; other sessions revoked"}
+
+
 @app.post("/api/auth/logout")
 async def logout(request: Request, response: Response, user: dict[str, Any] = Depends(current_user)) -> dict[str, str]:
     token = request.cookies.get(ACCESS_COOKIE) or request.headers.get("Authorization", "").removeprefix("Bearer ")
@@ -1348,7 +1454,7 @@ async def logout(request: Request, response: Response, user: dict[str, Any] = De
 @app.get("/api/auth/sessions")
 async def list_sessions(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
     rows = await find_many("auth_sessions", {"user_id": user["id"]})
-    return [{k: v for k, v in row.items() if k != "refresh_hash"} for row in sorted(rows, key=lambda x: x["created_at"], reverse=True)]
+    return [{k: v for k, v in row.items() if k not in {"refresh_hash", "csrf_hash"}} for row in sorted(rows, key=lambda x: x["created_at"], reverse=True)]
 
 
 @app.delete("/api/auth/sessions/{session_id}")
@@ -1389,10 +1495,10 @@ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
     customers = [await customer_view(x) for x in await find_many("customers") if not x.get("profile_deleted_at")]
     loans = [await enrich_loan(x) for x in await find_many("loans")]
     payments = await find_many("payments")
-    today_key = now().date().isoformat()
-    month_key = now().strftime("%Y-%m")
-    today_payments = [p for p in payments if p["timestamp"][:10] == today_key]
-    month_payments = [p for p in payments if p["timestamp"][:7] == month_key]
+    today_key = business_now().date().isoformat()
+    month_key = business_now().strftime("%Y-%m")
+    today_payments = [p for p in payments if business_date_key(p["timestamp"]) == today_key]
+    month_payments = [p for p in payments if business_month_key(p["timestamp"]) == month_key]
     area_summary = []
     for area in await find_many("areas"):
         code = area["code"]
@@ -1412,6 +1518,11 @@ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
             "daily_loans": len([l for l in area_loans if l["loan_type"] == "Daily 100-Day"]),
             "weekly_loans": len([l for l in area_loans if l["loan_type"] == "Weekly"]),
             "monthly_loans": len([l for l in area_loans if l["loan_type"] == "Monthly EMI"]),
+            "customer_dues": [{
+                "customer_id": loan["customer_id"], "customer_name": next((c["name"] for c in area_customers if c["customer_id"] == loan["customer_id"]), loan["customer_id"]),
+                "loan_id": loan["loan_id"], "frequency": loan["frequency"], "paid": loan["paid"], "outstanding": loan["balance"],
+                "installment": loan["installment"], "remaining_installments": loan["remaining_installments"], "next_due_date": loan.get("next_due_date"), "status": loan["status"],
+            } for loan in area_loans if loan["status"] not in {"Closed", "Written Off"} and loan["balance"] > 0],
         })
     collector_breakdown = []
     for collector in await find_many("users", {"role": "collector"}):
@@ -2664,7 +2775,7 @@ async def build_report(payload: ReportRequest) -> dict[str, Any]:
             "month": month,
             "collections": round(sum(p["amount"] for p in monthly), 2),
             "disbursements": round(sum(l["principal"] for l in disbursed), 2),
-            "interest_earned": round(sum(l["principal"] * l["interest_rate"] / 100 for l in disbursed), 2),
+            "interest_earned": round(sum(float(l.get("contract_interest", 0)) for l in disbursed), 2),
             "new_customers": len([c for c in customers_rows if c["created_at"][:7] == month]),
             "loans_closed": len([l for l in loans_rows if l["status"] == "Closed"]),
             "new_overdue": len([l for l in loans_rows if l["status"] == "Overdue"]),
@@ -2683,7 +2794,7 @@ async def build_report(payload: ReportRequest) -> dict[str, Any]:
         return {"title": "Collector Performance Report", "collectors": summary}
     if payload.report_type == "profit-report":
         interest = round(sum(max(l["paid"] - l["principal"], 0) for l in loans_rows), 2)
-        projected = round(sum(l["principal"] * l["interest_rate"] / 100 for l in loans_rows), 2)
+        projected = round(sum(float(l.get("contract_interest", 0)) for l in loans_rows), 2)
         return {"title": "Profit & Interest Report", "realised_interest": interest, "projected_interest": projected, "active_loans": len([l for l in loans_rows if l["status"] == "Active"])}
     if payload.report_type == "recovery-rate":
         due = sum(l["paid"] + l["balance"] for l in loans_rows)
