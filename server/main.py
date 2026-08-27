@@ -745,8 +745,19 @@ async def ensure_indexes() -> None:
     if USE_MEMORY:
         return
     await db.customers.create_index("customer_id", name="idx_customers_customer_id", unique=True)
-    await db.customers.create_index("mobile", name="idx_customers_mobile", unique=True)
     indexes = await db.customers.index_information()
+    mobile_index = indexes.get("idx_customers_mobile")
+    if mobile_index and not mobile_index.get("unique", False):
+        duplicates = await db.customers.aggregate([
+            {"$match": {"profile_deleted_at": {"$exists": False}, "mobile": {"$type": "string"}}},
+            {"$group": {"_id": "$mobile", "count": {"$sum": 1}}},
+            {"$match": {"count": {"$gt": 1}}},
+            {"$limit": 10},
+        ]).to_list(length=10)
+        if duplicates:
+            raise RuntimeError("Duplicate customer mobiles must be resolved before enabling uniqueness: " + ", ".join(str(item["_id"]) for item in duplicates))
+        await db.customers.drop_index("idx_customers_mobile")
+    await db.customers.create_index("mobile", name="idx_customers_mobile", unique=True)
     aadhaar_index = indexes.get("idx_customers_aadhaar_hash")
     expected_partial = {"aadhaar_hash": {"$type": "string"}}
     if aadhaar_index and aadhaar_index.get("partialFilterExpression") != expected_partial:
