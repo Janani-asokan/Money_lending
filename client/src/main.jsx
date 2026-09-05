@@ -16,6 +16,8 @@ const CalendarClock = Icons.CalendarClock || Icons.Calendar || FallbackIcon;
 const CircleGauge = Icons.CircleGauge || Icons.Gauge || FallbackIcon;
 const CheckCircle2 = Icons.CheckCircle2 || Icons.CircleCheck || FallbackIcon;
 const ChevronRight = Icons.ChevronRight || FallbackIcon;
+const PanelLeftClose = Icons.PanelLeftClose || Icons.ChevronsLeft || FallbackIcon;
+const PanelLeftOpen = Icons.PanelLeftOpen || Icons.ChevronsRight || FallbackIcon;
 const ContactRound = Icons.ContactRound || Icons.UserRound || FallbackIcon;
 const CreditCard = Icons.CreditCard || FallbackIcon;
 const DatabaseBackup = Icons.DatabaseBackup || Icons.Database || FallbackIcon;
@@ -136,6 +138,7 @@ function App() {
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [selectedCustomerId, setSelectedCustomerId] = useState('');
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('stf_sidebar_collapsed') === 'true');
   const api = useApi(setUser);
   const t = lang === 'ta' ? {
     ...TEXT.en,
@@ -151,6 +154,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem('stf_lang', lang);
   }, [lang]);
+
+  useEffect(() => {
+    localStorage.setItem('stf_sidebar_collapsed', String(sidebarCollapsed));
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     api('/api/me').then(async userData => { await api('/api/auth/csrf'); setUser(userData); }).catch(() => setUser(null)).finally(() => setAuthChecked(true));
@@ -188,8 +195,9 @@ function App() {
   ].filter(x => x[3]);
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar">
+        <button className="sidebar-toggle" aria-label={sidebarCollapsed ? 'Expand navigation menu' : 'Collapse navigation menu'} aria-expanded={!sidebarCollapsed} title={sidebarCollapsed ? 'Expand menu' : 'Collapse menu'} onClick={()=>setSidebarCollapsed(value=>!value)}>{sidebarCollapsed ? <PanelLeftOpen size={18}/> : <PanelLeftClose size={18}/>}</button>
         <div className="brand">
           <div className="brand-mark"><img src="/logo-mark.svg" alt="" /></div>
           <div>
@@ -199,7 +207,7 @@ function App() {
         </div>
         <nav>
           {nav.map(([id, label, Icon]) => (
-            <button key={id} className={view === id ? 'nav-item active' : 'nav-item'} onClick={() => setView(id)}>
+            <button key={id} title={sidebarCollapsed ? label : undefined} aria-current={view === id ? 'page' : undefined} className={view === id ? 'nav-item active' : 'nav-item'} onClick={() => setView(id)}>
               <Icon size={18} />
               <span>{label}</span>
             </button>
@@ -371,7 +379,7 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user }) {
           <Metric icon={ReceiptIndianRupee} label="Monthly collection" value={money(totals.monthly_collection)} />
           <Metric icon={AlertTriangle} label="Pending collection" value={money(Math.max(expectedCollection - totals.monthly_collection, 0))} />
         </div>
-        {data.cashflow.length ? <BarChart data={data.cashflow} x="month" y="collection" /> : <div className="empty-chart"><FileBarChart2 size={24}/><strong>No collections posted yet</strong><span>The monthly trend will appear after the first payment.</span></div>}
+        {data.cashflow.length ? <CollectionTrend data={data.cashflow} /> : <div className="empty-chart"><FileBarChart2 size={24}/><strong>No collections posted yet</strong><span>The monthly trend will appear after the first payment.</span></div>}
       </section>
       <section className="panel">
         <div className="panel-head"><h2>Loan portfolio mix</h2><span>Daily, weekly and monthly plans</span></div>
@@ -385,7 +393,7 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user }) {
       </section>
       <section className="panel wide area-performance">
         <div className="panel-head"><h2>Areas requiring collection</h2><span>Click an area, then click a customer for their complete profile</span></div>
-        {collectibleAreas.length ? <div className="area-drilldowns">{collectibleAreas.map(area => <details key={area.area}><summary>{area.area} · {area.name} — {area.customers_with_dues} customers to collect · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.map(item => <tr key={item.loan_id}><td><button className="table-link" onClick={() => onOpenCustomer(item.customer_id)}>{item.customer_name}</button><small>{item.customer_id}</small></td><td>{item.frequency}<small>{item.loan_id}</small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? date(item.next_due_date) : 'Completed'}</td></tr>)}</tbody></table></div></details>)}</div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No area requires collection</strong><span>All active balances are clear.</span></div>}
+        {collectibleAreas.length ? <div className="area-drilldowns">{collectibleAreas.map(area => <details key={area.area}><summary>{area.name || area.area} — {area.customers_with_dues} customers to collect · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.map(item => <tr key={item.loan_id}><td><button className="table-link" onClick={() => onOpenCustomer(item.customer_id)}>{item.customer_name}</button><small>{item.customer_id}</small></td><td>{item.frequency}<small>{item.loan_id}</small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? date(item.next_due_date) : 'Completed'}</td></tr>)}</tbody></table></div></details>)}</div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No area requires collection</strong><span>All active balances are clear.</span></div>}
       </section>
       <section className="panel">
         <div className="panel-head"><h2>Collector performance</h2><span>Collection volume and receipt count</span></div>
@@ -421,6 +429,7 @@ function Customers({ api, user, notify }) {
   const [updatingCustomerId, setUpdatingCustomerId] = useState('');
   const [deleteCandidate, setDeleteCandidate] = useState(null);
   const [deleteForm, setDeleteForm] = useState({ confirmation:'', reason:'', understood:false });
+  const [editCandidate, setEditCandidate] = useState(null);
   const load = async (query = customerQuery) => {
     const boot = await api('/api/bootstrap');
     setAreas(boot.areas);
@@ -445,7 +454,7 @@ function Customers({ api, user, notify }) {
     ).slice(0, 4);
   }, [knownCustomers, form.name, form.mobile]);
   function usePreviousCustomer(customer) {
-    setForm(current => ({ ...current, name: customer.name || '', father_name: customer.father_name || '', mobile: customer.mobile || '', address: customer.address || '', area: customer.area || current.area, guarantor: customer.guarantor || '' }));
+    setForm(current => ({ ...current, name: customer.name || '', father_name: customer.father_name || '', mobile: customer.mobile || '', address: customer.address || '', area: customer.area_code || customer.area || current.area, guarantor: customer.guarantor || '' }));
     setReceipt({ type: 'Existing Customer Selected', ack: customer.customer_id, customer });
     notify(`Loaded existing customer ${customer.customer_id}. Create another loan from the Loans page; no duplicate profile was created.`);
   }
@@ -519,6 +528,32 @@ function Customers({ api, user, notify }) {
     } catch (err) { setFormError(err.message); }
     finally { setUpdatingCustomerId(''); }
   }
+  async function saveCustomerEdit(e) {
+    e.preventDefault();
+    if (!editCandidate) return;
+    setFormError('');
+    try {
+      setUpdatingCustomerId(editCandidate.customer_id);
+      await api(`/api/customers/${encodeURIComponent(editCandidate.customer_id)}`, {
+        method:'PATCH',
+        body:JSON.stringify({
+          name:editCandidate.name,
+          father_name:editCandidate.father_name,
+          mobile:editCandidate.mobile,
+          address:editCandidate.address,
+          area:editCandidate.area_code || editCandidate.area,
+          guarantor:editCandidate.guarantor || ''
+        })
+      });
+      notify(`Customer ${editCandidate.customer_id} updated. The before-and-after values were audited.`);
+      setEditCandidate(null);
+      await load();
+    } catch(err) {
+      setFormError(err.message || 'Customer details could not be updated.');
+    } finally {
+      setUpdatingCustomerId('');
+    }
+  }
   async function unmask(id) {
     const purpose = window.prompt('Specific purpose for viewing Aadhaar:');
     if (!purpose) return;
@@ -532,6 +567,7 @@ function Customers({ api, user, notify }) {
   async function viewApproved(r) { const result = await api(`/api/customers/${r.customer_id}/aadhaar?access_request_id=${encodeURIComponent(r.request_id)}`); setFullAadhaar(current=>({...current,[r.customer_id]:result.aadhaar})); window.setTimeout(()=>setFullAadhaar(current=>({...current,[r.customer_id]:undefined})),15000); await load(); }
   return (
     <div className="split-layout">
+      {['owner','manager'].includes(user.role) && <section className="panel full customer-editor"><div className="panel-head"><div><span className="section-kicker">Customer corrections</span><h2>Edit an existing customer</h2></div><select aria-label="Select customer to edit" value={editCandidate?.customer_id || ''} onChange={e=>setEditCandidate(rows.find(row=>row.customer_id===e.target.value) || null)}><option value="">Select customer</option>{rows.map(row=><option key={row.customer_id} value={row.customer_id}>{row.name} · {row.customer_id}</option>)}</select></div>{editCandidate && <form onSubmit={saveCustomerEdit}><div className="two-col"><label>Name<input required minLength="2" value={editCandidate.name} onChange={e=>setEditCandidate({...editCandidate,name:e.target.value})}/></label><label>Father's name<input required minLength="2" value={editCandidate.father_name} onChange={e=>setEditCandidate({...editCandidate,father_name:e.target.value})}/></label><label>Mobile<input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" value={editCandidate.mobile} onChange={e=>setEditCandidate({...editCandidate,mobile:e.target.value.replace(/\D/g,'').slice(0,10)})}/></label><label>Area<select value={editCandidate.area_code || editCandidate.area} onChange={e=>setEditCandidate({...editCandidate,area_code:e.target.value})}>{areas.map(a=><option key={a.code} value={a.code}>{a.name}</option>)}</select></label></div><label>Address<textarea required minLength="5" value={editCandidate.address} onChange={e=>setEditCandidate({...editCandidate,address:e.target.value})}/></label><label>Guarantor<input value={editCandidate.guarantor || ''} onChange={e=>setEditCandidate({...editCandidate,guarantor:e.target.value})}/></label><div className="locked-note">Customer ID and Aadhaar identity remain locked. Every correction is recorded in the audit trail.</div><div className="action-row"><button type="button" className="ghost" onClick={()=>setEditCandidate(null)}>Cancel</button><button className="primary" disabled={updatingCustomerId===editCandidate.customer_id}>{updatingCustomerId===editCandidate.customer_id?'Saving…':'Save customer changes'}</button></div></form>}</section>}
       <form className="panel form-panel" onSubmit={submit}>
         <div className="panel-head"><div><span className="section-kicker">Secure onboarding</span><h2>Register a customer</h2></div><ShieldCheck size={22} /></div>
         <div className="segmented-control"><button type="button" className={registrationMode === 'aadhaar' ? 'active' : ''} onClick={() => setRegistrationMode('aadhaar')}>Aadhaar registration</button><button type="button" className={registrationMode === 'manual' ? 'active' : ''} onClick={() => { setRegistrationMode('manual'); setForm({ ...form, aadhaar: '' }); }}>Manual registration</button></div>
@@ -541,7 +577,7 @@ function Customers({ api, user, notify }) {
           <label>Father's name<input required value={form.father_name} onChange={e => setForm({ ...form, father_name: e.target.value })} /></label>
           <label>Mobile<input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" value={form.mobile} onChange={e => setForm({ ...form, mobile: e.target.value.replace(/\D/g, '') })} /></label>
           {registrationMode === 'aadhaar' && <><label>Aadhaar<input required inputMode="numeric" minLength="12" maxLength="12" pattern="[0-9]{12}" value={form.aadhaar} onChange={e => setForm({ ...form, aadhaar: e.target.value.replace(/\D/g, '') })} /></label><label>Purpose disclosed<input required minLength="5" value={form.aadhaar_consent_purpose} onChange={e=>setForm({...form,aadhaar_consent_purpose:e.target.value})}/></label><label>Consent reference<input required minLength="3" placeholder="Signed form / OTP reference" value={form.aadhaar_consent_reference} onChange={e=>setForm({...form,aadhaar_consent_reference:e.target.value})}/></label><label className="check-row"><input type="checkbox" checked={form.aadhaar_consent_given} onChange={e=>setForm({...form,aadhaar_consent_given:e.target.checked})}/> Customer gave informed consent for this disclosed purpose</label></>}
-          <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code}>{a.code}</option>)}</select></label>
+          <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code} value={a.code}>{a.name}</option>)}</select></label>
           <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
         </div>
         {previousMatches.length > 0 && <div className="customer-suggestions" role="listbox" aria-label="Existing customer suggestions"><strong>Existing customer found</strong><small>Select the previous profile instead of creating a duplicate.</small>{previousMatches.map(customer => <button type="button" key={customer.customer_id} onClick={() => usePreviousCustomer(customer)}><span>{customer.name}<small>{customer.customer_id} · {customer.mobile}</small></span><ChevronRight size={17}/></button>)}</div>}
@@ -567,7 +603,7 @@ function Customers({ api, user, notify }) {
         <div className="table-scroll">
           <table>
             <thead><tr><th>ID</th><th>Name</th><th>Aadhaar</th><th>Status</th><th>Risk</th><th>Area</th><th>Actions</th></tr></thead>
-            <tbody>{rows.map(r => <tr key={r.customer_id}><td>{r.customer_id}</td><td><div className="table-person"><span>{r.name.split(' ').map(x => x[0]).join('').slice(0,2)}</span><div>{r.name}<small>{r.mobile}</small></div></div></td><td>{fullAadhaar[r.customer_id] || r.aadhaar_masked}{r.aadhaar_verified_at && <small>Verified {date(r.aadhaar_verified_at)}</small>}</td><td><Status value={r.status} /></td><td><Risk score={r.risk_score} /></td><td>{r.area}</td><td><div className="action-row">{['owner','manager'].includes(user.role) && <><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Pending Verification'} onClick={() => verify(r.customer_id, 'Pending Verification')}>Pending</button><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Manual Verification Approved'} onClick={() => verify(r.customer_id, 'Manual Verification Approved')}><CheckCircle2 size={15} /> Approve</button><button className="ghost danger" disabled={updatingCustomerId===r.customer_id || r.status==='Verification Failed'} onClick={() => verify(r.customer_id, 'Verification Failed')}><AlertTriangle size={15} /> Fail</button></>}{user.role === 'owner' && <button className="ghost danger" disabled={updatingCustomerId===r.customer_id || !r.can_delete_profile} title={r.can_delete_profile ? 'Requires two confirmations and a reason' : 'Complete all loans and clear every balance first'} onClick={() => requestDelete(r)}><X size={15} /> {r.can_delete_profile ? 'Delete customer' : 'Loan active'}</button>}</div></td></tr>)}</tbody>
+            <tbody>{rows.map(r => <tr key={r.customer_id}><td>{r.customer_id}</td><td><div className="table-person"><span>{r.name.split(' ').map(x => x[0]).join('').slice(0,2)}</span><div>{r.name}<small>{r.mobile}</small></div></div></td><td>{fullAadhaar[r.customer_id] || r.aadhaar_masked}{r.aadhaar_verified_at && <small>Verified {date(r.aadhaar_verified_at)}</small>}</td><td><Status value={r.status} /></td><td><Risk score={r.risk_score} /></td><td>{r.area_name || r.area}</td><td><div className="action-row">{['owner','manager'].includes(user.role) && <><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Pending Verification'} onClick={() => verify(r.customer_id, 'Pending Verification')}>Pending</button><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Manual Verification Approved'} onClick={() => verify(r.customer_id, 'Manual Verification Approved')}><CheckCircle2 size={15} /> Approve</button><button className="ghost danger" disabled={updatingCustomerId===r.customer_id || r.status==='Verification Failed'} onClick={() => verify(r.customer_id, 'Verification Failed')}><AlertTriangle size={15} /> Fail</button></>}{user.role === 'owner' && <button className="ghost danger" disabled={updatingCustomerId===r.customer_id || !r.can_delete_profile} title={r.can_delete_profile ? 'Requires two confirmations and a reason' : 'Complete all loans and clear every balance first'} onClick={() => requestDelete(r)}><X size={15} /> {r.can_delete_profile ? 'Delete customer' : 'Loan active'}</button>}</div></td></tr>)}</tbody>
           </table>
         </div>
       </section>
@@ -647,7 +683,7 @@ function Customer360({ api, initialCustomerId = '', user, notify }) {
       <section className="panel profile-card">
         <div className="avatar">{customer.name.split(' ').map(x => x[0]).slice(0, 2).join('')}</div>
         <h2>{customer.name}</h2>
-        <p>{customer.customer_id} - {customer.area} - {customer.mobile}</p>
+        <p>{customer.customer_id} - {customer.area_name || customer.area} - {customer.mobile}</p>
         <label>Customer<select value={customer.customer_id} onChange={e => setSelectedId(e.target.value)}>{customers.map(c => <option key={c.customer_id} value={c.customer_id}>{c.customer_id} - {c.name}</option>)}</select></label>
         <div className="profile-tags">
           <Status value={customer.status} />
@@ -692,15 +728,21 @@ function Loans({ api, notify, user }) {
   const [rows, setRows] = useState([]);
   const [boot, setBoot] = useState({ collectors: [], loan_types: [] });
   const [customers, setCustomers] = useState([]);
-  const [form, setForm] = useState({ customer_id: '', principal: 50000, interest_rate: 2.14, loan_type: 'Daily 100-Day', repayment_period: 100, collector_id: '', disbursement_mode: 'Cash', interest_method: 'Reducing', processing_fee: 0, tax_rate: 18, first_due_date: '', moratorium_periods: 0, moratorium_interest_capitalized: true, preclosure_charge_rate: 0, late_fee: 0, kfs_acknowledgement_reference: '', identity_verification_id: null });
+  const [form, setForm] = useState({ customer_id: '', principal: 50000, interest_rate: 2.14, loan_type: 'Daily 100-Day', repayment_period: 100, collector_id: '', disbursement_mode: 'Cash', interest_method: 'Upfront Monthly Flat', processing_fee: 0, tax_rate: 18, first_due_date: '', moratorium_periods: 0, moratorium_interest_capitalized: true, preclosure_charge_rate: 0, late_fee: 0, kfs_acknowledgement_reference: '', identity_verification_id: null });
   const [providerStatus, setProviderStatus] = useState({ configured:false, verified_disbursal_required:false });
   const [identity, setIdentity] = useState({ purpose:'Identity verification before loan disbursal', consent_reference:'', owner_notes:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, expires_at:'', resend_available_at:'' });
   const [identityError, setIdentityError] = useState('');
   const [identityBusy, setIdentityBusy] = useState(false);
   const [quote, setQuote] = useState(null);
+  const [loanDetails, setLoanDetails] = useState(null);
+  const [detailsBusy, setDetailsBusy] = useState(false);
+  const [closure, setClosure] = useState(null);
+  const [closureReceipt, setClosureReceipt] = useState(null);
   const [loanError, setLoanError] = useState('');
   const [savingLoan, setSavingLoan] = useState(false);
   const [service, setService] = useState({ loan_id: '', amount: '', strategy: 'Reduce EMI', effective_date: new Date().toISOString().slice(0,10), consent: '', annual_rate: 12, periods: 12, moratorium: 0, approval: '', reason: '' });
+  const [adjustmentPreview, setAdjustmentPreview] = useState(null);
+  const [adjustmentConfirmed, setAdjustmentConfirmed] = useState(false);
   const load = async () => {
     const b = await api('/api/bootstrap');
     const cs = await api('/api/customers');
@@ -735,6 +777,39 @@ function Loans({ api, notify, user }) {
     catch (err) { setQuote(null); setLoanError(err.message || 'Loan preview could not be generated.'); }
   }
   async function servicePost(path, body, message) { await api(path, { method:'POST', body:JSON.stringify(body) }); notify(message); await load(); }
+  async function closeLoanNow() {
+    const loan = rows.find(item=>item.loan_id===service.loan_id);
+    if (!loan || loan.balance <= 0) return notify('This loan is already completed.');
+    try {
+      const quote=await api(`/api/loans/${loan.loan_id}/preclosure-quote`);
+      setClosure({loan,quote,mode:'Cash',payment_reference:'',reason:'',confirmation:'',confirmed:false,busy:false,error:'',request_id:crypto.randomUUID()});
+    } catch(err) { setLoanError(err.message); }
+  }
+  async function submitClosure(e) {
+    e.preventDefault();
+    setClosure(current=>({...current,busy:true,error:''}));
+    try {
+      const result=await api(`/api/loans/${closure.loan.loan_id}/close`,{method:'POST',body:JSON.stringify({mode:closure.mode,payment_reference:closure.payment_reference || null,reason:closure.reason,confirmation:closure.confirmation,confirmed:closure.confirmed,request_id:closure.request_id})});
+      setClosureReceipt(result.receipt); setClosure(null); notify(`${result.loan.loan_id} closed with final receipt ${result.receipt.receipt_no}.`); await load();
+    } catch(err) { setClosure(current=>({...current,busy:false,error:err.message})); }
+  }
+  async function openLoanDetails(loanId) {
+    setLoanError(''); setDetailsBusy(true);
+    try { setLoanDetails(await api(`/api/loans/${encodeURIComponent(loanId)}/details`)); }
+    catch(err) { setLoanError(err.message || 'Loan details could not be loaded.'); }
+    finally { setDetailsBusy(false); }
+  }
+  async function postInterestRebate() {
+    if (!adjustmentPreview?.permitted) return notify('Preview a valid interest adjustment first.');
+    if (service.reason.trim().length < 5 || service.consent.trim().length < 3 || service.approval.trim().length < 3 || !adjustmentConfirmed) return notify('Reason, borrower acknowledgement, approval reference, and confirmation are required.');
+    await servicePost(`/api/loans/${service.loan_id}/adjustments`,{kind:'Interest Rebate',amount:Number(service.amount),reason:service.reason,borrower_acknowledgement_reference:service.consent,approval_reference:service.approval,confirmed:true,request_id:crypto.randomUUID()},'Interest rebate posted with a balanced ledger entry and audit trail.');
+    setAdjustmentPreview(null); setAdjustmentConfirmed(false);
+  }
+  async function previewInterestRebate() {
+    if (!service.loan_id || Number(service.amount) <= 0) return notify('Select a loan and enter a rebate amount greater than zero.');
+    try { setAdjustmentPreview(await api(`/api/loans/${encodeURIComponent(service.loan_id)}/adjustment-preview?amount=${encodeURIComponent(service.amount)}`)); setAdjustmentConfirmed(false); }
+    catch (err) { setAdjustmentPreview(null); setAdjustmentConfirmed(false); notify(err.message); }
+  }
   async function startIdentityOtp() { setIdentityError(''); setIdentityBusy(true); try { const result=await api('/api/aadhaar/otp/start',{method:'POST',body:JSON.stringify({customer_id:form.customer_id,purpose:identity.purpose,consent_reference:identity.consent_reference,proposed_disbursal_amount:Number(form.principal),owner_notes:identity.owner_notes})}); setIdentity({...identity,...result,verification_id:result.verification_id,otp:''}); notify(`OTP sent to ${result.masked_destination}.`); } catch(err) { setIdentityError(err.message); } finally { setIdentityBusy(false); } }
   async function verifyIdentityOtp() { if (![4,6].includes(identity.otp.length)) return setIdentityError('Enter exactly the 4 or 6-digit OTP sent to the customer.'); setIdentityError(''); setIdentityBusy(true); try { const result=await api('/api/aadhaar/otp/verify',{method:'POST',body:JSON.stringify({verification_id:identity.verification_id,otp:identity.otp})}); setForm({...form,identity_verification_id:result.verification_id}); setIdentity({...identity,otp:''}); notify('Automatic Aadhaar verification succeeded and was linked to this disbursal.'); } catch(err) { const match=err.message.match(/(\d+) attempts? remaining/i); setIdentity(current=>({...current,otp:'',attempts_remaining:match ? Number(match[1]) : err.message.toLowerCase().includes('locked') ? 0 : current.attempts_remaining})); setIdentityError(err.message); } finally { setIdentityBusy(false); } }
   async function resendIdentityOtp() { setIdentityError(''); setIdentityBusy(true); try { const result=await api('/api/aadhaar/otp/resend',{method:'POST',body:JSON.stringify({verification_id:identity.verification_id})}); setIdentity(current=>({...current,...result,otp:''})); notify('A new OTP was sent.'); } catch(err) { setIdentityError(err.message); } finally { setIdentityBusy(false); } }
@@ -746,10 +821,10 @@ function Loans({ api, notify, user }) {
         <label>Customer<select value={form.customer_id} onChange={e => setForm({ ...form, customer_id: e.target.value })}>{customers.map(c => <option key={c.customer_id}>{c.customer_id}</option>)}</select></label>
         <div className="two-col">
           <label>Principal<input type="number" value={form.principal} onChange={e => setForm({ ...form, principal: e.target.value })} /></label>
-          <label>Annual interest %<input type="number" value="2.14" readOnly aria-readonly="true" /><small>Approved fixed rate</small></label>
+          <label>Monthly interest %<input type="number" value="2.14" readOnly aria-readonly="true" /><small>2.14% per month, deducted before handover</small></label>
           <label>Loan type<select value={form.loan_type} onChange={e => setForm({ ...form, loan_type: e.target.value, repayment_period: e.target.value.includes('Daily') ? 100 : e.target.value === 'Weekly' ? 52 : 12 })}>{boot.loan_types.map(x => <option key={x}>{x}</option>)}</select></label>
           <label>Period<input type="number" value={form.repayment_period} onChange={e => setForm({ ...form, repayment_period: e.target.value })} /></label>
-          <label>Interest method<select value={form.interest_method} onChange={e=>setForm({...form,interest_method:e.target.value})}><option>Reducing</option><option>Flat</option></select></label>
+          <label>Interest method<input value="Monthly upfront deduction" readOnly aria-readonly="true" /></label>
           <label>Processing fee<input type="number" min="0" step="0.01" value={form.processing_fee} onChange={e=>setForm({...form,processing_fee:e.target.value})}/></label>
           <label>Tax on fee %<input type="number" min="0" step="0.01" value={form.tax_rate} onChange={e=>setForm({...form,tax_rate:e.target.value})}/></label>
           <label>First due date<input type="date" value={form.first_due_date} onChange={e=>setForm({...form,first_due_date:e.target.value})}/></label>
@@ -764,22 +839,39 @@ function Loans({ api, notify, user }) {
         <button type="button" className="ghost" onClick={preview}><FileText size={18}/> Preview APR, KFS and schedule</button>
         {loanError && <div className="error" role="alert">{loanError}</div>}
         <button className="primary" disabled={savingLoan || !form.customer_id || !form.collector_id}><FileText size={18} /> {savingLoan ? 'Creating loan…' : 'Create loan directly'}</button>
-        {quote && <div className="locked-note">APR {quote.apr}% · Net disbursed {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
+        {quote && <div className="locked-note">Monthly rate 2.14% · Interest deducted {money(quote.total_interest)} · Cash handed over {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
       </form>
       <section className="panel">
         <div className="panel-head"><h2>Loan book</h2><span>Multiple daily, weekly and monthly plans per customer</span></div>
-        <LoanTable rows={rows} />
+        <LoanTable rows={rows} onView={openLoanDetails} viewBusy={detailsBusy} />
         {rows.length > 0 && <div className="servicing-box">
           <h3>Controlled loan servicing</h3>
-          <label>Loan<select value={service.loan_id} onChange={e=>setService({...service,loan_id:e.target.value})}>{rows.map(l=><option key={l.loan_id}>{l.loan_id}</option>)}</select></label>
-          <div className="two-col"><label>Amount<input type="number" min="0.01" step="0.01" value={service.amount} onChange={e=>setService({...service,amount:e.target.value})}/></label><label>Effective date<input type="date" value={service.effective_date} onChange={e=>setService({...service,effective_date:e.target.value})}/></label></div>
+          <label>Loan<select value={service.loan_id} onChange={e=>{setService({...service,loan_id:e.target.value});setAdjustmentPreview(null);setAdjustmentConfirmed(false)}}>{rows.map(l=><option key={l.loan_id}>{l.loan_id}</option>)}</select></label>
+          <div className="two-col"><label>Amount<input type="number" min="0.01" step="0.01" value={service.amount} onChange={e=>{setService({...service,amount:e.target.value});setAdjustmentPreview(null);setAdjustmentConfirmed(false)}}/></label><label>Effective date<input type="date" value={service.effective_date} onChange={e=>setService({...service,effective_date:e.target.value})}/></label></div>
           <label>Borrower consent / approval reference<input value={service.consent} onChange={e=>setService({...service,consent:e.target.value})}/></label>
-          <div className="action-row"><select value={service.strategy} onChange={e=>setService({...service,strategy:e.target.value})}><option>Reduce EMI</option><option>Reduce Tenor</option></select><button className="ghost" onClick={()=>servicePost(`/api/loans/${service.loan_id}/part-payment`,{amount:Number(service.amount),strategy:service.strategy,effective_date:service.effective_date,borrower_consent_reference:service.consent,mode:'Bank Transfer'},'Part-payment posted and schedule version updated.')}>Part-payment</button><button className="ghost" onClick={()=>api(`/api/loans/${service.loan_id}/preclosure-quote`).then(q=>notify(`Pre-closure quote: ${money(q.total)}`))}>Pre-closure quote</button><button className="ghost" onClick={()=>api(`/api/loans/${service.loan_id}/kfs`).then(kfs=>downloadPdf(kfs,`KFS-${service.loan_id}`))}>KFS / schedule PDF</button></div>
+          <div className="action-row"><button className="primary small" onClick={()=>openLoanDetails(service.loan_id)}>View complete loan history</button><button className="ghost" onClick={()=>api(`/api/loans/${service.loan_id}/kfs`).then(kfs=>downloadPdf(kfs,`KFS-${service.loan_id}`))}>Download KFS</button></div>
+          <details><summary>Payment and closure actions</summary><label>Part-payment strategy<select value={service.strategy} onChange={e=>setService({...service,strategy:e.target.value})}><option>Reduce EMI</option><option>Reduce Tenor</option></select></label><div className="action-row"><button className="ghost" onClick={()=>servicePost(`/api/loans/${service.loan_id}/part-payment`,{amount:Number(service.amount),strategy:service.strategy,effective_date:service.effective_date,borrower_consent_reference:service.consent,mode:'Bank Transfer'},'Part-payment posted and schedule version updated.')}>Post part-payment</button><button className="ghost" onClick={()=>api(`/api/loans/${service.loan_id}/preclosure-quote`).then(q=>notify(`Pre-closure quote: ${money(q.total)}`))}>Check closure amount</button><button className="ghost" onClick={closeLoanNow}>Close loan now</button></div></details>
+          <details><summary>Interest adjustment</summary><div className="two-col"><label>Mandatory reason<input value={service.reason} onChange={e=>setService({...service,reason:e.target.value})} placeholder="Why is this rebate approved?"/></label><label>Manager approval reference<input value={service.approval} onChange={e=>setService({...service,approval:e.target.value})} placeholder="Approval ID or signed note"/></label></div><label>Borrower acknowledgement reference<input value={service.consent} onChange={e=>setService({...service,consent:e.target.value})} placeholder="Signed consent or OTP acknowledgement"/></label><button className="ghost" onClick={previewInterestRebate}>Preview adjustment</button>{adjustmentPreview && <div className={adjustmentPreview.permitted?'locked-note':'error-banner'}><span>Before <strong>{money(adjustmentPreview.balance_before)}</strong></span><span>Rebate <strong>{money(adjustmentPreview.proposed_rebate)}</strong></span><span>After <strong>{money(adjustmentPreview.balance_after)}</strong></span><span>Maximum allowed <strong>{money(adjustmentPreview.maximum_rebate)}</strong></span><small>{adjustmentPreview.message}</small></div>}{adjustmentPreview?.permitted && <label className="check-row"><input type="checkbox" checked={adjustmentConfirmed} onChange={e=>setAdjustmentConfirmed(e.target.checked)}/> I verified the before-and-after balance, borrower acknowledgement, and approval.</label>}<button className="primary small" disabled={!adjustmentPreview?.permitted||!adjustmentConfirmed} onClick={postInterestRebate}>Post immutable interest rebate</button></details>
           {user.role === 'owner' && <details><summary>Restructure or write-off</summary><div className="two-col"><label>New annual rate<input type="number" value={service.annual_rate} onChange={e=>setService({...service,annual_rate:e.target.value})}/></label><label>Remaining periods<input type="number" value={service.periods} onChange={e=>setService({...service,periods:e.target.value})}/></label><label>Moratorium periods<input type="number" value={service.moratorium} onChange={e=>setService({...service,moratorium:e.target.value})}/></label><label>Approval reference<input value={service.approval} onChange={e=>setService({...service,approval:e.target.value})}/></label></div><label>Reason<input value={service.reason} onChange={e=>setService({...service,reason:e.target.value})}/></label><div className="action-row"><button className="ghost" onClick={()=>servicePost(`/api/loans/${service.loan_id}/restructure`,{annual_rate:Number(service.annual_rate),remaining_periods:Number(service.periods),moratorium_periods:Number(service.moratorium),effective_date:service.effective_date,approval_reference:service.approval,borrower_consent_reference:service.consent},'Loan restructured with a new immutable schedule.')}>Restructure</button><button className="ghost danger" onClick={()=>servicePost(`/api/loans/${service.loan_id}/write-off`,{amount:Number(service.amount),reason:service.reason,approval_reference:service.approval},'Approved write-off posted to the ledger.')}>Write-off</button></div></details>}
         </div>}
       </section>
+      {loanDetails && <LoanDetailsModal data={loanDetails} api={api} notify={notify} onRefresh={()=>openLoanDetails(loanDetails.loan.loan_id)} onClose={()=>setLoanDetails(null)} />}
+      {closure && <div className="modal-backdrop" onClick={()=>!closure.busy&&setClosure(null)}><form className="modal confirm-delete" onSubmit={submitClosure} onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Full and final settlement</span><h2>Close {closure.loan.loan_id}</h2></div><button type="button" className="icon-btn" disabled={closure.busy} onClick={()=>setClosure(null)}><X size={18}/></button></div><div className="finance-strip"><Metric icon={WalletCards} label="Outstanding" value={money(closure.quote.principal + closure.quote.accrued_interest + closure.quote.penal_charges)}/><Metric icon={BadgeIndianRupee} label="Closure charge" value={money(closure.quote.preclosure_charge)}/><Metric icon={CheckCircle2} label="Final settlement" value={money(closure.quote.total)}/></div><label>Payment mode<select value={closure.mode} onChange={e=>setClosure({...closure,mode:e.target.value,payment_reference:''})}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>{closure.mode!=='Cash'&&<label>{closure.mode} reference<input required minLength="3" value={closure.payment_reference} onChange={e=>setClosure({...closure,payment_reference:e.target.value})}/></label>}<label>Mandatory closure reason<textarea required minLength="5" value={closure.reason} onChange={e=>setClosure({...closure,reason:e.target.value})} placeholder="Full repayment received and verified"/></label><div className="error-banner">Closing is permanent. The loan, payments, ledger entries, OTP evidence and receipts remain available in history.</div><label>Type loan ID <strong>{closure.loan.loan_id}</strong><input required value={closure.confirmation} onChange={e=>setClosure({...closure,confirmation:e.target.value})}/></label><label className="check-row"><input type="checkbox" checked={closure.confirmed} onChange={e=>setClosure({...closure,confirmed:e.target.checked})}/> I verified the settlement amount and payment source.</label>{closure.error&&<div className="error" role="alert">{closure.error}</div>}<div className="action-row"><button type="button" className="ghost" disabled={closure.busy} onClick={()=>setClosure(null)}>Cancel</button><button className="primary danger" disabled={closure.busy||closure.confirmation.trim().toUpperCase()!==closure.loan.loan_id.toUpperCase()||closure.reason.trim().length<5||!closure.confirmed}>{closure.busy?'Closing transaction…':'Confirm full closure'}</button></div></form></div>}
+      {closureReceipt && <ReceiptModal title="Final Loan Closure Receipt" data={closureReceipt} onClose={()=>setClosureReceipt(null)}/>}
     </div>
   );
+}
+
+function LoanDetailsModal({ data, api, notify, onRefresh, onClose }) {
+  const { loan, customer, schedule, payments, adjustments, events, part_payments:partPayments, writeoffs, identity_verification:verification, closure } = data;
+  async function requestAdjustmentReversal(item) {
+    const reason=window.prompt(`Reason for reversing ${item.adjustment_id} (minimum 5 characters):`,'');
+    if (reason===null) return;
+    if (reason.trim().length<5) return notify('Enter a reversal reason of at least 5 characters.');
+    try { const result=await api(`/api/accounting/journals/${encodeURIComponent(item.journal_entry_id)}/reversal-requests`,{method:'POST',body:JSON.stringify({reason:reason.trim()})}); notify(`Reversal request ${result.request_id} sent for independent approval.`); await onRefresh(); }
+    catch(err) { notify(err.message); }
+  }
+  return <div className="modal-backdrop" onClick={onClose}><div className="modal loan-details-modal" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Complete loan record</span><h2>{loan.loan_id} · {customer.name}</h2><span>{loan.frequency} plan · {customer.area_name || customer.area}</span></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div><div className="finance-strip"><Metric icon={BadgeIndianRupee} label="Sanctioned" value={money(loan.principal)}/><Metric icon={WalletCards} label="Cash handed over" value={money(loan.net_disbursed)}/><Metric icon={CheckCircle2} label="Paid" value={money(loan.paid)}/><Metric icon={CalendarClock} label="Outstanding" value={money(loan.balance)}/></div><div className="loan-detail-grid"><div><span>Monthly interest</span><strong>{loan.interest_rate}%</strong></div><div><span>Interest deducted</span><strong>{money(loan.contract_interest)}</strong></div><div><span>Installment</span><strong>{money(loan.installment)}</strong></div><div><span>Remaining installments</span><strong>{loan.remaining_installments}</strong></div><div><span>Borrow date</span><strong>{date(loan.borrow_date)}</strong></div><div><span>Status</span><Status value={loan.status}/></div></div><div className="locked-note"><ShieldCheck size={16}/>{verification ? `OTP verified ${date(verification.verified_at || verification.attempted_at)} · Proof ${verification.verification_id}` : 'No Aadhaar OTP proof was linked to this loan disbursement.'}</div>{closure?.closed && <div className="locked-note"><CheckCircle2 size={16}/>Closed {closure.closed_at ? date(closure.closed_at) : ''}{closure.final_receipt ? ` · Final receipt ${closure.final_receipt}` : ''}</div>}<details open><summary>Repayment and receipt history ({payments.length})</summary><div className="table-scroll"><table><thead><tr><th>Receipt</th><th>Date</th><th>Amount</th><th>Mode</th><th>Reference</th><th>Status</th></tr></thead><tbody>{payments.map(p=><tr key={p.receipt_no || p.id}><td>{p.receipt_no}</td><td>{date(p.timestamp)}</td><td>{money(p.amount)}</td><td>{p.mode}</td><td>{p.payment_reference || '—'}</td><td><Status value={p.status || 'Posted'}/></td></tr>)}</tbody></table></div></details><details><summary>Installment schedule · version {data.schedule_version} ({schedule.length})</summary><div className="table-scroll"><table><thead><tr><th>No.</th><th>Due date</th><th>Payment</th><th>Opening</th><th>Closing</th></tr></thead><tbody>{schedule.map(row=><tr key={row.number}><td>{row.number}</td><td>{date(row.due_date)}</td><td>{money(row.payment)}</td><td>{money(row.opening)}</td><td>{money(row.closing)}</td></tr>)}</tbody></table></div></details><details><summary>Adjustments and servicing history ({adjustments.length + events.length + partPayments.length + writeoffs.length})</summary><div className="timeline">{[...adjustments,...events,...partPayments,...writeoffs].sort((a,b)=>new Date(b.timestamp || b.created_at)-new Date(a.timestamp || a.created_at)).map((item,index)=><div className="timeline-item" key={item.adjustment_id || item.event_id || item.part_payment_id || item.writeoff_id || index}><FileText size={16}/><div><strong>{item.kind || item.event_type || item.strategy || 'Loan servicing event'}</strong><span>{item.reason || item.description || (item.amount ? money(item.amount) : '')}</span><small>{date(item.timestamp || item.created_at)}</small></div></div>)}</div></details><div className="action-row"><button className="ghost" onClick={()=>downloadPdf(data,`Loan-history-${loan.loan_id}`)}><Printer size={17}/>Download complete history</button><button className="primary small" onClick={onClose}>Close</button></div></div></div>;
 }
 
 function Collections({ api, user, notify }) {
@@ -879,7 +971,7 @@ function SearchView({ api }) {
       <div className="toolbar"><div className="searchbox"><Search size={18} /><input value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => e.key === 'Enter' && run()} placeholder="Try KUN, mobile, customer name..." /></div><button className="primary small" onClick={run}>Search</button></div>
       <h3>Loans</h3><LoanTable rows={result.loans} />
       <h3>Customers</h3>
-      <table><thead><tr><th>ID</th><th>Name</th><th>Mobile</th><th>Aadhaar</th><th>Area</th><th>Risk</th></tr></thead><tbody>{result.customers.map(c => <tr key={c.customer_id}><td>{c.customer_id}</td><td>{c.name}</td><td>{c.mobile}</td><td>{c.aadhaar_masked}</td><td>{c.area}</td><td><Risk score={c.risk_score} /></td></tr>)}</tbody></table>
+      <table><thead><tr><th>ID</th><th>Name</th><th>Mobile</th><th>Aadhaar</th><th>Area</th><th>Risk</th></tr></thead><tbody>{result.customers.map(c => <tr key={c.customer_id}><td>{c.customer_id}</td><td>{c.name}</td><td>{c.mobile}</td><td>{c.aadhaar_masked}</td><td>{c.area_name || c.area}</td><td><Risk score={c.risk_score} /></td></tr>)}</tbody></table>
     </section>
   );
 }
@@ -1072,6 +1164,17 @@ function SettingsView({ api, notify }) {
     setArea({ code: '', name: '' });
     load();
   }
+  async function renameArea(item) {
+    const name = window.prompt(`Edit the area name for ${item.code}.`, item.name);
+    if (!name) return;
+    const code = window.prompt('Enter the 3-letter area code.', item.code)?.trim().toUpperCase();
+    if (!code) return;
+    if (!/^[A-Z]{3}$/.test(code)) return notify('Area code must contain exactly three English letters.');
+    if (name.trim() === item.name && code === item.code) return;
+    if (code !== item.code && !window.confirm(`Change area code ${item.code} to ${code}? Existing customer IDs will stay unchanged, while their area assignment moves to ${name.trim()}.`)) return;
+    const result = await api(`/api/areas/${item.code}`, {method:'PATCH', body:JSON.stringify({name:name.trim(),code})});
+    notify(`${result.name} (${result.code}) saved. ${result.customers_migrated || 0} customer profiles were migrated safely.`); load();
+  }
   async function backup() {
     await api('/api/backups/manual', { method: 'POST', body: '{}' });
     notify('Manual backup completed and logged.');
@@ -1089,10 +1192,10 @@ function SettingsView({ api, notify }) {
   return (
     <div className="split-layout">
       <form className="panel form-panel" onSubmit={addArea}>
-        <div className="panel-head"><h2>Area management</h2><span>Add future branches without code changes</span></div>
+        <div className="panel-head"><h2>Area management</h2><span>Add areas or safely edit their names and codes</span></div>
         <div className="two-col"><label>Code<input maxLength="3" value={area.code} onChange={e => setArea({ ...area, code: e.target.value.toUpperCase() })} /></label><label>Name<input value={area.name} onChange={e => setArea({ ...area, name: e.target.value })} /></label></div>
         <button className="primary"><Plus size={18} /> Add area</button>
-        <div className="pill-row">{areas.map(a => <span className="pill" key={a.code}>{a.code} · {a.name}</span>)}</div>
+        <div className="pill-row">{areas.map(a => <button type="button" className="pill" key={a.code} onClick={()=>renameArea(a)} title="Edit area name or code">{a.name} <small>({a.code}) · Edit</small></button>)}</div>
       </form>
       <section className="panel">
         <div className="panel-head"><h2>Backup control</h2><span>Nightly backup with 90-day retention, plus manual trigger</span></div>
@@ -1115,21 +1218,22 @@ function EmiPlanner() {
   const [principal, setPrincipal] = useState(250000);
   const rate = 2.14;
   const [months, setMonths] = useState(24);
-  const monthlyRate = rate / 1200;
-  const emi = monthlyRate ? principal * monthlyRate * Math.pow(1 + monthlyRate, months) / (Math.pow(1 + monthlyRate, months) - 1) : principal / months;
-  const total = emi * months;
+  const interest = principal * rate * months / 100;
+  const cashHandover = Math.max(principal - interest, 0);
+  const emi = principal / months;
+  const total = principal;
   return (
     <div className="planner-layout">
       <section className="panel planner-controls">
         <div className="panel-head"><div><span className="section-kicker">Instant estimate</span><h2>Build a comfortable repayment plan</h2></div><Calculator size={24} /></div>
         <label>Loan amount <strong>{money(principal)}</strong><input type="range" min="10000" max="2000000" step="10000" value={principal} onChange={e => setPrincipal(Number(e.target.value))} /></label>
-        <label>Annual interest <strong>{rate}%</strong><input type="range" min="2.14" max="2.14" step="0.01" value={rate} readOnly aria-label="Approved annual interest rate 2.14 percent" /><small>Fixed approved rate</small></label>
+        <label>Monthly interest <strong>{rate}%</strong><input type="range" min="2.14" max="2.14" step="0.01" value={rate} readOnly aria-label="Approved monthly interest rate 2.14 percent" /><small>Fixed at 2.14% per month</small></label>
         <label>Repayment tenure <strong>{months} months</strong><input type="range" min="3" max="60" value={months} onChange={e => setMonths(Number(e.target.value))} /></label>
-        <div className="planner-note"><ShieldCheck size={18} /><span>This is an indicative reducing-balance estimate. Final terms should follow the approved sanction.</span></div>
+        <div className="planner-note"><ShieldCheck size={18} /><span>Interest = sanctioned amount × 2.14% × months. It is deducted before cash handover; the sanctioned amount is repaid across the selected months.</span></div>
       </section>
       <section className="planner-result">
         <span>Your estimated monthly payment</span><strong>{money(emi)}</strong><small>for {months} months</small>
-        <div className="result-grid"><div><span>Principal</span><b>{money(principal)}</b></div><div><span>Total interest</span><b>{money(total - principal)}</b></div><div><span>Total payable</span><b>{money(total)}</b></div></div>
+        <div className="result-grid"><div><span>Sanctioned amount</span><b>{money(principal)}</b></div><div><span>Interest deducted upfront</span><b>{money(interest)}</b></div><div><span>Cash handed over</span><b>{money(cashHandover)}</b></div><div><span>Total repayment</span><b>{money(total)}</b></div></div>
         <div className="repayment-bar"><i style={{ width: `${principal / total * 100}%` }} /></div>
         <div className="legend repayment-legend"><span><i className="dot success" />Principal</span><span><i className="dot accent" />Interest</span></div>
       </section>
@@ -1173,7 +1277,7 @@ function AiAssistant({ api, onClose }) {
         const ids = Object.entries(counts).filter(([,count]) => count > 1).map(([id,count]) => `${id} (${count})`);
         answer = ids.length ? `Customers with multiple active loans: ${ids.join(', ')}.` : 'No customer currently has more than one active loan.';
       } else if (lower.includes('salem') || lower.includes('slm')) {
-        const list = customers.filter(c => c.area === 'SLM');
+        const list = customers.filter(c => c.area_code === 'SLM' || c.area_name?.toLowerCase() === 'salem');
         answer = `${list.length} Salem customers found: ${list.slice(0,8).map(c => `${c.customer_id} ${c.name}`).join(', ')}${list.length > 8 ? ', and more.' : '.'}`;
       } else if (lower.match(/(?:owing|above|more than).*50[,.]?000/)) {
         const grouped = loans.filter(l => l.status !== 'Closed').reduce((acc,l) => ({...acc,[l.customer_id]:(acc[l.customer_id]||0)+Number(l.balance||0)}),{});
@@ -1193,7 +1297,7 @@ function AiAssistant({ api, onClose }) {
         answer = `The current expected collection is approximately ${money(expected)} based on recorded monthly collections and portfolio exposure. ${dashboard.totals.overdue_loans} overdue loans are the main forecast risk.`;
       } else if (lower.includes('area performance') || lower.includes('branch performance')) {
         const ranked = [...dashboard.area_summary].sort((a,b) => b.today_collection-a.today_collection);
-        answer = `Area ranking by today’s collection: ${ranked.map(a => `${a.area} ${money(a.today_collection)}`).join(', ')}.`;
+        answer = `Area ranking by today’s collection: ${ranked.map(a => `${a.name || a.area} ${money(a.today_collection)}`).join(', ')}.`;
       } else if (lower.includes('today') || lower.includes('collect')) answer = `Today’s recorded collection is ${money(dashboard.totals.today_collection)}. This month is at ${money(dashboard.totals.monthly_collection)}.`;
       else if (lower.includes('overdue') || lower.includes('risk') || lower.includes('default')) answer = `${dashboard.totals.overdue_loans} loans are overdue. ${dashboard.alerts.length} priority reminders are queued. Start with the highest-balance cases in Needs attention.`;
       else if (lower.includes('outstanding') || lower.includes('pay') || lower.includes('due')) answer = `The current portfolio outstanding is ${money(dashboard.totals.outstanding)} across ${dashboard.totals.active_loans} active loans. Include a customer ID such as KUN001 for an exact borrower-level answer.`;
@@ -1235,8 +1339,8 @@ function CommandPalette({ onSelect, onClose }) {
   );
 }
 
-function LoanTable({ rows }) {
-  return <div className="table-scroll"><table><thead><tr><th>Loan</th><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th><th>Status</th></tr></thead><tbody>{rows.map(l => <tr key={l.loan_id}><td>{l.loan_id}<small>{date(l.borrow_date)}</small></td><td>{l.customer_name || l.customer_id}<small>{l.area}</small></td><td>{l.frequency || l.loan_type}</td><td>{money(l.installment)}</td><td>{money(l.paid)}</td><td>{money(l.balance)}</td><td>{l.remaining_installments ?? '—'}<small>{l.frequency ? `${l.frequency} installments` : ''}</small></td><td>{l.next_due_date ? date(l.next_due_date) : 'Completed'}</td><td><Status value={l.status} /></td></tr>)}</tbody></table></div>;
+function LoanTable({ rows, onView, viewBusy = false }) {
+  return <div className="table-scroll"><table><thead><tr><th>Loan</th><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th><th>Status</th>{onView&&<th>Action</th>}</tr></thead><tbody>{rows.map(l => <tr key={l.loan_id}><td>{l.loan_id}<small>{date(l.borrow_date)}</small></td><td>{l.customer_name || l.customer_id}<small>{l.area_name || l.area}</small></td><td>{l.frequency || l.loan_type}</td><td>{money(l.installment)}</td><td>{money(l.paid)}</td><td>{money(l.balance)}</td><td>{l.remaining_installments ?? '—'}<small>{l.frequency ? `${l.frequency} installments` : ''}</small></td><td>{l.next_due_date ? date(l.next_due_date) : 'Completed'}</td><td><Status value={l.status} /></td>{onView&&<td><button className="ghost small" disabled={viewBusy} onClick={()=>onView(l.loan_id)}><FileText size={15}/>View loan</button></td>}</tr>)}</tbody></table></div>;
 }
 
 function ReceiptModal({ title, data, onClose }) {
@@ -1275,6 +1379,19 @@ function Metric({ icon: Icon, label, value }) {
 function BarChart({ data, x, y }) {
   const max = Math.max(...data.map(d => d[y]), 1);
   return <div className="bar-chart">{data.map(d => <div className="bar-col" key={d[x]}><div className="bar" style={{ height: `${Math.max(8, d[y] / max * 100)}%` }}><span>{money(d[y])}</span></div><small>{d[x]}</small></div>)}</div>;
+}
+
+function CollectionTrend({ data }) {
+  const recent = data.slice(-6);
+  const max = Math.max(...recent.map(item => Number(item.collection) || 0), 1);
+  return <div className="collection-trend-list">{recent.map(item => {
+    const value = Number(item.collection) || 0;
+    return <div className="collection-trend-row" key={item.month}>
+      <span>{item.month}</span>
+      <div className="collection-trend-track" aria-hidden="true"><i style={{ width: `${Math.max(value ? 8 : 0, value / max * 100)}%` }} /></div>
+      <strong>{money(value)}</strong>
+    </div>;
+  })}</div>;
 }
 
 function Donut({ daily, monthly }) {

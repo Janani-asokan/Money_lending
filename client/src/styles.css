@@ -1,3 +1,23 @@
+.loan-details-modal { width:min(1120px,calc(100vw - 32px)); max-height:92vh; overflow:auto; }
+.loan-detail-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:18px 0; }
+.loan-detail-grid > div { display:grid; gap:5px; padding:14px; border:1px solid var(--line); border-radius:14px; background:var(--panel-strong); }
+.loan-detail-grid span { color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+.loan-details-modal details { margin-top:14px; border:1px solid var(--line); border-radius:14px; padding:12px; }
+.loan-details-modal summary { cursor:pointer; font-weight:800; }
+@media (max-width:700px) { .loan-detail-grid { grid-template-columns:1fr 1fr; } .loan-details-modal { width:calc(100vw - 16px); max-height:96vh; } }
+@media (max-width:430px) { .loan-detail-grid { grid-template-columns:1fr; } }
+
+.sidebar-toggle { position:absolute; top:18px; right:-15px; z-index:3; width:30px; height:30px; border-radius:50%; border:1px solid var(--border); background:var(--panel); color:var(--text); display:grid; place-items:center; cursor:pointer; box-shadow:var(--shadow-sm); }
+.sidebar-collapsed .sidebar-toggle svg { transform:rotate(180deg); }
+@media (min-width:1101px) {
+  .app-shell.sidebar-collapsed { padding-left:84px; }
+  .sidebar-collapsed .sidebar { width:84px; padding-inline:14px; }
+  .sidebar-collapsed .brand > div:last-child, .sidebar-collapsed .nav-item span, .sidebar-collapsed .sidebar-card { display:none; }
+  .sidebar-collapsed .brand { justify-content:center; }
+  .sidebar-collapsed .nav-item { justify-content:center; padding-inline:0; }
+}
+@media (max-width:1100px) { .sidebar-toggle { display:none; } }
+
 :root {
   color-scheme: dark;
   --bg: #0b1020;
@@ -905,4 +925,93 @@ html, body, #root { width: 100%; max-width: 100%; overflow-x: hidden; }
     margin: 0;
     padding-bottom: calc(88px + env(safe-area-inset-bottom));
   }
+}
+
+/* Compact collection trend: avoids a full-height block when only one month exists. */
+.collection-trend-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+  padding: 4px 0;
+}
+.collection-trend-row {
+  display: grid;
+  grid-template-columns: minmax(72px, .7fr) minmax(140px, 3fr) minmax(90px, auto);
+  align-items: center;
+  gap: 14px;
+  min-height: 30px;
+}
+.collection-trend-row > span { color: var(--muted); font-size: 13px; font-weight: 700; }
+.collection-trend-row > strong { color: var(--text); font-size: 14px; text-align: right; }
+.collection-trend-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-alt);
+}
+.collection-trend-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+@media (max-width: 520px) {
+  .collection-trend-row { grid-template-columns: 64px minmax(70px, 1fr) 82px; gap: 8px; }
+  .collection-trend-row > span,
+  .collection-trend-row > strong { font-size: 12px; }
+}
+
+/* Calm operational UI: everyday actions stay obvious; advanced controls disclose on demand. */
+main { max-width: 1540px; margin-inline: auto; }
+.panel { overflow: hidden; }
+.panel-head h2 { line-height: 1.2; }
+.panel-head > span, .panel-head > div > span { max-width: 64ch; line-height: 1.45; }
+.form-panel, .servicing-box { row-gap: 14px; }
+.form-panel label, .servicing-box label { gap: 6px; color: var(--muted); font-size: 12px; font-weight: 750; }
+.form-panel input, .form-panel select, .form-panel textarea,
+.servicing-box input, .servicing-box select, .servicing-box textarea { color: var(--ink); font-size: 14px; font-weight: 600; }
+.servicing-box > details { padding: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.servicing-box > details > summary { display: flex; align-items: center; justify-content: space-between; min-height: 48px; margin: 0; padding: 12px 14px; list-style: none; color: var(--ink); }
+.servicing-box > details > summary::-webkit-details-marker { display: none; }
+.servicing-box > details > summary::after { content: '+'; color: var(--accent); font-size: 20px; font-weight: 500; }
+.servicing-box > details[open] > summary { border-bottom: 1px solid var(--line); }
+.servicing-box > details[open] > summary::after { content: '\2212'; }
+.servicing-box > details > :not(summary) { margin: 12px 14px; }
+.action-row > button { min-height: 42px; }
+.table-scroll { border: 1px solid var(--line); border-radius: 10px; }
+.table-scroll table { border-collapse: separate; border-spacing: 0; }
+.table-scroll thead th { position: sticky; top: 0; z-index: 1; background: var(--surface-alt); }
+.table-scroll tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface-alt) 55%, transparent); }
+.table-scroll tbody tr:hover { background: color-mix(in srgb, var(--accent) 7%, var(--panel)); }
+
+@media (max-width: 680px) {
+  .panel-head { margin-bottom: 14px; }
+  .panel-head h2 { font-size: 18px; }
+  .servicing-box { padding: 14px; }
+  .action-row > button, .action-row > select { flex: 1 1 100%; width: 100%; }
+  .table-scroll { border-radius: 8px; }
+}
+
+/* Final flexible-navigation rules override older theme layout declarations. */
+@media (min-width: 1101px) {
+  .app-shell.sidebar-collapsed { padding-left: 84px; }
+  .app-shell.sidebar-collapsed .sidebar { width: 84px; padding-inline: 14px; overflow-x: visible; }
+  .app-shell.sidebar-collapsed .brand > div:last-child,
+  .app-shell.sidebar-collapsed .nav-item span,
+  .app-shell.sidebar-collapsed .sidebar-card { display: none; }
+  .app-shell.sidebar-collapsed .brand,
+  .app-shell.sidebar-collapsed .nav-item { justify-content: center; }
+  .app-shell.sidebar-collapsed .nav-item { padding-inline: 0; }
+  .app-shell .sidebar,
+  .app-shell main { transition: width .2s ease, padding-left .2s ease; }
+}
+
+@media (min-width: 681px) and (max-width: 1100px) {
+  .app-shell .sidebar { position: relative; }
+}
+
+@media (max-width: 680px) {
+  .app-shell .sidebar nav { scrollbar-width: none; scroll-snap-type: x proximity; }
+  .app-shell .sidebar nav::-webkit-scrollbar { display: none; }
+  .app-shell .sidebar .nav-item { scroll-snap-align: start; }
 }

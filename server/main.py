@@ -249,6 +249,33 @@ class CustomerIn(BaseModel):
         return value.strip().upper()
 
 
+class CustomerUpdateIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    father_name: str = Field(min_length=2, max_length=120)
+    mobile: str = Field(min_length=10, max_length=15)
+    address: str = Field(min_length=5, max_length=500)
+    area: str = Field(min_length=2, max_length=3)
+    guarantor: str = Field(default="", max_length=120)
+
+    @field_validator("name", "father_name", "address", "guarantor")
+    @classmethod
+    def strip_update_text(cls, value: str) -> str:
+        return " ".join(value.split())
+
+    @field_validator("mobile")
+    @classmethod
+    def valid_update_mobile(cls, value: str) -> str:
+        digits = "".join(ch for ch in value if ch.isdigit())
+        if len(digits) != 10 or digits[0] not in "6789":
+            raise ValueError("Mobile must be a valid 10-digit Indian number")
+        return digits
+
+    @field_validator("area")
+    @classmethod
+    def uppercase_update_area(cls, value: str) -> str:
+        return value.strip().upper()
+
+
 class LoanIn(BaseModel):
     customer_id: str
     principal: float = Field(gt=0, le=100000000)
@@ -258,7 +285,7 @@ class LoanIn(BaseModel):
     collector_id: str
     borrow_date: Optional[str] = None
     disbursement_mode: str = "Cash"
-    interest_method: str = "Reducing"
+    interest_method: str = "Upfront Monthly Flat"
     processing_fee: float = Field(default=0, ge=0, le=10000000)
     tax_rate: float = Field(default=18, ge=0, le=100)
     first_due_date: Optional[str] = None
@@ -279,8 +306,8 @@ class LoanIn(BaseModel):
     @field_validator("interest_method")
     @classmethod
     def valid_interest_method(cls, value: str) -> str:
-        if value not in {"Reducing", "Flat"}:
-            raise ValueError("Interest method must be Reducing or Flat")
+        if value not in {"Upfront Monthly Flat", "Reducing", "Flat"}:
+            raise ValueError("Invalid interest method")
         return value
 
 
@@ -339,6 +366,26 @@ class PaymentIn(BaseModel):
     def model_post_init(self, __context: Any) -> None:
         if self.mode == "UPI" and len((self.payment_reference or "").strip()) < 3:
             raise ValueError("UPI transaction/reference ID is required")
+
+
+class LoanClosureIn(BaseModel):
+    mode: str
+    payment_reference: Optional[str] = Field(default=None, max_length=120)
+    reason: str = Field(min_length=5, max_length=300)
+    confirmation: str = Field(min_length=3, max_length=40)
+    confirmed: bool = False
+    request_id: str = Field(min_length=8, max_length=100)
+
+    @field_validator("mode")
+    @classmethod
+    def valid_closure_mode(cls, value: str) -> str:
+        if value not in PAYMENT_MODES:
+            raise ValueError("Invalid closure payment mode")
+        return value
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.mode != "Cash" and len((self.payment_reference or "").strip()) < 3:
+            raise ValueError("UPI or bank reference is required")
 
 
 class ExpenseIn(BaseModel):
@@ -448,14 +495,26 @@ class LoanAdjustmentIn(BaseModel):
     amount: float = Field(gt=0, le=100000000)
     reason: str = Field(min_length=5, max_length=300)
     request_id: str = Field(min_length=8, max_length=100)
+    borrower_acknowledgement_reference: str = Field(default="", max_length=120)
+    approval_reference: str = Field(default="", max_length=120)
+    confirmed: bool = False
 
     @field_validator("kind")
     @classmethod
     def valid_kind(cls, value: str) -> str:
-        allowed = {"Penalty", "Interest Waiver", "Penalty Waiver"}
+        allowed = {"Penalty", "Interest Waiver", "Interest Rebate", "Penalty Waiver"}
         if value not in allowed:
             raise ValueError("Invalid adjustment type")
         return value
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.kind == "Interest Rebate":
+            if len(self.borrower_acknowledgement_reference.strip()) < 3:
+                raise ValueError("Borrower acknowledgement reference is required for an interest rebate")
+            if len(self.approval_reference.strip()) < 3:
+                raise ValueError("Manager approval reference is required for an interest rebate")
+            if not self.confirmed:
+                raise ValueError("Confirm the before-and-after balance before posting")
 
 
 class VerificationIn(BaseModel):
@@ -475,6 +534,16 @@ class CustomerDeleteIn(BaseModel):
 class AreaIn(BaseModel):
     code: str
     name: str
+
+
+class AreaUpdateIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    code: Optional[str] = Field(default=None, pattern=r"^[A-Za-z]{3}$")
+
+    @field_validator("code")
+    @classmethod
+    def normalize_area_code(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip().upper() if value else None
 
 
 class ReportRequest(BaseModel):
@@ -595,6 +664,48 @@ def periodic_irr(cashflows: list[Decimal]) -> Decimal:
 
 def build_amortization(payload: LoanIn, borrow: datetime) -> dict[str, Any]:
     principal = Decimal(str(payload.principal)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if payload.interest_method == "Upfront Monthly Flat":
+        periods = payload.repayment_period
+        monthly_rate = Decimal(str(payload.interest_rate)) / 100
+        tenure_months = (
+            Decimal(periods) / Decimal(30)
+            if payload.loan_type == "Daily 100-Day"
+            else Decimal(periods) * Decimal(7) / Decimal(30)
+            if payload.loan_type == "Weekly"
+            else Decimal(periods)
+        )
+        upfront_interest = (principal * monthly_rate * tenure_months).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        fee = Decimal(str(payload.processing_fee)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        tax = (fee * Decimal(str(payload.tax_rate)) / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        net_disbursed = principal - upfront_interest - fee - tax
+        if net_disbursed <= 0:
+            raise HTTPException(422, "Upfront interest, fee and tax cannot equal or exceed the sanctioned amount")
+        first_due = parse_date(payload.first_due_date) if payload.first_due_date else (borrow + timedelta(days=1) if payload.loan_type == "Daily 100-Day" else borrow + timedelta(days=7) if payload.loan_type == "Weekly" else add_months(borrow, 1))
+        def due_for(number: int) -> datetime:
+            if payload.loan_type == "Daily 100-Day": return first_due + timedelta(days=number - 1)
+            if payload.loan_type == "Weekly": return first_due + timedelta(days=7 * (number - 1))
+            return add_months(first_due, number - 1)
+        base_payment = (principal / periods).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        balance = principal
+        rows: list[dict[str, Any]] = []
+        for number in range(1, periods + 1):
+            opening = balance
+            payment = balance if number == periods else min(base_payment, balance)
+            balance = (balance - payment).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            rows.append({"number": number, "due_date": iso(due_for(number)), "opening": float(opening), "payment": float(payment), "principal": float(payment), "interest": 0.0, "closing": float(balance), "moratorium": False})
+        cashflows = [-net_disbursed] + [Decimal(str(row["payment"])) for row in rows]
+        irr = periodic_irr(cashflows)
+        periods_per_year = Decimal(365 if payload.loan_type == "Daily 100-Day" else 52 if payload.loan_type == "Weekly" else 12)
+        annual_apr = ((Decimal(1) + irr) ** int(periods_per_year) - 1) * 100
+        return {
+            "rows": rows, "emi": float(base_payment), "principal": float(principal),
+            "interest_total": float(upfront_interest), "processing_fee": float(fee), "tax": float(tax),
+            "net_disbursed": float(net_disbursed), "apr": float(annual_apr.quantize(Decimal("0.0001"))),
+            "first_due_date": iso(first_due), "maturity_date": rows[-1]["due_date"],
+            "total_repayment": float(principal), "monthly_interest_rate": float(payload.interest_rate),
+            "tenure_months": float(tenure_months.quantize(Decimal("0.0001"))),
+            "interest_deduction_basis": "Deducted upfront from sanctioned principal",
+        }
     annual_rate = Decimal(str(payload.interest_rate)) / 100
     periods = payload.repayment_period
     periods_per_year = Decimal(365 if payload.loan_type == "Daily 100-Day" else 52 if payload.loan_type == "Weekly" else 12)
@@ -1044,10 +1155,12 @@ async def loan_component_balances(loan: dict[str, Any], session: Any = None) -> 
         part_payments = await db.part_payments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
         writeoffs = await db.writeoffs.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
     principal = to_paise(loan["principal"])
-    interest = to_paise(loan.get("contract_interest", Decimal(str(loan["principal"])) * Decimal(str(loan.get("interest_rate", 0))) / 100))
+    upfront_interest = loan.get("interest_collection_basis") == "Upfront Discount"
+    interest = 0 if upfront_interest else to_paise(loan.get("contract_interest", Decimal(str(loan["principal"])) * Decimal(str(loan.get("interest_rate", 0))) / 100))
     penalty = sum(to_paise(a["amount"]) for a in adjustments if a["kind"] == "Penalty")
     interest = max(interest - sum(to_paise(a["amount"]) for a in adjustments if a["kind"] == "Interest Waiver"), 0)
     penalty = max(penalty - sum(to_paise(a["amount"]) for a in adjustments if a["kind"] == "Penalty Waiver"), 0)
+    principal = max(principal - sum(to_paise(a["amount"]) for a in adjustments if a["kind"] == "Interest Rebate"), 0)
     original_total = principal + interest + penalty
     paid_total = 0
     for payment in payments:
@@ -1082,6 +1195,10 @@ async def customer_view(customer: dict[str, Any]) -> dict[str, Any]:
     visible = {k: v for k, v in customer.items() if k not in {"aadhaar_encrypted", "aadhaar_hash"}}
     visible["aadhaar_masked"] = f"XXXX XXXX {customer['aadhaar_last4']}" if customer.get("aadhaar_last4") else ("Stored securely" if customer.get("aadhaar_encrypted") else "Not provided")
     visible["has_aadhaar"] = bool(customer.get("aadhaar_encrypted"))
+    area = await find_one("areas", {"code": customer.get("area")})
+    visible["area_code"] = customer.get("area", "")
+    visible["area_name"] = area.get("name", customer.get("area", "")) if area else customer.get("area", "")
+    visible["area"] = visible["area_name"]
     return visible
 
 
@@ -1617,7 +1734,7 @@ async def customers(q: str = "", area: str = "", status_filter: str = "", user: 
     if q.strip():
         rows = [r for r in rows if customer_matches_search(r, q)]
     if area:
-        rows = [r for r in rows if r["area"] == area]
+        rows = [r for r in rows if r.get("area_code") == area]
     if status_filter:
         rows = [r for r in rows if r["status"] == status_filter]
     return rows
@@ -1667,6 +1784,35 @@ async def delete_completed_customer(customer_id: str, payload: CustomerDeleteIn,
                     raise HTTPException(409, "Customer profile changed concurrently; reload and retry")
                 await audit(user, "completed_customer_profile_deleted", "customer", customer_id, audit_details, request, session=session)
     return {"customer_id": customer_id, "status": "Profile Deleted", "deleted_at": stamp, "financial_history_retained": True}
+
+
+@app.patch("/api/customers/{customer_id}")
+async def update_customer(customer_id: str, payload: CustomerUpdateIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+    customer = await find_one("customers", {"customer_id": customer_id})
+    if not customer or customer.get("profile_deleted_at"):
+        raise HTTPException(404, "Active customer profile not found")
+    area = await find_one("areas", {"code": payload.area})
+    if not area or not area.get("active", True):
+        raise HTTPException(422, "Select an active operating area")
+    duplicate = await find_one("customers", {"mobile": payload.mobile})
+    if duplicate and duplicate.get("customer_id") != customer_id and not duplicate.get("profile_deleted_at"):
+        raise HTTPException(409, f"Mobile already belongs to {duplicate['customer_id']}")
+    before = {key: customer.get(key, "") for key in payload.model_fields}
+    updated = deepcopy(customer)
+    updated.update(payload.model_dump())
+    updated.update({"updated_at": iso(now()), "updated_by": user["name"]})
+    details = {"before": before, "after": payload.model_dump(), "customer_id_unchanged": True}
+    if USE_MEMORY:
+        await replace_one("customers", {"customer_id": customer_id}, updated)
+        await audit(user, "customer_details_updated", "customer", customer_id, details, request)
+    else:
+        async with await mongo_client.start_session() as session:
+            async with session.start_transaction():
+                result = await db.customers.replace_one({"_id": customer["_id"]}, updated, session=session)
+                if result.modified_count != 1:
+                    raise HTTPException(409, "Customer changed concurrently; reload and retry")
+                await audit(user, "customer_details_updated", "customer", customer_id, details, request, session=session)
+    return await customer_view(updated)
 
 
 @app.post("/api/customers")
@@ -1982,13 +2128,20 @@ async def loans(q: str = "", status_filter: str = "", loan_type: str = "", area:
     out = []
     for loan in rows:
         c = customers_map.get(loan["customer_id"], {})
-        item = {**loan, "customer_name": c.get("name", ""), "area": c.get("area", ""), "mobile": c.get("mobile", "")}
+        item = {
+            **loan,
+            "customer_name": c.get("name", ""),
+            "area": c.get("area_code", c.get("area", "")),
+            "area_code": c.get("area_code", c.get("area", "")),
+            "area_name": c.get("area_name", c.get("area", "")),
+            "mobile": c.get("mobile", ""),
+        }
         out.append(item)
     if user["role"] == "collector":
         out = [x for x in out if x["collector_id"] == user["id"]]
     ql = q.lower().strip()
     if ql:
-        out = [r for r in out if ql in " ".join([r["loan_id"], r["customer_id"], r["customer_name"], r["mobile"], r["area"]]).lower()]
+        out = [r for r in out if ql in " ".join([r["loan_id"], r["customer_id"], r["customer_name"], r["mobile"], r["area"], r.get("area_name", "")]).lower()]
     if status_filter:
         out = [r for r in out if r["status"] == status_filter]
     if loan_type:
@@ -2003,13 +2156,14 @@ async def loans(q: str = "", status_filter: str = "", loan_type: str = "", area:
 @app.post("/api/loan-quotes")
 async def loan_quote(payload: LoanIn, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
     if abs(payload.interest_rate - 2.14) > 0.000001:
-        raise HTTPException(422, "New loans must use the approved annual interest rate of 2.14%")
+        raise HTTPException(422, "New loans must use the approved monthly interest rate of 2.14%")
+    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat"})
     borrow = parse_date(payload.borrow_date)
     schedule = build_amortization(payload, borrow)
     return {
         "quote_id": f"QTE-{uuid.uuid4().hex[:12].upper()}", "generated_at": iso(now()),
         "sanctioned_amount": payload.principal, "net_disbursed_amount": schedule["net_disbursed"],
-        "annual_interest_rate": payload.interest_rate, "interest_method": payload.interest_method,
+        "monthly_interest_rate": payload.interest_rate, "interest_method": payload.interest_method,
         "apr": schedule["apr"], "processing_fee": schedule["processing_fee"], "tax_on_fee": schedule["tax"],
         "periodic_instalment": schedule["emi"], "total_interest": schedule["interest_total"],
         "total_repayment": schedule["total_repayment"], "first_due_date": schedule["first_due_date"],
@@ -2033,6 +2187,84 @@ async def get_loan_schedule(loan_id: str, user: dict[str, Any] = Depends(current
     return schedule
 
 
+@app.get("/api/loans/{loan_id}/details")
+async def loan_details(loan_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    loan_record = await find_one("loans", {"loan_id": loan_id})
+    if not loan_record:
+        raise HTTPException(404, "Loan not found")
+    if user["role"] == "collector" and loan_record.get("collector_id") != user["id"]:
+        raise HTTPException(403, "Collector can only view assigned loans")
+    loan = await enrich_loan(loan_record)
+    customer_record = await find_one("customers", {"customer_id": loan_record["customer_id"]})
+    customer = await customer_view(customer_record) if customer_record else {"customer_id": loan_record["customer_id"], "name": "Customer record unavailable"}
+    schedule = await find_one("loan_schedules", {"loan_id": loan_id, "version": int(loan_record.get("schedule_version", 1))})
+    payments = sorted(
+        await find_many("payments", {"loan_id": loan_id}),
+        key=lambda row: row.get("timestamp", ""), reverse=True,
+    )
+    running_balance = to_paise(loan.get("balance", 0))
+    payment_history = []
+    for row in payments:
+        item = deepcopy(row)
+        allocation = item.get("allocation", {})
+        applied = sum(int(allocation.get(key, 0)) for key in ("principal_paise", "interest_paise", "penalty_paise"))
+        item["principal_paid"] = from_paise(int(allocation.get("principal_paise", 0)))
+        item["interest_paid"] = from_paise(int(allocation.get("interest_paise", 0)))
+        item["penalty_paid"] = from_paise(int(allocation.get("penalty_paise", 0)))
+        item["closure_charge_paid"] = from_paise(int(allocation.get("preclosure_charge_paise", 0)))
+        item["balance_after"] = item.get("balance_after", from_paise(running_balance))
+        if item.get("status", "Posted") != "Reversed":
+            running_balance += applied
+        item["balance_before"] = item.get("balance_before", from_paise(running_balance))
+        payment_history.append(item)
+    adjustments = sorted(
+        await find_many("loan_adjustments", {"loan_id": loan_id}),
+        key=lambda row: row.get("timestamp", ""), reverse=True,
+    )
+    events = sorted(
+        await find_many("loan_events", {"loan_id": loan_id}),
+        key=lambda row: row.get("timestamp", row.get("created_at", "")), reverse=True,
+    )
+    part_payments = sorted(
+        await find_many("part_payments", {"loan_id": loan_id}),
+        key=lambda row: row.get("timestamp", ""), reverse=True,
+    )
+    writeoffs = sorted(
+        await find_many("writeoffs", {"loan_id": loan_id}),
+        key=lambda row: row.get("timestamp", ""), reverse=True,
+    )
+    verification_id = loan_record.get("identity_verification_id")
+    verification = await find_one("verification_logs", {"verification_id": verification_id}) if verification_id else None
+    closure_payment = next((row for row in payments if loan.get("status") == "Closed" and row.get("status", "Posted") != "Reversed"), None)
+    return {
+        "loan": loan,
+        "customer": customer,
+        "schedule": (schedule or {}).get("rows", []),
+        "schedule_version": int(loan_record.get("schedule_version", 1)),
+        "payments": payment_history,
+        "repayment_summary": {
+            "receipt_count": len([row for row in payment_history if row.get("status", "Posted") != "Reversed"]),
+            "total_received": round(sum(float(row.get("amount", 0)) for row in payment_history if row.get("status", "Posted") != "Reversed"), 2),
+            "principal_received": from_paise(sum(int(row.get("allocation", {}).get("principal_paise", 0)) for row in payment_history if row.get("status", "Posted") != "Reversed")),
+            "interest_received": from_paise(sum(int(row.get("allocation", {}).get("interest_paise", 0)) for row in payment_history if row.get("status", "Posted") != "Reversed")),
+            "penalty_received": from_paise(sum(int(row.get("allocation", {}).get("penalty_paise", 0)) for row in payment_history if row.get("status", "Posted") != "Reversed")),
+            "outstanding": loan.get("balance", 0),
+            "remaining_installments": loan.get("remaining_installments", 0),
+            "next_due_date": loan.get("next_due_date"),
+        },
+        "adjustments": adjustments,
+        "events": events,
+        "part_payments": part_payments,
+        "writeoffs": writeoffs,
+        "identity_verification": verification,
+        "closure": {
+            "closed": loan.get("status") == "Closed",
+            "closed_at": closure_payment.get("timestamp") if closure_payment else None,
+            "final_receipt": closure_payment.get("receipt_no") if closure_payment else None,
+        },
+    }
+
+
 @app.get("/api/loans/{loan_id}/kfs")
 async def loan_kfs(loan_id: str, user: dict[str, Any] = Depends(require("owner", "manager", "accountant"))) -> dict[str, Any]:
     loan = await find_one("loans", {"loan_id": loan_id})
@@ -2045,7 +2277,7 @@ async def loan_kfs(loan_id: str, user: dict[str, Any] = Depends(require("owner",
     return {
         "document": "Key Facts Statement", "loan_id": loan_id, "borrower": {"customer_id": customer["customer_id"], "name": customer["name"]},
         "sanctioned_amount": loan["principal"], "net_disbursed_amount": loan["net_disbursed"],
-        "annual_interest_rate": loan["interest_rate"], "interest_method": loan["interest_method"],
+        "monthly_interest_rate": loan["interest_rate"], "interest_method": loan["interest_method"],
         "apr": loan["apr"], "tenor_periods": loan["repayment_period"], "repayment_frequency": "Daily" if loan["loan_type"] == "Daily 100-Day" else "Weekly" if loan["loan_type"] == "Weekly" else "Monthly",
         "periodic_instalment": loan["emi"], "total_interest": loan["contract_interest"], "total_repayment": loan["total_repayment"],
         "processing_fee": loan["processing_fee"], "tax_on_fee": loan["tax_amount"],
@@ -2222,7 +2454,8 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
     if payload.loan_type not in LOAN_TYPES:
         raise HTTPException(422, "Invalid loan type")
     if abs(payload.interest_rate - 2.14) > 0.000001:
-        raise HTTPException(422, "New loans must use the approved annual interest rate of 2.14%")
+        raise HTTPException(422, "New loans must use the approved monthly interest rate of 2.14%")
+    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat"})
     collector = await find_one("users", {"id": payload.collector_id})
     if not collector or collector.get("role") not in {"collector", "owner", "manager"} or not collector.get("active", True):
         raise HTTPException(422, "Select an active collector or the self-managed owner")
@@ -2235,6 +2468,8 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
         "customer_id": payload.customer_id,
         "principal": payload.principal,
         "interest_rate": payload.interest_rate,
+        "interest_rate_period": "Monthly",
+        "interest_collection_basis": "Upfront Discount",
         "loan_type": payload.loan_type,
         "repayment_period": payload.repayment_period,
         "collector_id": payload.collector_id,
@@ -2270,10 +2505,7 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
     if tax_paise:
         lines.append(ledger_line("2100", credit_paise=tax_paise, loan_id=loan_id))
     if interest_paise:
-        lines.extend([
-            ledger_line("1200", debit_paise=interest_paise, loan_id=loan_id, customer_id=payload.customer_id),
-            ledger_line("4000", credit_paise=interest_paise, loan_id=loan_id),
-        ])
+        lines.append(ledger_line("4000", credit_paise=interest_paise, loan_id=loan_id))
     if USE_MEMORY:
         await insert_one("loans", loan)
         await insert_one("loan_schedules", {"loan_id": loan_id, "version": 1, "reason": "Origination", "created_at": iso(now()), **schedule})
@@ -2331,6 +2563,8 @@ async def create_payment(payload: PaymentIn, request: Request, user: dict[str, A
             "timestamp": iso(stamp), "status": "Posted", "journal_entry_id": entry_id,
             "payment_reference": (payload.payment_reference or "").strip() or None,
             "allocation": {"penalty_paise": penalty_part, "interest_paise": interest_part, "principal_paise": principal_part},
+            "balance_before": from_paise(balances["balance_paise"]),
+            "balance_after": from_paise(balances["balance_paise"] - amount_paise),
             "identity_verified_at_disbursal": bool(loan.get("identity_verification_id")),
             "identity_verification_id": loan.get("identity_verification_id"),
         }
@@ -2369,6 +2603,77 @@ async def create_payment(payload: PaymentIn, request: Request, user: dict[str, A
     loan = await find_one("loans", {"loan_id": payment["loan_id"]})
     after = await enrich_loan(loan)
     return {"payment": payment, "loan": after, "receipt": await receipt_payload(payment)}
+
+
+@app.post("/api/loans/{loan_id}/close")
+async def close_loan(loan_id: str, payload: LoanClosureIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+    if not payload.confirmed or payload.confirmation.strip().upper() != loan_id.upper():
+        raise HTTPException(422, f"Type loan ID {loan_id} and confirm the permanent closure")
+    existing = await find_one("payments", {"request_id": payload.request_id})
+    if existing:
+        loan = await enrich_loan(await find_one("loans", {"loan_id": loan_id}))
+        return {"loan": loan, "receipt": await receipt_payload(existing), "duplicate": True}
+    stamp = now()
+    receipt_seq = await next_sequence(f"RCP-{stamp.strftime('%Y%m%d')}", "receipt_no", "payments")
+    receipt_no = f"RCP-{stamp.strftime('%Y%m%d')}-{receipt_seq:06d}"
+    journal_id = f"JRN-{await next_sequence('JRN', 'entry_id', 'journal_entries'):09d}"
+    event_id = f"LEV-{await next_sequence('LEV', 'event_id', 'loan_events'):08d}"
+
+    async def post_closure(session: Any = None) -> dict[str, Any]:
+        loan = await (find_one("loans", {"loan_id": loan_id}) if USE_MEMORY else db.loans.find_one({"loan_id": loan_id}, session=session))
+        if not loan:
+            raise HTTPException(404, "Loan not found")
+        balances = await loan_component_balances(loan, session=session)
+        if balances["balance_paise"] <= 0:
+            raise HTTPException(409, "This loan is already completed")
+        closure_charge = int((Decimal(balances["principal_balance_paise"]) * Decimal(str(loan.get("preclosure_charge_rate", 0))) / Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        settlement = balances["balance_paise"] + closure_charge
+        remaining = balances["balance_paise"]
+        penalty_part = min(remaining, balances["penalty_balance_paise"]); remaining -= penalty_part
+        interest_part = min(remaining, balances["interest_balance_paise"]); remaining -= interest_part
+        principal_part = remaining
+        payment = {
+            "receipt_no": receipt_no, "loan_id": loan_id, "customer_id": loan["customer_id"],
+            "amount": from_paise(settlement), "mode": payload.mode, "collector_id": user["id"],
+            "timestamp": iso(stamp), "status": "Posted", "journal_entry_id": journal_id,
+            "payment_reference": (payload.payment_reference or "").strip() or None,
+            "request_id": payload.request_id, "closure_payment": True, "closure_reason": payload.reason.strip(),
+            "allocation": {"penalty_paise": penalty_part, "interest_paise": interest_part, "principal_paise": principal_part, "preclosure_charge_paise": closure_charge},
+            "balance_before": from_paise(balances["balance_paise"]), "balance_after": 0.0,
+        }
+        lines = [ledger_line(cash_account(payload.mode), debit_paise=settlement, loan_id=loan_id)]
+        if penalty_part: lines.append(ledger_line("1300", credit_paise=penalty_part, loan_id=loan_id))
+        if interest_part: lines.append(ledger_line("1200", credit_paise=interest_part, loan_id=loan_id))
+        if principal_part: lines.append(ledger_line("1100", credit_paise=principal_part, loan_id=loan_id))
+        if closure_charge: lines.append(ledger_line("4100", credit_paise=closure_charge, loan_id=loan_id, charge="Pre-closure"))
+        event = {"event_id": event_id, "loan_id": loan_id, "event_type": "Loan Closed", "reason": payload.reason.strip(), "receipt_no": receipt_no, "settlement_amount": from_paise(settlement), "timestamp": iso(stamp), "posted_by": user["name"]}
+        loan_update = {"status": "Closed", "closed_at": iso(stamp), "closed_by": user["name"], "closure_reason": payload.reason.strip(), "closure_receipt_no": receipt_no}
+        if USE_MEMORY:
+            await insert_one("payments", payment)
+            await insert_one("loan_events", event)
+            await replace_one("loans", {"loan_id": loan_id}, {**loan, **loan_update})
+            await post_journal(journal_id, "loan_closure", receipt_no, f"Full and final closure of {loan_id}", lines, user)
+            await audit(user, "loan_closed", "loan", loan_id, {"payment": payment, "event": event}, request)
+        else:
+            await db.payments.insert_one(deepcopy(payment), session=session)
+            await db.loan_events.insert_one(deepcopy(event), session=session)
+            result = await db.loans.update_one({"_id": loan["_id"], "status": {"$ne": "Closed"}}, {"$set": loan_update, "$inc": {"ledger_version": 1}}, session=session)
+            if result.modified_count != 1: raise HTTPException(409, "Loan changed concurrently; reload and retry")
+            await post_journal(journal_id, "loan_closure", receipt_no, f"Full and final closure of {loan_id}", lines, user, session=session)
+            await audit(user, "loan_closed", "loan", loan_id, {"payment": payment, "event": event}, request, session=session)
+        return payment
+
+    if USE_MEMORY:
+        payment = await post_closure()
+    else:
+        async with await mongo_client.start_session() as session:
+            try:
+                payment = await session.with_transaction(post_closure)
+            except DuplicateKeyError:
+                payment = await db.payments.find_one({"request_id": payload.request_id})
+                if not payment: raise HTTPException(409, "Closure was already submitted")
+    loan = await enrich_loan(await find_one("loans", {"loan_id": loan_id}))
+    return {"loan": loan, "receipt": await receipt_payload(payment), "closed_at": loan.get("closed_at"), "closure_reason": loan.get("closure_reason")}
 
 
 async def receipt_payload(payment: dict[str, Any]) -> dict[str, Any]:
@@ -2532,22 +2837,63 @@ async def upi_settlement(payload: SettlementIn, request: Request, user: dict[str
     return settlement
 
 
+async def interest_rebate_limit(loan: dict[str, Any], balances: dict[str, int]) -> tuple[int, int, int]:
+    original_interest = to_paise(loan.get("contract_interest", 0))
+    adjustments = await find_many("loan_adjustments", {"loan_id": loan["loan_id"]})
+    already_rebated = sum(
+        to_paise(row.get("amount", 0)) for row in adjustments
+        if row.get("kind") == "Interest Rebate" and row.get("status", "Posted") != "Reversed"
+    )
+    return original_interest, already_rebated, min(max(original_interest - already_rebated, 0), balances["principal_balance_paise"])
+
+
+@app.get("/api/loans/{loan_id}/adjustment-preview")
+async def adjustment_preview(loan_id: str, amount: float, user: dict[str, Any] = Depends(require("owner", "manager", "accountant"))) -> dict[str, Any]:
+    loan = await find_one("loans", {"loan_id": loan_id})
+    if not loan:
+        raise HTTPException(404, "Loan not found")
+    if loan.get("status") not in {"Active", "Overdue"}:
+        raise HTTPException(409, "Interest can be adjusted only on an active loan")
+    proposed = to_paise(amount)
+    if proposed <= 0:
+        raise HTTPException(422, "Adjustment amount must be greater than zero")
+    balances = await loan_component_balances(loan)
+    original_interest, already_rebated, maximum = await interest_rebate_limit(loan, balances)
+    return {
+        "loan_id": loan_id, "original_interest": from_paise(original_interest),
+        "previous_rebates": from_paise(already_rebated),
+        "maximum_rebate": from_paise(maximum), "proposed_rebate": from_paise(proposed),
+        "balance_before": from_paise(balances["total_balance_paise"]),
+        "balance_after": from_paise(max(balances["total_balance_paise"] - proposed, 0)),
+        "permitted": proposed <= maximum,
+        "message": "Adjustment is within the remaining contract interest" if proposed <= maximum else "Rebate exceeds the remaining adjustable contract interest",
+    }
+
+
 @app.post("/api/loans/{loan_id}/adjustments")
 async def loan_adjustment(loan_id: str, payload: LoanAdjustmentIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
     loan = await find_one("loans", {"loan_id": loan_id})
     if not loan:
         raise HTTPException(404, "Loan not found")
+    if loan.get("status") not in {"Active", "Overdue"}:
+        raise HTTPException(409, "Adjustments can be posted only to an active loan")
     balances = await loan_component_balances(loan)
     amount = to_paise(payload.amount)
     if payload.kind == "Interest Waiver" and amount > balances["interest_balance_paise"]:
         raise HTTPException(409, "Waiver exceeds outstanding interest")
+    if payload.kind == "Interest Rebate":
+        _original_interest, _already_rebated, maximum_rebate = await interest_rebate_limit(loan, balances)
+        if amount > maximum_rebate:
+            raise HTTPException(409, "Interest rebate exceeds the remaining adjustable contract interest")
     if payload.kind == "Penalty Waiver" and amount > balances["penalty_balance_paise"]:
         raise HTTPException(409, "Waiver exceeds outstanding penalty")
     adjustment_id = f"ADJ-{await next_sequence('ADJ', 'adjustment_id', 'loan_adjustments'):08d}"
     entry_id = f"JRN-{await next_sequence('JRN', 'entry_id', 'journal_entries'):09d}"
-    adjustment = {"adjustment_id": adjustment_id, "loan_id": loan_id, **payload.model_dump(), "amount": from_paise(amount), "timestamp": iso(now()), "status": "Posted", "journal_entry_id": entry_id, "posted_by": user["name"]}
+    adjustment = {"adjustment_id": adjustment_id, "loan_id": loan_id, **payload.model_dump(), "amount": from_paise(amount), "balance_before": from_paise(balances["total_balance_paise"]), "balance_after": from_paise(max(balances["total_balance_paise"] - amount, 0)), "timestamp": iso(now()), "status": "Posted", "journal_entry_id": entry_id, "posted_by": user["name"]}
     if payload.kind == "Penalty":
         lines = [ledger_line("1300", debit_paise=amount, loan_id=loan_id), ledger_line("4100", credit_paise=amount, loan_id=loan_id)]
+    elif payload.kind == "Interest Rebate":
+        lines = [ledger_line("4000", debit_paise=amount, loan_id=loan_id), ledger_line("1100", credit_paise=amount, loan_id=loan_id)]
     else:
         receivable = "1200" if payload.kind == "Interest Waiver" else "1300"
         lines = [ledger_line("5100", debit_paise=amount, loan_id=loan_id), ledger_line(receivable, credit_paise=amount, loan_id=loan_id)]
@@ -2921,6 +3267,48 @@ async def create_area(payload: AreaIn, request: Request, user: dict[str, Any] = 
     await insert_one("areas", area)
     await audit(user, "area_create", "area", code, area, request)
     return area
+
+
+@app.patch("/api/areas/{code}")
+async def update_area(code: str, payload: AreaUpdateIn, request: Request, user: dict[str, Any] = Depends(require("owner"))) -> dict[str, Any]:
+    old_code = code.strip().upper()
+    new_code = payload.code or old_code
+    area = await find_one("areas", {"code": old_code})
+    if not area:
+        raise HTTPException(404, "Area not found")
+    if new_code != old_code and await find_one("areas", {"code": new_code}):
+        raise HTTPException(409, f"Area code {new_code} already exists")
+    updated = {
+        **area, "code": new_code, "name": " ".join(payload.name.split()),
+        "updated_at": iso(now()), "updated_by": user["name"],
+    }
+    details = {
+        "old_code": old_code, "new_code": new_code,
+        "old_name": area.get("name"), "new_name": updated["name"],
+        "customer_ids_unchanged": True,
+    }
+    if USE_MEMORY:
+        affected = await find_many("customers", {"area": old_code})
+        await replace_one("areas", {"code": old_code}, updated)
+        for customer in affected:
+            migrated = {**customer, "area": new_code, "area_updated_at": updated["updated_at"]}
+            await replace_one("customers", {"customer_id": customer["customer_id"]}, migrated)
+        details["customers_migrated"] = len(affected)
+        await audit(user, "area_updated", "area", new_code, details, request)
+    else:
+        async with await mongo_client.start_session() as session:
+            async with session.start_transaction():
+                result = await db.areas.replace_one({"_id": area["_id"], "code": old_code}, deepcopy(updated), session=session)
+                if result.modified_count != 1:
+                    raise HTTPException(409, "Area changed concurrently; reload and retry")
+                customer_result = await db.customers.update_many(
+                    {"area": old_code},
+                    {"$set": {"area": new_code, "area_updated_at": updated["updated_at"]}},
+                    session=session,
+                )
+                details["customers_migrated"] = customer_result.modified_count
+                await audit(user, "area_updated", "area", new_code, details, request, session=session)
+    return {**updated, "customers_migrated": details["customers_migrated"]}
 
 
 @app.post("/api/backups/manual")
