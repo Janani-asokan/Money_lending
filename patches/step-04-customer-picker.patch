@@ -1,0 +1,113 @@
+--- step3/client/src/main.jsx
++++ step4/client/src/main.jsx
+@@ -411,6 +411,46 @@
+   );
+ }
+ 
++// Shared customer lookup used by Customer Onboarding and Loan disbursement (same rule, same list).
++function findCustomerMatches(customers, nameText, mobileText) {
++  const name = (nameText || '').trim().toLowerCase();
++  const mobile = (mobileText || '').trim();
++  if (name.length < 3 && mobile.length < 4) return [];
++  return customers.filter(customer =>
++    (mobile.length >= 4 && customer.mobile?.includes(mobile)) ||
++    (name.length >= 3 && customer.name?.toLowerCase().includes(name))
++  ).slice(0, 4);
++}
++
++function CustomerSuggestions({ matches, onSelect }) {
++  if (!matches.length) return null;
++  return <div className="customer-suggestions" role="listbox" aria-label="Existing customer suggestions"><strong>Existing customer found</strong><small>Select the previous profile instead of creating a duplicate.</small>{matches.map(customer => <button type="button" key={customer.customer_id} onClick={() => onSelect(customer)}><span>{customer.name}<small>{customer.customer_id} · {customer.mobile}</small></span><ChevronRight size={17}/></button>)}</div>;
++}
++
++function CustomerPicker({ customers, value, onChange }) {
++  const [name, setName] = useState('');
++  const [mobile, setMobile] = useState('');
++  const matches = useMemo(() => findCustomerMatches(customers, name, mobile), [customers, name, mobile]);
++  const selected = customers.find(c => c.customer_id === value);
++  function pick(customer) {
++    setName(customer.name || '');
++    setMobile(customer.mobile || '');
++    onChange(customer.customer_id);
++  }
++  return (
++    <div className="customer-picker">
++      <div className="two-col">
++        <label>Customer name<input value={name} onChange={e => setName(e.target.value)} placeholder="Type 3+ letters" /></label>
++        <label>Mobile<input inputMode="numeric" maxLength="10" value={mobile} onChange={e => setMobile(e.target.value.replace(/\D/g, ''))} placeholder="Type 4+ digits" /></label>
++      </div>
++      <CustomerSuggestions matches={matches} onSelect={pick} />
++      {selected
++        ? <div className="locked-note"><CheckCircle2 size={16} /> Selected: <strong>{selected.name}</strong> · {selected.customer_id} · {selected.mobile} · {selected.status}</div>
++        : <div className="locked-note"><AlertTriangle size={16} /> No customer selected. Type a name or mobile number and choose from the list.</div>}
++    </div>
++  );
++}
++
+ function Customers({ api, user, notify }) {
+   const [rows, setRows] = useState([]);
+   const [knownCustomers, setKnownCustomers] = useState([]);
+@@ -444,15 +484,7 @@
+     const timer = setTimeout(() => load(customerQuery), 250);
+     return () => clearTimeout(timer);
+   }, [customerQuery]);
+-  const previousMatches = useMemo(() => {
+-    const name = form.name.trim().toLowerCase();
+-    const mobile = form.mobile.trim();
+-    if (name.length < 3 && mobile.length < 4) return [];
+-    return knownCustomers.filter(customer =>
+-      (mobile.length >= 4 && customer.mobile?.includes(mobile)) ||
+-      (name.length >= 3 && customer.name?.toLowerCase().includes(name))
+-    ).slice(0, 4);
+-  }, [knownCustomers, form.name, form.mobile]);
++  const previousMatches = useMemo(() => findCustomerMatches(knownCustomers, form.name, form.mobile), [knownCustomers, form.name, form.mobile]);
+   function usePreviousCustomer(customer) {
+     setForm(current => ({ ...current, name: customer.name || '', father_name: customer.father_name || '', mobile: customer.mobile || '', address: customer.address || '', area: customer.area_code || customer.area || current.area, guarantor: customer.guarantor || '' }));
+     setReceipt({ type: 'Existing Customer Selected', ack: customer.customer_id, customer });
+@@ -580,7 +612,7 @@
+           <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code} value={a.code}>{a.name}</option>)}</select></label>
+           <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
+         </div>
+-        {previousMatches.length > 0 && <div className="customer-suggestions" role="listbox" aria-label="Existing customer suggestions"><strong>Existing customer found</strong><small>Select the previous profile instead of creating a duplicate.</small>{previousMatches.map(customer => <button type="button" key={customer.customer_id} onClick={() => usePreviousCustomer(customer)}><span>{customer.name}<small>{customer.customer_id} · {customer.mobile}</small></span><ChevronRight size={17}/></button>)}</div>}
++        <CustomerSuggestions matches={previousMatches} onSelect={usePreviousCustomer} />
+         <label>Address<textarea required value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></label>
+         <label>Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
+         {formError && <div className="error" role="alert">{formError}</div>}
+@@ -752,7 +784,7 @@
+     setCustomers(cs);
+     const loanRows = await api('/api/loans');
+     setRows(loanRows.map(row=>({...row,contract_version:row.contract_version ?? 1})));
+-    setForm(f => ({ ...f, customer_id: f.customer_id || cs[0]?.customer_id || '', collector_id: f.collector_id || b.collectors[0]?.id || '' }));
++    setForm(f => ({ ...f, customer_id: f.customer_id, collector_id: f.collector_id || b.collectors[0]?.id || '' }));
+     setService(s => ({ ...s, loan_id: s.loan_id || loanRows[0]?.loan_id || '' }));
+   };
+   useEffect(() => { load(); }, []);
+@@ -829,7 +861,7 @@
+       <form className="panel form-panel" onSubmit={submit}>
+         <div className="panel-head"><h2>Loan disbursement</h2><span>Auto Loan ID, installment and completion date</span></div>
+         <div className="locked-note">Automatic Aadhaar: {providerStatus.configured ? `${providerStatus.provider} connected` : 'Not configured — authorized AUA/KUA provider credentials required'}</div>
+-        <label>Customer<select value={form.customer_id} onChange={e => setForm({ ...form, customer_id: e.target.value })}>{customers.map(c => <option key={c.customer_id}>{c.customer_id}</option>)}</select></label>
++        <CustomerPicker customers={customers} value={form.customer_id} onChange={id => setForm({ ...form, customer_id: id })} />
+         <div className="two-col">
+           <label>Principal<input type="number" value={form.principal} onChange={e => setForm({ ...form, principal: e.target.value })} /></label>
+           <label>Monthly interest %<input type="number" required min="0.01" max="10" step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /><small>{Number(form.interest_rate) || 0}% per month, deducted before handover (default 2.14%)</small></label>
+@@ -841,8 +873,8 @@
+         <label>Collector<select value={form.collector_id} onChange={e => setForm({ ...form, collector_id: e.target.value })}>{boot.collectors.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
+         <label>Disbursement account<select value={form.disbursement_mode} onChange={e => setForm({ ...form, disbursement_mode: e.target.value })}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>
+         <label>KFS borrower acknowledgement reference<input required value={form.kfs_acknowledgement_reference} onChange={e=>setForm({...form,kfs_acknowledgement_reference:e.target.value})} placeholder="Signed/OTP acknowledgement ID"/></label>
+-        {providerStatus.configured && <div className="servicing-box"><h3>Fresh Aadhaar OTP before money handover</h3><label>Purpose<input value={identity.purpose} onChange={e=>setIdentity({...identity,purpose:e.target.value})}/></label><label>Consent reference<input value={identity.consent_reference} onChange={e=>setIdentity({...identity,consent_reference:e.target.value})}/></label><label>Owner handover note<input value={identity.owner_notes} onChange={e=>setIdentity({...identity,owner_notes:e.target.value})}/></label><div className="action-row"><button type="button" className="ghost" disable
+-        <button type="button" className="ghost" onClick={preview}><FileText size={18}/> Preview APR, KFS and schedule</button>
++        {providerStatus.configured && <div className="servicing-box"><h3>Fresh Aadhaar OTP before money handover</h3><label>Purpose<input value={identity.purpose} onChange={e=>setIdentity({...identity,purpose:e.target.value})}/></label><label>Consent reference<input value={identity.consent_reference} onChange={e=>setIdentity({...identity,consent_reference:e.target.value})}/></label><label>Owner handover note<input value={identity.owner_notes} onChange={e=>setIdentity({...identity,owner_notes:e.target.value})}/></label><div className="action-row"><button type="button" className="ghost" disable
++        <button type="button" className="ghost" disabled={!form.customer_id} onClick={preview}><FileText size={18}/> Preview APR, KFS and schedule</button>
+         {loanError && <div className="error" role="alert">{loanError}</div>}
+         <button className="primary" disabled={savingLoan || !form.customer_id || !form.collector_id}><FileText size={18} /> {savingLoan ? 'Creating loan…' : 'Create loan directly'}</button>
+         {quote && <div className="locked-note">Monthly rate {quote.monthly_interest_rate}% · Interest deducted {money(quote.total_interest)} · Cash handed over {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
+--- step3/client/src/styles.css
++++ step4/client/src/styles.css
+@@ -1018,3 +1018,6 @@
+   .app-shell .sidebar nav::-webkit-scrollbar { display: none; }
+   .app-shell .sidebar .nav-item { scroll-snap-align: start; }
+ }
++
++/* Item 4: shared customer picker used on the Loan disbursement screen */
++.customer-picker { display: grid; gap: 10px; }

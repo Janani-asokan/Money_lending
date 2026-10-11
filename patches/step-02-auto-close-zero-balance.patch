@@ -1,0 +1,111 @@
+--- step1/server/main.py
++++ step2/server/main.py
+@@ -1405,6 +1405,65 @@
+             await insert_one("notifications", {**alert, "channel": "In-app WhatsApp/SMS", "sent": False})
+ 
+ 
++AUTO_CLOSE_REASON = "Balance reached zero - closed automatically"
++
++
++async def sync_loan_status(loan_id: str, allow_reopen: bool = False) -> Optional[str]:
++    """Keep the stored loan status in line with the real balance.
++
++    - balance 0 and loan not Closed / Written Off  -> status becomes "Closed"
++    - allow_reopen (used only after an approved reversal): a Closed loan whose
++      balance is outstanding again goes back to "Active"
++    No payment, ledger or schedule data is touched; only the status fields plus an
++    event and an audit entry are written. Safe to call repeatedly.
++    """
++    loan = await find_one("loans", {"loan_id": loan_id})
++    if not loan:
++        return None
++    current = loan.get("status", "Active")
++    if current == "Written Off":
++        return None
++    balances = await loan_component_balances(loan)
++    stamp = iso(now())
++    if balances["balance_paise"] <= 0 and current != "Closed":
++        fields = {"status": "Closed", "closed_at": stamp, "closed_by": "System", "closure_reason": AUTO_CLOSE_REASON}
++        event_type, reason, outcome = "Loan Closed", AUTO_CLOSE_REASON, "Closed"
++        guard = {"loan_id": loan_id, "status": {"$nin": ["Closed", "Written Off"]}}
++    elif allow_reopen and balances["balance_paise"] > 0 and current == "Closed":
++        fields = {"status": "Active", "reopened_at": stamp, "reopened_reason": "A reversal made the balance outstanding again"}
++        event_type, reason, outcome = "Loan Reopened", fields["reopened_reason"], "Reopened"
++        guard = {"loan_id": loan_id, "status": "Closed"}
++    else:
++        return None
++    if USE_MEMORY:
++        await replace_one("loans", {"loan_id": loan_id}, {**loan, **fields})
++    else:
++        result = await db.loans.update_one(guard, {"$set": fields, "$inc": {"ledger_version": 1}})
++        if result.modified_count != 1:
++            return None
++    event_id = f"LEV-{await next_sequence('LEV', 'event_id', 'loan_events'):08d}"
++    event = {"event_id": event_id, "loan_id": loan_id, "event_type": event_type, "reason": reason, "approval_reference": "AUTOMATIC", "timestamp": stamp, "posted_by": "System", "previous_status": current}
++    await insert_one("loan_events", event)
++    await audit(None, "loan_auto_closed" if outcome == "Closed" else "loan_reopened", "loan", loan_id, {"event": event, "balance_paise": balances["balance_paise"]})
++    return outcome
++
++
++async def auto_close_zero_balance_loans() -> int:
++    """One-time/idempotent sweep: closes every existing loan whose balance is already 0."""
++    closed = 0
++    try:
++        for row in await find_many("loans"):
++            if row.get("status", "Active") in {"Closed", "Written Off"}:
++                continue
++            if await sync_loan_status(row["loan_id"]) == "Closed":
++                closed += 1
++        if closed:
++            print(f"[auto-close] {closed} loan(s) with zero balance were marked Closed")
++    except Exception as exc:  # never block application startup
++        print(f"[auto-close] sweep skipped: {exc}")
++    return closed
++
++
+ @app.on_event("startup")
+ async def startup() -> None:
+     global mongo_client, db, USE_MEMORY
+@@ -1412,6 +1471,7 @@
+     if not MONGO_ENABLED:
+         USE_MEMORY = True
+         await seed_data()
++        await auto_close_zero_balance_loans()
+         return
+     try:
+         mongo_client = AsyncIOMotorClient(
+@@ -1433,6 +1493,7 @@
+         hello = await db.command("hello")
+         if not hello.get("setName"):
+             raise RuntimeError("Production MongoDB must be configured as a replica set")
++    await auto_close_zero_balance_loans()
+ 
+ 
+ @app.get("/api/health")
+@@ -2691,6 +2752,7 @@
+                     if payment:
+                         return {"payment": payment, "loan": await enrich_loan(await find_one("loans", {"loan_id": payment["loan_id"]})), "receipt": await receipt_payload(payment), "duplicate": True}
+                 raise HTTPException(409, "This payment was already posted")
++    await sync_loan_status(payment["loan_id"])
+     loan = await find_one("loans", {"loan_id": payment["loan_id"]})
+     after = await enrich_loan(loan)
+     return {"payment": payment, "loan": after, "receipt": await receipt_payload(payment)}
+@@ -2999,6 +3061,8 @@
+                 await db.loan_adjustments.insert_one(deepcopy(adjustment), session=session)
+                 await post_journal(entry_id, "loan_adjustment", adjustment_id, f"{payload.kind}: {payload.reason}", lines, user, session=session)
+     await audit(user, "loan_adjustment", "loan", loan_id, adjustment, request)
++    await sync_loan_status(loan_id)
++    loan = await find_one("loans", {"loan_id": loan_id}) or loan
+     return {"adjustment": adjustment, "loan": await enrich_loan(loan)}
+ 
+ 
+@@ -3170,6 +3234,9 @@
+                 reversal = await post_journal(reversal_id, "journal_reversal", original["entry_id"], f"Approved reversal {request_id}: {reversal_request['reason']}", lines, user, session=session, reversal_of=original["entry_id"])
+                 if source_mapping and source_after:
+                     await db[source_mapping[0]].replace_one({source_mapping[1]: original["source_id"]}, source_after, session=session)
++    affected_loan_id = (source_before or {}).get("loan_id")
++    if affected_loan_id:
++        await sync_loan_status(affected_loan_id, allow_reopen=True)
+     await audit(user, "reversal_approved_and_posted", "reversal_request", request_id, {
+         "original_transaction_reference": original["entry_id"], "reason": reversal_request["reason"],
+         "manager_approval": {"checker": user["name"], "checker_id": user["id"], "reference": payload.approval_reference, "comments": payload.comments},

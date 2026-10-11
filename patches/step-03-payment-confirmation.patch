@@ -1,0 +1,78 @@
+--- step2/client/src/main.jsx
++++ step3/client/src/main.jsx
+@@ -903,6 +903,7 @@
+   const [receipt, setReceipt] = useState(null);
+   const [saving, setSaving] = useState(false);
+   const [error, setError] = useState('');
++  const [confirming, setConfirming] = useState(null);
+   const load = async () => {
+     const [rows, paymentRows] = await Promise.all([api('/api/loans'), api('/api/payments')]);
+     const collectible = rows.filter(row => row.balance > 0 && row.status !== 'Closed');
+@@ -918,18 +919,25 @@
+   const lastPayment = selectedPayments[0];
+   const paidToday = selectedPayments.filter(payment => indiaDayKey(payment.timestamp) === todayKey);
+   const paidTodayAmount = paidToday.reduce((sum,payment)=>sum+Number(payment.amount || 0),0);
+-  async function submit(e) {
++  function submit(e) {
+     e.preventDefault();
+     if (!selected || saving) return;
++    setError('');
++    // Nothing is saved here. The payment is only recorded after the user confirms in the popup.
++    setConfirming({ loan: selected, amount: Number(amount), mode, reference: mode === 'UPI' ? paymentReference.trim() : '', requestId: crypto.randomUUID() });
++  }
++  async function confirmAndSave() {
++    if (!confirming || saving) return;
+     setSaving(true);
+     setError('');
+-    const requestId = crypto.randomUUID();
++    const requestId = confirming.requestId;
+     try {
+       const res = await api('/api/payments', {
+         method: 'POST',
+         headers: { 'Idempotency-Key': requestId },
+-        body: JSON.stringify({ loan_id: selected.loan_id, amount: Number(amount), mode, payment_reference: mode === 'UPI' ? paymentReference.trim() : null, request_id: requestId })
++        body: JSON.stringify({ loan_id: confirming.loan.loan_id, amount: confirming.amount, mode: confirming.mode, payment_reference: confirming.mode === 'UPI' ? confirming.reference : null, request_id: requestId })
+       });
++      setConfirming(null);
+       setReceipt(res.receipt);
+       setAmount('');
+       setPaymentReference('');
+@@ -972,6 +980,7 @@
+         ) : <p>No loans available.</p>}
+       </form>
+       {receipt && <ReceiptModal title="Payment Receipt" onClose={() => setReceipt(null)} data={receipt} />}
++      {confirming && <PaymentConfirmModal payment={confirming} saving={saving} error={error} onCancel={() => { setConfirming(null); setError(''); }} onConfirm={confirmAndSave} />}
+     </div>
+   );
+ }
+@@ -1362,6 +1371,30 @@
+   return <div className="table-scroll"><table><thead><tr><th>Loan</th><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th><th>Status</th>{onView&&<th>Action</th>}</tr></thead><tbody>{rows.map(l => <tr key={l.loan_id}><td>{l.loan_id}<small>{date(l.borrow_date)}</small></td><td>{l.customer_name || l.customer_id}<small>{l.area_name || l.area}</small></td><td>{l.frequency || l.loan_type}</td><td>{money(l.installment)}</td><td>{money(l.paid)}</td><td>{money(l.balance)}</td><td>{l.remaining_installments ?? '—'}<small>{l.frequency ? `${l.frequency} installments` : ''}</small></td><td>{l.next_due_date ? date(l.next_due_date) : 'Completed'}</td><td><Status value={l.status} /></td>{onView&&<td><button className="ghost small" disabled={viewBusy} onClick={()=>onView(l.loan_id)}><FileText size={15}/>View loan</button></td>}</tr>)}</tbody></table></div>;
+ }
+ 
++function PaymentConfirmModal({ payment, saving, error, onCancel, onConfirm }) {
++  const balanceAfter = Math.max(0, Number(payment.loan.balance || 0) - Number(payment.amount || 0));
++  return (
++    <div className="modal-backdrop" onClick={() => !saving && onCancel()}>
++      <div className="modal confirm-delete" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
++        <div className="panel-head"><div><span className="section-kicker">Confirm payment</span><h2>Are you sure you want to record this payment?</h2></div><button type="button" className="icon-btn" disabled={saving} onClick={onCancel}>×</button></div>
++        <div className="summary-card">
++          <strong>{payment.loan.customer_name}</strong>
++          <span>{payment.loan.customer_id} · {payment.loan.loan_id}</span>
++          <div className="amount-line">{money(payment.amount)} <small>via {payment.mode}</small></div>
++          {payment.reference && <span>Reference: {payment.reference}</span>}
++          <span>Balance after this payment: {money(balanceAfter)}{balanceAfter === 0 ? ' (loan will be closed)' : ''}</span>
++        </div>
++        <div className="locked-note"><LockKeyhole size={16} /> Nothing is saved until you press Confirm.</div>
++        {error && <div className="error" role="alert">{error}</div>}
++        <div className="action-row">
++          <button type="button" className="ghost" disabled={saving} onClick={onCancel}>Cancel</button>
++          <button type="button" className="primary" disabled={saving} onClick={onConfirm}><ReceiptIndianRupee size={18} /> {saving ? 'Saving payment…' : 'Confirm and save payment'}</button>
++        </div>
++      </div>
++    </div>
++  );
++}
++
+ function ReceiptModal({ title, data, onClose }) {
+   return (
+     <div className="modal-backdrop">

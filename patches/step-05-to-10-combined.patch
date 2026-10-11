@@ -1,0 +1,493 @@
+--- step4/server/main.py
++++ final/server/main.py
+@@ -124,6 +124,12 @@
+ MAX_MONTHLY_INTEREST_RATE = float(os.getenv("MAX_MONTHLY_INTEREST_RATE", "10"))
+ 
+ 
++# Late charge rule - the ONLY place that decides who is a "defaulter".
++# A loan is a defaulter when its oldest unpaid instalment is at least this many days past its due date.
++# Change the number here (or set the LATE_CHARGE_DEFAULTER_DAYS environment variable).
++LATE_CHARGE_DEFAULTER_DAYS = int(os.getenv("LATE_CHARGE_DEFAULTER_DAYS", "30"))
++
++
+ def validate_new_loan_rate(rate: float) -> None:
+     if not (MIN_MONTHLY_INTEREST_RATE <= rate <= MAX_MONTHLY_INTEREST_RATE):
+         raise HTTPException(422, f"Monthly interest rate must be between {MIN_MONTHLY_INTEREST_RATE:g}% and {MAX_MONTHLY_INTEREST_RATE:g}%")
+@@ -297,7 +303,7 @@
+     disbursement_mode: str = "Cash"
+     interest_method: str = "Upfront Monthly Flat"
+     processing_fee: float = Field(default=0, ge=0, le=10000000)
+-    tax_rate: float = Field(default=18, ge=0, le=100)
++    tax_rate: float = Field(default=0, ge=0, le=100)
+     first_due_date: Optional[str] = None
+     moratorium_periods: int = Field(default=0, ge=0, le=24)
+     moratorium_interest_capitalized: bool = True
+@@ -365,6 +371,14 @@
+     collector_id: Optional[str] = None
+     request_id: Optional[str] = Field(default=None, min_length=8, max_length=100)
+     payment_reference: Optional[str] = Field(default=None, max_length=120)
++    payment_type: str = "Collection"
++
++    @field_validator("payment_type")
++    @classmethod
++    def valid_payment_type(cls, value: str) -> str:
++        if value not in {"Collection", "Prepayment"}:
++            raise ValueError("Payment type must be Collection or Prepayment")
++        return value
+ 
+     @field_validator("mode")
+     @classmethod
+@@ -1405,6 +1419,63 @@
+             await insert_one("notifications", {**alert, "channel": "In-app WhatsApp/SMS", "sent": False})
+ 
+ 
++async def late_charge_status(loan: dict[str, Any]) -> dict[str, Any]:
++    """Defaulter check for the late-charge rule (see LATE_CHARGE_DEFAULTER_DAYS)."""
++    late_fee = float(loan.get("late_fee", 0) or 0)
++    info: dict[str, Any] = {
++        "is_defaulter": False, "overdue_days": 0, "threshold_days": LATE_CHARGE_DEFAULTER_DAYS,
++        "late_fee": late_fee, "next_installment": None, "can_apply": False, "message": "",
++    }
++    if loan.get("status") in {"Closed", "Written Off"}:
++        info["message"] = "Loan is closed."
++        return info
++    if loan.get("contract_version", 1) < 2:
++        info["message"] = "Late charges need a versioned contract."
++        return info
++    schedule = await find_one("loan_schedules", {"loan_id": loan["loan_id"], "version": int(loan.get("schedule_version", 1))})
++    if not schedule:
++        info["message"] = "No schedule found."
++        return info
++    paid = await instalment_paid_paise(loan["loan_id"])
++    stamp = now()
++    cumulative = 0
++    unpaid_overdue: list[dict[str, Any]] = []
++    for row in sorted(schedule["rows"], key=lambda item: int(item["number"])):
++        cumulative += to_paise(row["payment"])
++        if cumulative > paid and parse_date(row["due_date"]) < stamp:
++            unpaid_overdue.append(row)
++    if unpaid_overdue:
++        info["overdue_days"] = max((stamp - parse_date(unpaid_overdue[0]["due_date"])).days, 0)
++    info["is_defaulter"] = bool(unpaid_overdue) and info["overdue_days"] >= LATE_CHARGE_DEFAULTER_DAYS
++    if not info["is_defaulter"]:
++        info["message"] = f"Late charge applies only to defaulters (oldest unpaid instalment at least {LATE_CHARGE_DEFAULTER_DAYS} days overdue). This loan is {info['overdue_days']} day(s) overdue."
++        return info
++    if late_fee <= 0:
++        info["message"] = "No late charge was disclosed in this loan's KFS."
++        return info
++    for row in unpaid_overdue:
++        request_id = f"LATE-{loan['loan_id']}-{loan['schedule_version']}-{int(row['number'])}"
++        if not await find_one("loan_adjustments", {"request_id": request_id}):
++            info["next_installment"] = int(row["number"])
++            info["can_apply"] = True
++            return info
++    info["message"] = "Late charge is already applied to every overdue instalment."
++    return info
++
++
++async def instalment_paid_paise(loan_id: str) -> int:
++    total = 0
++    for payment in await find_many("payments", {"loan_id": loan_id}):
++        if payment.get("status", "Posted") == "Reversed":
++            continue
++        allocation = payment.get("allocation")
++        if allocation:
++            total += int(allocation.get("principal_paise", 0)) + int(allocation.get("interest_paise", 0))
++        else:
++            total += to_paise(payment["amount"])
++    return total
++
++
+ AUTO_CLOSE_REASON = "Balance reached zero - closed automatically"
+ 
+ 
+@@ -2245,7 +2316,8 @@
+ @app.post("/api/loan-quotes")
+ async def loan_quote(payload: LoanIn, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+     validate_new_loan_rate(payload.interest_rate)
+-    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat"})
++    # Tax on fee, moratorium and pre-closure charge were removed from disbursement: new loans always carry 0 for them.
++    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat", "tax_rate": 0, "moratorium_periods": 0, "preclosure_charge_rate": 0})
+     borrow = parse_date(payload.borrow_date)
+     schedule = build_amortization(payload, borrow)
+     return {
+@@ -2300,6 +2372,7 @@
+         item["interest_paid"] = from_paise(int(allocation.get("interest_paise", 0)))
+         item["penalty_paid"] = from_paise(int(allocation.get("penalty_paise", 0)))
+         item["closure_charge_paid"] = from_paise(int(allocation.get("preclosure_charge_paise", 0)))
++        item["payment_type"] = "Closure" if item.get("closure_payment") else item.get("payment_type", "Collection")
+         item["balance_after"] = item.get("balance_after", from_paise(running_balance))
+         if item.get("status", "Posted") != "Reversed":
+             running_balance += applied
+@@ -2345,6 +2418,7 @@
+         "part_payments": part_payments,
+         "writeoffs": writeoffs,
+         "identity_verification": verification,
++        "late_charge": await late_charge_status(loan_record),
+         "closure": {
+             "closed": loan.get("status") == "Closed",
+             "closed_at": closure_payment.get("timestamp") if closure_payment else None,
+@@ -2377,27 +2451,6 @@
+     }
+ 
+ 
+-@app.get("/api/loans/{loan_id}/preclosure-quote")
+-async def preclosure_quote(loan_id: str, quote_date: Optional[str] = None, user: dict[str, Any] = Depends(require("owner", "manager", "accountant"))) -> dict[str, Any]:
+-    loan = await find_one("loans", {"loan_id": loan_id})
+-    if not loan:
+-        raise HTTPException(404, "Loan not found")
+-    quote_at = parse_date(quote_date)
+-    schedule = await find_one("loan_schedules", {"loan_id": loan_id, "version": int(loan.get("schedule_version", 1))})
+-    if not schedule:
+-        raise HTTPException(409, "Legacy loan requires schedule migration")
+-    payments = [p for p in await find_many("payments", {"loan_id": loan_id}) if p.get("status", "Posted") != "Reversed"]
+-    principal_paid = sum(int(p.get("allocation", {}).get("principal_paise", 0)) for p in payments)
+-    interest_paid = sum(int(p.get("allocation", {}).get("interest_paise", 0)) for p in payments)
+-    principal_due = max(to_paise(loan["principal"]) - principal_paid, 0)
+-    accrued_interest = sum(to_paise(row["interest"]) for row in schedule["rows"] if parse_date(row["due_date"]) <= quote_at)
+-    interest_due = max(accrued_interest - interest_paid, 0)
+-    penalty_due = (await loan_component_balances(loan))["penalty_balance_paise"]
+-    charge = to_paise(Decimal(principal_due) / 100 * Decimal(str(loan.get("preclosure_charge_rate", 0))) / 100)
+-    total = principal_due + interest_due + penalty_due + charge
+-    return {"loan_id": loan_id, "quote_date": quote_at.date().isoformat(), "principal": from_paise(principal_due), "accrued_interest": from_paise(interest_due), "penal_charges": from_paise(penalty_due), "preclosure_charge": from_paise(charge), "total": from_paise(total), "valid_for_date_only": True}
+-
+-
+ def migration_schedule_input(loan: dict[str, Any]) -> LoanIn:
+     return LoanIn(
+         customer_id=loan["customer_id"], principal=float(loan["principal"]), interest_rate=2.14,
+@@ -2617,7 +2670,8 @@
+     if payload.loan_type not in LOAN_TYPES:
+         raise HTTPException(422, "Invalid loan type")
+     validate_new_loan_rate(payload.interest_rate)
+-    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat"})
++    # Tax on fee, moratorium and pre-closure charge were removed from disbursement: new loans always carry 0 for them.
++    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat", "tax_rate": 0, "moratorium_periods": 0, "preclosure_charge_rate": 0})
+     collector = await find_one("users", {"id": payload.collector_id})
+     if not collector or collector.get("role") not in {"collector", "owner", "manager"} or not collector.get("active", True):
+         raise HTTPException(422, "Select an active collector or the self-managed owner")
+@@ -2710,6 +2764,8 @@
+         amount_paise = to_paise(payload.amount)
+         if amount_paise <= 0 or amount_paise > balances["balance_paise"]:
+             raise HTTPException(422, "Payment must not exceed the principal, interest, and penalty outstanding")
++        if payload.payment_type == "Prepayment" and amount_paise >= balances["balance_paise"]:
++            raise HTTPException(422, "A prepayment must be less than the outstanding balance. Use Close account to settle the full balance.")
+         remaining = amount_paise
+         penalty_part = min(remaining, balances["penalty_balance_paise"]); remaining -= penalty_part
+         interest_part = min(remaining, balances["interest_balance_paise"]); remaining -= interest_part
+@@ -2724,6 +2780,7 @@
+             "amount": from_paise(amount_paise), "mode": payload.mode, "collector_id": collector_id,
+             "timestamp": iso(stamp), "status": "Posted", "journal_entry_id": entry_id,
+             "payment_reference": (payload.payment_reference or "").strip() or None,
++            "payment_type": payload.payment_type,
+             "allocation": {"penalty_paise": penalty_part, "interest_paise": interest_part, "principal_paise": principal_part},
+             "balance_before": from_paise(balances["balance_paise"]),
+             "balance_after": from_paise(balances["balance_paise"] - amount_paise),
+@@ -2791,8 +2848,7 @@
+         balances = await loan_component_balances(loan, session=session)
+         if balances["balance_paise"] <= 0:
+             raise HTTPException(409, "This loan is already completed")
+-        closure_charge = int((Decimal(balances["principal_balance_paise"]) * Decimal(str(loan.get("preclosure_charge_rate", 0))) / Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+-        settlement = balances["balance_paise"] + closure_charge
++        settlement = balances["balance_paise"]
+         remaining = balances["balance_paise"]
+         penalty_part = min(remaining, balances["penalty_balance_paise"]); remaining -= penalty_part
+         interest_part = min(remaining, balances["interest_balance_paise"]); remaining -= interest_part
+@@ -2804,14 +2860,13 @@
+             "payment_reference": (payload.payment_reference or "").strip() or None,
+             "request_id": payload.request_id, "closure_payment": True, "closure_reason": payload.reason.strip(),
+             "closure_approval_reference": payload.approval_reference.strip() or f"OWNER-{user['id']}",
+-            "allocation": {"penalty_paise": penalty_part, "interest_paise": interest_part, "principal_paise": principal_part, "preclosure_charge_paise": closure_charge},
++            "allocation": {"penalty_paise": penalty_part, "interest_paise": interest_part, "principal_paise": principal_part},
+             "balance_before": from_paise(balances["balance_paise"]), "balance_after": 0.0,
+         }
+         lines = [ledger_line(cash_account(payload.mode), debit_paise=settlement, loan_id=loan_id)]
+         if penalty_part: lines.append(ledger_line("1300", credit_paise=penalty_part, loan_id=loan_id))
+         if interest_part: lines.append(ledger_line("1200", credit_paise=interest_part, loan_id=loan_id))
+         if principal_part: lines.append(ledger_line("1100", credit_paise=principal_part, loan_id=loan_id))
+-        if closure_charge: lines.append(ledger_line("4100", credit_paise=closure_charge, loan_id=loan_id, charge="Pre-closure"))
+         event = {"event_id": event_id, "loan_id": loan_id, "event_type": "Loan Closed", "reason": payload.reason.strip(), "approval_reference": payload.approval_reference.strip() or f"OWNER-{user['id']}", "receipt_no": receipt_no, "settlement_amount": from_paise(settlement), "timestamp": iso(stamp), "posted_by": user["name"]}
+         loan_update = {"status": "Closed", "closed_at": iso(stamp), "closed_by": user["name"], "closure_reason": payload.reason.strip(), "closure_receipt_no": receipt_no}
+         if USE_MEMORY:
+@@ -3095,9 +3150,12 @@
+     if existing:
+         return {"adjustment": existing, "loan": await enrich_loan(loan), "duplicate": True}
+     cumulative_due = to_paise(sum(Decimal(str(item["payment"])) for item in schedule["rows"] if int(item["number"]) <= installment_number))
+-    paid = sum(to_paise(p["amount"]) for p in await find_many("payments", {"loan_id": loan_id}) if p.get("status", "Posted") != "Reversed")
++    paid = await instalment_paid_paise(loan_id)
+     if paid >= cumulative_due:
+         raise HTTPException(409, "Installment is already fully paid")
++    defaulter = await late_charge_status(loan)
++    if not defaulter["is_defaulter"]:
++        raise HTTPException(409, defaulter["message"] or "Late charge can be applied only to defaulters")
+     return await loan_adjustment(loan_id, LoanAdjustmentIn(kind="Penalty", amount=late_fee, reason=f"Contractual late charge for installment {installment_number}", request_id=request_id), request, user)
+ 
+ 
+--- step4/client/src/main.jsx
++++ final/client/src/main.jsx
+@@ -470,6 +470,9 @@
+   const [deleteCandidate, setDeleteCandidate] = useState(null);
+   const [deleteForm, setDeleteForm] = useState({ confirmation:'', reason:'', understood:false });
+   const [editCandidate, setEditCandidate] = useState(null);
++  const [registryFilter, setRegistryFilter] = useState('all');
++  const [areaFilter, setAreaFilter] = useState('');
++  const [areaView, setAreaView] = useState('none');
+   const load = async (query = customerQuery) => {
+     const boot = await api('/api/bootstrap');
+     setAreas(boot.areas);
+@@ -485,6 +488,14 @@
+     return () => clearTimeout(timer);
+   }, [customerQuery]);
+   const previousMatches = useMemo(() => findCustomerMatches(knownCustomers, form.name, form.mobile), [knownCustomers, form.name, form.mobile]);
++  const areaOf = row => row.area_code || row.area || '';
++  const pendingCount = useMemo(() => rows.filter(row => row.status === 'Pending Verification').length, [rows]);
++  const visibleRows = useMemo(() => {
++    let list = rows.filter(row => (registryFilter !== 'pending' || row.status === 'Pending Verification') && (!areaFilter || areaOf(row) === areaFilter));
++    if (areaView !== 'none') list = [...list].sort((a, b) => areaOf(a).localeCompare(areaOf(b)) || String(a.name || '').localeCompare(String(b.name || '')));
++    return list;
++  }, [rows, registryFilter, areaFilter, areaView]);
++  const areaCounts = useMemo(() => visibleRows.reduce((acc, row) => ({ ...acc, [areaOf(row)]: (acc[areaOf(row)] || 0) + 1 }), {}), [visibleRows]);
+   function usePreviousCustomer(customer) {
+     setForm(current => ({ ...current, name: customer.name || '', father_name: customer.father_name || '', mobile: customer.mobile || '', address: customer.address || '', area: customer.area_code || customer.area || current.area, guarantor: customer.guarantor || '' }));
+     setReceipt({ type: 'Existing Customer Selected', ack: customer.customer_id, customer });
+@@ -539,9 +550,11 @@
+   async function verify(id, status) {
+     setFormError(''); setUpdatingCustomerId(id);
+     try {
+-      await api(`/api/customers/${id}/verification`, { method: 'PATCH', body: JSON.stringify({ status, reason: `${status} selected from customer registry` }) });
++      const result = await api(`/api/customers/${id}/verification`, { method: 'PATCH', body: JSON.stringify({ status, reason: `${status} selected from customer registry` }) });
++      const refreshRow = row => row.customer_id === id ? { ...row, ...(result.customer || {}), status: (result.customer && result.customer.status) || status } : row;
++      setRows(current => current.map(refreshRow));
++      setKnownCustomers(current => current.map(refreshRow));
+       notify(`Customer ${id} is now ${status}.`);
+-      await load();
+     } catch (err) { setFormError(err.message || 'Customer status could not be updated.'); }
+     finally { setUpdatingCustomerId(''); }
+   }
+@@ -620,7 +633,7 @@
+         {onboardingOtp.verification_id && <div className="servicing-box"><h3>Aadhaar OTP verification</h3><p>Customer {onboardingOtp.customer_id} · sent to {onboardingOtp.masked_destination || 'Aadhaar-linked mobile'}</p>{onboardingOtp.verified_at ? <div className="locked-note"><CheckCircle2 size={16}/> Verified at {new Date(onboardingOtp.verified_at).toLocaleString('en-IN')} · proof {onboardingOtp.verification_id}</div> : <><label>4 or 6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" value={onboardingOtp.otp} onChange={e=>setOnboardingOtp({...onboardingOtp,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/></label><div className="action-row"><button type="button" className="primary small" disabled={otpBusy || onboardingOtp.attempts_remaining===0 || ![4,6].includes(onboardingOtp.otp.length)} onClick={verify
+       </form>
+       <section className="panel">
+-        <div className="panel-head"><h2>Customer registry</h2><span>{rows.length} matching profiles</span></div>
++        <div className="panel-head"><h2>Customer registry</h2><span>{visibleRows.length} matching profiles</span></div>
+         <div className="toolbar">
+           <div className="searchbox">
+             <Search size={18} />
+@@ -632,10 +645,15 @@
+           </div>
+           {customerQuery && <button className="ghost" onClick={() => setCustomerQuery('')}>Clear</button>}
+         </div>
++        <div className="registry-controls">
++          <div className="segmented-control" role="group" aria-label="Registry status filter"><button type="button" className={registryFilter === 'all' ? 'active' : ''} onClick={() => setRegistryFilter('all')}>All ({rows.length})</button><button type="button" className={registryFilter === 'pending' ? 'active' : ''} onClick={() => setRegistryFilter('pending')}>Pending approval ({pendingCount})</button></div>
++          <select aria-label="Filter by area code" value={areaFilter} onChange={e => setAreaFilter(e.target.value)}><option value="">All areas</option>{areas.map(a => <option key={a.code} value={a.code}>{a.code} · {a.name}</option>)}</select>
++          <select aria-label="Arrange customers by area code" value={areaView} onChange={e => setAreaView(e.target.value)}><option value="none">Arrange: default</option><option value="sort">Sort by area code</option><option value="group">Group by area code</option></select>
++        </div>
+         <div className="table-scroll">
+           <table>
+             <thead><tr><th>ID</th><th>Name</th><th>Aadhaar</th><th>Status</th><th>Risk</th><th>Area</th><th>Actions</th></tr></thead>
+-            <tbody>{rows.map(r => <tr key={r.customer_id}><td>{r.customer_id}</td><td><div className="table-person"><span>{r.name.split(' ').map(x => x[0]).join('').slice(0,2)}</span><div>{r.name}<small>{r.mobile}</small></div></div></td><td>{fullAadhaar[r.customer_id] || r.aadhaar_masked}{r.aadhaar_verified_at && <small>Verified {date(r.aadhaar_verified_at)}</small>}</td><td><Status value={r.status} /></td><td><Risk score={r.risk_score} /></td><td>{r.area_name || r.area}</td><td><div className="action-row">{['owner','manager'].includes(user.role) && <><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Pending Verification'} onClick={() => verify(r.customer_id, 'Pending Verification')}>Pending</button><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Manual Verification Approved'} onClick={() => verify(r.customer_id,
++            <tbody>{visibleRows.length === 0 && <tr><td colSpan="7">No customers match the current search and filters.</td></tr>}{visibleRows.map((r, index) => <React.Fragment key={r.customer_id}>{areaView === 'group' && (index === 0 || areaOf(visibleRows[index - 1]) !== areaOf(r)) && <tr className="group-row"><td colSpan="7">{areaOf(r) || 'No area'} · {r.area_name || 'Area not set'} <small>({areaCounts[areaOf(r)]} customer{areaCounts[areaOf(r)] === 1 ? '' : 's'})</small></td></tr>}<tr><td>{r.customer_id}</td><td><div className="table-person"><span>{r.name.split(' ').map(x => x[0]).join('').slice(0,2)}</span><div>{r.name}<small>{r.mobile}</small></div></div></td><td>{fullAadhaar[r.customer_id] || r.aadhaar_masked}{r.aadhaar_verified_at && <small>Verified {date(r.aadhaar_verified_at)}</small>}</td><td><Status value={r.status} /></td><td><Risk score={r.risk_score} /></td><td>{r.area_name
+           </table>
+         </div>
+       </section>
+@@ -760,7 +778,7 @@
+   const [rows, setRows] = useState([]);
+   const [boot, setBoot] = useState({ collectors: [], loan_types: [] });
+   const [customers, setCustomers] = useState([]);
+-  const [form, setForm] = useState({ customer_id: '', principal: 50000, interest_rate: 2.14, loan_type: 'Daily 100-Day', repayment_period: 100, collector_id: '', disbursement_mode: 'Cash', interest_method: 'Upfront Monthly Flat', processing_fee: 0, tax_rate: 18, first_due_date: '', moratorium_periods: 0, moratorium_interest_capitalized: true, preclosure_charge_rate: 0, late_fee: 0, kfs_acknowledgement_reference: '', identity_verification_id: null });
++  const [form, setForm] = useState({ customer_id: '', principal: 50000, interest_rate: 2.14, loan_type: 'Daily 100-Day', repayment_period: 100, collector_id: '', disbursement_mode: 'Cash', interest_method: 'Upfront Monthly Flat', processing_fee: 0, tax_rate: 0, first_due_date: '', moratorium_periods: 0, moratorium_interest_capitalized: true, preclosure_charge_rate: 0, late_fee: 0, kfs_acknowledgement_reference: '', identity_verification_id: null });
+   const [providerStatus, setProviderStatus] = useState({ configured:false, verified_disbursal_required:false });
+   const [identity, setIdentity] = useState({ purpose:'Identity verification before loan disbursal', consent_reference:'', owner_notes:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, expires_at:'', resend_available_at:'' });
+   const [identityError, setIdentityError] = useState('');
+@@ -810,21 +828,16 @@
+     catch (err) { setQuote(null); setLoanError(err.message || 'Loan preview could not be generated.'); }
+   }
+   async function servicePost(path, body, message) { await api(path, { method:'POST', body:JSON.stringify(body) }); notify(message); await load(); }
+-  async function closeLoanNow() {
+-    const loan = rows.find(item=>item.loan_id===service.loan_id);
+-    if (!loan || loan.balance <= 0) return notify('This loan is already completed.');
+-    if (user.role === 'manager' && service.consent.trim().length < 3) return notify('Enter the owner approval reference before closing this loan.');
+-    try {
+-      const quote=await api(`/api/loans/${loan.loan_id}/preclosure-quote`);
+-      setClosure({loan,quote,mode:'Cash',payment_reference:'',reason:'',approval_reference:service.consent.trim(),confirmation:'',confirmed:false,busy:false,error:'',request_id:crypto.randomUUID()});
+-    } catch(err) { setLoanError(err.message); }
++  function openClosure(loanRow) {
++    if (!loanRow || Number(loanRow.balance) <= 0) return notify('This loan is already completed.');
++    setClosure({ loan: { loan_id: loanRow.loan_id, balance: loanRow.balance }, mode: 'Cash', payment_reference: '', reason: '', approval_reference: '', confirmation: '', confirmed: false, busy: false, error: '', request_id: crypto.randomUUID() });
+   }
+   async function submitClosure(e) {
+     e.preventDefault();
+     setClosure(current=>({...current,busy:true,error:''}));
+     try {
+       const result=await api(`/api/loans/${closure.loan.loan_id}/close`,{method:'POST',body:JSON.stringify({mode:closure.mode,payment_reference:closure.payment_reference || null,reason:closure.reason,approval_reference:closure.approval_reference,confirmation:closure.confirmation,confirmed:closure.confirmed,request_id:closure.request_id})});
+-      setClosureReceipt(result.receipt); setClosure(null); notify(`${result.loan.loan_id} closed with final receipt ${result.receipt.receipt_no}.`); await load();
++      setClosureReceipt(result.receipt); setClosure(null); notify(`${result.loan.loan_id} closed with final receipt ${result.receipt.receipt_no}.`); await load(); if (loanDetails) await openLoanDetails(result.loan.loan_id);
+     } catch(err) { setClosure(current=>({...current,busy:false,error:err.message})); }
+   }
+   async function openLoanDetails(loanId) {
+@@ -869,7 +882,7 @@
+           <label>Period<input type="number" value={form.repayment_period} onChange={e => setForm({ ...form, repayment_period: e.target.value })} /></label>
+           <label>Interest method<input value="Monthly upfront deduction" readOnly aria-readonly="true" /></label>
+         </div>
+-        <details className="advanced-fields"><summary>Optional charges and schedule settings</summary><div className="two-col"><label>Processing fee<input type="number" min="0" step="0.01" value={form.processing_fee} onChange={e=>setForm({...form,processing_fee:e.target.value})}/></label><label>Tax on fee %<input type="number" min="0" step="0.01" value={form.tax_rate} onChange={e=>setForm({...form,tax_rate:e.target.value})}/></label><label>First due date<input type="date" value={form.first_due_date} onChange={e=>setForm({...form,first_due_date:e.target.value})}/></label><label>Moratorium periods<input type="number" min="0" value={form.moratorium_periods} onChange={e=>setForm({...form,moratorium_periods:e.target.value})}/></label><label>Late charge<input type="number" min="0" step="0.01" value={form.late_fee} onChange={e=>setForm({...form,late_fee:e.target.value})}/></label><label>Pre-cl
++        <details className="advanced-fields"><summary>Optional charges and schedule settings</summary><div className="two-col"><label>Processing fee<input type="number" min="0" step="0.01" value={form.processing_fee} onChange={e=>setForm({...form,processing_fee:e.target.value})}/></label><label>First due date<input type="date" value={form.first_due_date} onChange={e=>setForm({...form,first_due_date:e.target.value})}/></label><label>Late charge (defaulters only)<input type="number" min="0" step="0.01" value={form.late_fee} onChange={e=>setForm({...form,late_fee:e.target.value})}/></label></div></details>
+         <label>Collector<select value={form.collector_id} onChange={e => setForm({ ...form, collector_id: e.target.value })}>{boot.collectors.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
+         <label>Disbursement account<select value={form.disbursement_mode} onChange={e => setForm({ ...form, disbursement_mode: e.target.value })}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>
+         <label>KFS borrower acknowledgement reference<input required value={form.kfs_acknowledgement_reference} onChange={e=>setForm({...form,kfs_acknowledgement_reference:e.target.value})} placeholder="Signed/OTP acknowledgement ID"/></label>
+@@ -888,21 +901,77 @@
+           <div className="two-col"><label>Amount<input type="number" min="0.01" step="0.01" value={service.amount} onChange={e=>{setService({...service,amount:e.target.value});setAdjustmentPreview(null);setAdjustmentConfirmed(false)}}/></label><label>Effective date<input type="date" value={service.effective_date} onChange={e=>setService({...service,effective_date:e.target.value})}/></label></div>
+           <label>Borrower consent / approval reference<input value={service.consent} onChange={e=>setService({...service,consent:e.target.value})}/></label>
+           <div className="action-row"><button className="primary small" onClick={()=>openLoanDetails(service.loan_id)}>View complete loan history</button><button className="ghost" onClick={()=>api(`/api/loans/${service.loan_id}/kfs`).then(kfs=>downloadPdf(kfs,`KFS-${service.loan_id}`))}>Download KFS</button></div>
+-          <details><summary>Payment and closure actions</summary><label>Part-payment strategy<select value={service.strategy} onChange={e=>setService({...service,strategy:e.target.value})}><option>Reduce EMI</option><option>Reduce Tenor</option></select></label><div className="action-row"><button className="ghost" onClick={()=>servicePost(`/api/loans/${service.loan_id}/part-payment`,{amount:Number(service.amount),strategy:service.strategy,effective_date:service.effective_date,borrower_consent_reference:service.consent,mode:'Bank Transfer'},'Part-payment posted and schedule version updated.')}>Post part-payment</button><button className="ghost" onClick={()=>api(`/api/loans/${service.loan_id}/preclosure-quote`).then(q=>notify(`Pre-closure quote: ${money(q.total)}`))}>Check closure amount</button><button className="ghost" onClick={closeLoanNow}>Close loan now</button></div></details>
++          <details><summary>Part-payment</summary><label>Part-payment strategy<select value={service.strategy} onChange={e=>setService({...service,strategy:e.target.value})}><option>Reduce EMI</option><option>Reduce Tenor</option></select></label><div className="action-row"><button className="ghost" onClick={()=>servicePost(`/api/loans/${service.loan_id}/part-payment`,{amount:Number(service.amount),strategy:service.strategy,effective_date:service.effective_date,borrower_consent_reference:service.consent,mode:'Bank Transfer'},'Part-payment posted and schedule version updated.')}>Post part-payment</button></div></details>
+           <details><summary>Interest adjustment</summary><div className="two-col"><label>Mandatory reason<input value={service.reason} onChange={e=>setService({...service,reason:e.target.value})} placeholder="Why is this rebate approved?"/></label><label>Manager approval reference<input value={service.approval} onChange={e=>setService({...service,approval:e.target.value})} placeholder="Approval ID or signed note"/></label></div><label>Borrower acknowledgement reference<input value={service.consent} onChange={e=>setService({...service,consent:e.target.value})} placeholder="Signed consent or OTP acknowledgement"/></label><button className="ghost" onClick={previewInterestRebate}>Preview adjustment</button>{adjustmentPreview && <div className={adjustmentPreview.permitted?'locked-note':'error-banner'}><span>Before <strong>{money(adjustmentPreview.balance_before)}</strong></span><span>Rebate 
+           {user.role==='owner' && rows.find(row=>row.loan_id===service.loan_id)?.contract_version<2 && <details><summary>Legacy loan migration</summary><div className="error-banner">Migration changes the contractual calculation. Preview it and obtain borrower acknowledgement before continuing.</div><button className="ghost" onClick={previewLegacyMigration}>Preview controlled migration</button>{migration && <><div className="finance-strip"><Metric icon={WalletCards} label="Old outstanding" value={money(migration.quote.old_outstanding)}/><Metric icon={BadgeIndianRupee} label="New outstanding" value={money(migration.quote.new_outstanding)}/><Metric icon={CheckCircle2} label="Payments preserved" value={money(migration.quote.paid_preserved)}/></div><label>Migration reason<input value={migration.reason} onChange={e=>setMigration({...migration,reason:e.target.value})}/></label><label>Owner app
+           {user.role === 'owner' && <details><summary>Restructure or write-off</summary><div className="two-col"><label>New annual rate<input type="number" value={service.annual_rate} onChange={e=>setService({...service,annual_rate:e.target.value})}/></label><label>Remaining periods<input type="number" value={service.periods} onChange={e=>setService({...service,periods:e.target.value})}/></label><label>Moratorium periods<input type="number" value={service.moratorium} onChange={e=>setService({...service,moratorium:e.target.value})}/></label><label>Approval reference<input value={service.approval} onChange={e=>setService({...service,approval:e.target.value})}/></label></div><label>Reason<input value={service.reason} onChange={e=>setService({...service,reason:e.target.value})}/></label><div className="action-row"><button className="ghost" onClick={()=>servicePost(`/api/loans/${service.loan
+         </div>}
+       </section>
+-      {loanDetails && <LoanDetailsModal data={loanDetails} api={api} notify={notify} onRefresh={()=>openLoanDetails(loanDetails.loan.loan_id)} onClose={()=>setLoanDetails(null)} />}
+-      {closure && <div className="modal-backdrop" onClick={()=>!closure.busy&&setClosure(null)}><form className="modal confirm-delete" onSubmit={submitClosure} onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Full and final settlement</span><h2>Close {closure.loan.loan_id}</h2></div><button type="button" className="icon-btn" disabled={closure.busy} onClick={()=>setClosure(null)}><X size={18}/></button></div><div className="finance-strip"><Metric icon={WalletCards} label="Outstanding" value={money(closure.quote.principal + closure.quote.accrued_interest + closure.quote.penal_charges)}/><Metric icon={BadgeIndianRupee} label="Closure charge" value={money(closure.quote.preclosure_charge)}/><Metric icon={CheckCircle2} label="Final settlement" value={money(closure.quote.total)}/></div><label>Payment mode<select value={closure.mode} onChange={e
++      {loanDetails && <LoanDetailsModal data={loanDetails} api={api} notify={notify} user={user} onInstantClose={openClosure} onRefresh={async()=>{ await load(); await openLoanDetails(loanDetails.loan.loan_id); }} onClose={()=>setLoanDetails(null)} />}
++      {closure && <div className="modal-backdrop" onClick={()=>!closure.busy&&setClosure(null)}><form className="modal confirm-delete" onSubmit={submitClosure} onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Full and final settlement</span><h2>Close {closure.loan.loan_id}</h2></div><button type="button" className="icon-btn" disabled={closure.busy} onClick={()=>setClosure(null)}><X size={18}/></button></div><div className="finance-strip"><Metric icon={WalletCards} label="Outstanding" value={money(closure.loan.balance)}/><Metric icon={CheckCircle2} label="Final settlement" value={money(closure.loan.balance)}/></div><label>Payment mode<select value={closure.mode} onChange={e=>setClosure({...closure,mode:e.target.value,payment_reference:''})}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>{closure.mo
+       {closureReceipt && <ReceiptModal title="Final Loan Closure Receipt" data={closureReceipt} onClose={()=>setClosureReceipt(null)}/>}
+     </div>
+   );
+ }
+ 
+-function LoanDetailsModal({ data, api, notify, onRefresh, onClose }) {
+-  const { loan, customer, schedule, payments, adjustments, events, part_payments:partPayments, writeoffs, identity_verification:verification, closure } = data;
++function LoanDetailsModal({ data, api, notify, onRefresh, onInstantClose, user, onClose }) {
++  const { loan, customer, schedule, payments, adjustments, events, part_payments:partPayments, writeoffs, identity_verification:verification, closure, late_charge:lateCharge } = data;
++  const [quick, setQuick] = useState(null);
++  const [confirmingQuick, setConfirmingQuick] = useState(null);
++  const [quickSaving, setQuickSaving] = useState(false);
++  const [quickError, setQuickError] = useState('');
++  const [quickReceipt, setQuickReceipt] = useState(null);
++  const [lateBusy, setLateBusy] = useState(false);
++  const isOpenLoan = !['Closed', 'Written Off'].includes(loan.status) && Number(loan.balance) > 0;
++  const canCollect = isOpenLoan && ['owner', 'manager', 'collector'].includes(user.role);
++  const canClose = isOpenLoan && ['owner', 'manager'].includes(user.role);
++  function openQuick(kind) {
++    setQuickError('');
++    const suggested = kind === 'Collection' ? Math.min(Number(loan.installment) || 0, Number(loan.balance) || 0) : 0;
++    setQuick({ kind, amount: suggested > 0 ? String(suggested) : '', mode: 'Cash', reference: '' });
++  }
++  function reviewQuick(e) {
++    e.preventDefault();
++    const amount = Number(quick.amount);
++    const balance = Number(loan.balance);
++    if (!(amount > 0)) return setQuickError('Enter an amount greater than zero.');
++    if (amount > balance) return setQuickError(`Amount cannot be more than the outstanding balance of ${money(balance)}.`);
++    if (quick.kind === 'Prepayment' && amount >= balance) return setQuickError('A prepayment must be less than the outstanding balance. Use Close account to settle the full balance.');
++    if (quick.mode === 'UPI' && quick.reference.trim().length < 3) return setQuickError('Enter the UPI transaction/reference ID.');
++    setQuickError('');
++    setConfirmingQuick({ kind: quick.kind, loan: { customer_name: customer.name, customer_id: customer.customer_id || loan.customer_id, loan_id: loan.loan_id, balance: loan.balance }, amount, mode: quick.mode, reference: quick.mode === 'UPI' ? quick.reference.trim() : '', requestId: crypto.randomUUID() });
++  }
++  async function saveQuick() {
++    if (!confirmingQuick || quickSaving) return;
++    setQuickSaving(true);
++    setQuickError('');
++    const pending = confirmingQuick;
++    try {
++      const res = await api('/api/payments', { method: 'POST', headers: { 'Idempotency-Key': pending.requestId }, body: JSON.stringify({ loan_id: pending.loan.loan_id, amount: pending.amount, mode: pending.mode, payment_reference: pending.mode === 'UPI' ? pending.reference : null, payment_type: pending.kind, request_id: pending.requestId }) });
++      setConfirmingQuick(null);
++      setQuick(null);
++      setQuickReceipt(res.receipt);
++      notify(`${pending.kind} recorded. Balance updated.`);
++      await onRefresh();
++    } catch (err) {
++      setQuickError(err.message);
++    } finally {
++      setQuickSaving(false);
++    }
++  }
++  async function applyLateCharge() {
++    if (lateBusy) return;
++    setLateBusy(true);
++    try {
++      await api(`/api/loans/${encodeURIComponent(loan.loan_id)}/late-fees/${lateCharge.next_installment}`, { method: 'POST' });
++      notify(`Late charge applied for instalment ${lateCharge.next_installment}.`);
++      await onRefresh();
++    } catch (err) {
++      notify(err.message);
++    } finally {
++      setLateBusy(false);
++    }
++  }
+   async function requestAdjustmentReversal(item) {
+     const reason=window.prompt(`Reason for reversing ${item.adjustment_id} (minimum 5 characters):`,'');
+     if (reason===null) return;
+@@ -911,17 +980,38 @@
+     catch(err) { notify(err.message); }
+   }
+   const servicingHistory=[...adjustments,...events,...partPayments,...writeoffs].sort((a,b)=>new Date(b.timestamp || b.created_at)-new Date(a.timestamp || a.created_at));
+-  return <div className="modal-backdrop" onClick={onClose}><div className="modal loan-details-modal" onClick={e=>e.stopPropagation()}>
++  return <><div className="modal-backdrop" onClick={onClose}><div className="modal loan-details-modal" onClick={e=>e.stopPropagation()}>
+     <div className="panel-head"><div><span className="section-kicker">Complete loan record</span><h2>{loan.loan_id} · {customer.name}</h2><span>{loan.frequency} plan · {customer.area_name || customer.area}</span></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>
+     <div className="finance-strip"><Metric icon={BadgeIndianRupee} label="Sanctioned" value={money(loan.principal)}/><Metric icon={WalletCards} label="Cash handed over" value={money(loan.net_disbursed)}/><Metric icon={CheckCircle2} label="Paid" value={money(loan.paid)}/><Metric icon={CalendarClock} label="Outstanding" value={money(loan.balance)}/></div>
+     <div className="loan-detail-grid"><div><span>Monthly interest</span><strong>{loan.interest_rate}%</strong></div><div><span>Interest deducted</span><strong>{money(loan.contract_interest)}</strong></div><div><span>Processing fee + tax</span><strong>{money(Number(loan.processing_fee||0)+Number(loan.tax_amount||0))}</strong></div><div><span>APR</span><strong>{loan.apr ? `${loan.apr}%` : 'Legacy contract'}</strong></div><div><span>Installment</span><strong>{money(loan.installment)}</strong></div><div><span>Remaining installments</span><strong>{loan.remaining_installments}</strong></div><div><span>Borrow date</span><strong>{date(loan.borrow_date)}</strong></div><div><span>Maturity</span><strong>{date(loan.maturity_date || loan.expected_completion)}</strong></div><div><span>Status</span><Status value={loan.status}/></div></div>
+     <div className="locked-note"><ShieldCheck size={16}/>{verification ? `OTP verified ${date(verification.verified_at || verification.attempted_at)} · Proof ${verification.verification_id}` : 'No Aadhaar OTP proof was linked to this loan disbursement.'}</div>
+     {closure?.closed && <div className="locked-note"><CheckCircle2 size={16}/>Closed {closure.closed_at ? date(closure.closed_at) : ''}{closure.final_receipt ? ` · Final receipt ${closure.final_receipt}` : ''}</div>}
+-    <details open><summary>Repayment and receipt history ({payments.length})</summary><div className="table-scroll"><table><thead><tr><th>Receipt</th><th>Date</th><th>Amount</th><th>Principal</th><th>Interest</th><th>Balance after</th><th>Mode / reference</th><th>Status</th></tr></thead><tbody>{payments.map(p=><tr key={p.receipt_no || p.id}><td>{p.receipt_no}</td><td>{date(p.timestamp)}</td><td>{money(p.amount)}</td><td>{money(p.principal_paid||0)}</td><td>{money(p.interest_paid||0)}</td><td>{money(p.balance_after)}</td><td>{p.mode}<small>{p.payment_reference || '—'}</small></td><td><Status value={p.status || 'Posted'}/></td></tr>)}</tbody></table></div></details>
++    {(canCollect || canClose) && <div className="servicing-box quick-actions"><h3>Quick actions</h3>
++      <div className="action-row">
++        {canCollect && <button type="button" className="primary small" onClick={() => openQuick('Collection')}><ReceiptIndianRupee size={16}/> Collect payment</button>}
++        {canCollect && <button type="button" className="ghost" onClick={() => openQuick('Prepayment')}><WalletCards size={16}/> Prepayment</button>}
++        {canClose && <button type="button" className="ghost danger" onClick={() => onInstantClose(loan)}><CheckCircle2 size={16}/> Close account</button>}
++      </div>
++      {quick && <form onSubmit={reviewQuick}>
++        <p className="form-intro">{quick.kind === 'Prepayment' ? 'Prepayment: an extra payment made ahead of schedule. The outstanding balance falls immediately and the remaining instalments are cleared in order, earliest first.' : 'Collection: records a payment received on this loan. The outstanding balance updates immediately.'}</p>
++        <div className="two-col">
++          <label>{quick.kind} amount<input type="number" required min="0.01" step="0.01" max={loan.balance} value={quick.amount} onChange={e => setQuick({ ...quick, amount: e.target.value })} /><small>Outstanding {money(loan.balance)}</small></label>
++          <label>Payment mode<select value={quick.mode} onChange={e => setQuick({ ...quick, mode: e.target.value, reference: '' })}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>
++        </div>
++        {quick.mode === 'UPI' && <label>UPI transaction/reference ID<input required minLength="3" value={quick.reference} onChange={e => setQuick({ ...quick, reference: e.target.value })} /></label>}
++        {quickError && !confirmingQuick && <div className="error" role="alert">{quickError}</div>}
++        <div className="action-row"><button type="submit" className="primary small">Review {quick.kind.toLowerCase()}</button><button type="button" className="ghost" onClick={() => { setQuick(null); setQuickError(''); }}>Cancel</button></div>
++      </form>}
++    </div>}
++    {lateCharge && isOpenLoan && lateCharge.late_fee > 0 && <div className="locked-note"><ShieldCheck size={16}/>{lateCharge.is_defaulter ? `Defaulter · ${lateCharge.overdue_days} days overdue · late charge ${money(lateCharge.late_fee)} per overdue instalment. ` : `${lateCharge.message} `}{lateCharge.can_apply && ['owner', 'manager'].includes(user.role) && <button type="button" className="ghost small" disabled={lateBusy} onClick={applyLateCharge}>{lateBusy ? 'Applying…' : `Apply late charge for instalment ${lateCharge.next_installment}`}</button>}{lateCharge.is_defaulter && !lateCharge.can_apply && lateCharge.message}</div>}
++    <details open><summary>Repayment and receipt history ({payments.length})</summary><div className="table-scroll"><table><thead><tr><th>Receipt</th><th>Date</th><th>Type</th><th>Amount</th><th>Principal</th><th>Interest</th><th>Balance after</th><th>Mode / reference</th><th>Status</th></tr></thead><tbody>{payments.map(p=><tr key={p.receipt_no || p.id}><td>{p.receipt_no}</td><td>{date(p.timestamp)}</td><td>{p.payment_type || 'Collection'}</td><td>{money(p.amount)}</td><td>{money(p.principal_paid||0)}</td><td>{money(p.interest_paid||0)}</td><td>{money(p.balance_after)}</td><td>{p.mode}<small>{p.payment_reference || '—'}</small></td><td><Status value={p.status || 'Posted'}/></td></tr>)}</tbody></table></div></details>
+     <details><summary>Installment schedule · version {data.schedule_version} ({schedule.length})</summary><div className="table-scroll"><table><thead><tr><th>No.</th><th>Due date</th><th>Payment</th><th>Opening</th><th>Closing</th></tr></thead><tbody>{schedule.map(row=><tr key={row.number}><td>{row.number}</td><td>{date(row.due_date)}</td><td>{money(row.payment)}</td><td>{money(row.opening)}</td><td>{money(row.closing)}</td></tr>)}</tbody></table></div></details>
+     <details open><summary>Adjustments and servicing history ({servicingHistory.length})</summary><div className="timeline">{servicingHistory.map((item,index)=><div className="timeline-item" key={item.adjustment_id || item.event_id || item.part_payment_id || item.writeoff_id || index}><FileText size={16}/><div><strong>{item.kind || item.event_type || item.strategy || 'Loan servicing event'}{item.amount ? ` · ${money(item.amount)}` : ''}</strong><span>{item.reason || item.description || 'Recorded servicing event'}</span><small>{date(item.timestamp || item.created_at)}{item.approval_reference ? ` · Approval ${item.approval_reference}` : ''}{item.borrower_acknowledgement_reference ? ` · Borrower acknowledgement ${item.borrower_acknowledgement_reference}` : ''}</small>{item.adjustment_id && item.status!=='Reversed' && item.journal_entry_id && <button className="ghost small" onClick={()=>
+     <div className="action-row"><button className="ghost" onClick={()=>downloadPdf(data,`Loan-history-${loan.loan_id}`)}><Printer size={17}/>Download complete history</button><button className="primary small" onClick={onClose}>Close</button></div>
+-  </div></div>;
++  </div></div>
++  {confirmingQuick && <PaymentConfirmModal payment={confirmingQuick} saving={quickSaving} error={quickError} onCancel={() => { setConfirmingQuick(null); setQuickError(''); }} onConfirm={saveQuick} />}
++  {quickReceipt && <ReceiptModal title="Payment Receipt" onClose={() => setQuickReceipt(null)} data={quickReceipt} />}
++  </>;
+ }
+ 
+ function Collections({ api, user, notify }) {
+@@ -1408,7 +1498,7 @@
+   return (
+     <div className="modal-backdrop" onClick={() => !saving && onCancel()}>
+       <div className="modal confirm-delete" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
+-        <div className="panel-head"><div><span className="section-kicker">Confirm payment</span><h2>Are you sure you want to record this payment?</h2></div><button type="button" className="icon-btn" disabled={saving} onClick={onCancel}>×</button></div>
++        <div className="panel-head"><div><span className="section-kicker">{payment.kind === 'Prepayment' ? 'Confirm prepayment' : 'Confirm payment'}</span><h2>Are you sure you want to record this {payment.kind === 'Prepayment' ? 'prepayment' : 'payment'}?</h2></div><button type="button" className="icon-btn" disabled={saving} onClick={onCancel}>×</button></div>
+         <div className="summary-card">
+           <strong>{payment.loan.customer_name}</strong>
+           <span>{payment.loan.customer_id} · {payment.loan.loan_id}</span>
+@@ -1420,7 +1510,7 @@
+         {error && <div className="error" role="alert">{error}</div>}
+         <div className="action-row">
+           <button type="button" className="ghost" disabled={saving} onClick={onCancel}>Cancel</button>
+-          <button type="button" className="primary" disabled={saving} onClick={onConfirm}><ReceiptIndianRupee size={18} /> {saving ? 'Saving payment…' : 'Confirm and save payment'}</button>
++          <button type="button" className="primary" disabled={saving} onClick={onConfirm}><ReceiptIndianRupee size={18} /> {saving ? 'Saving…' : payment.kind === 'Prepayment' ? 'Confirm and save prepayment' : 'Confirm and save payment'}</button>
+         </div>
+       </div>
+     </div>
+--- step4/client/src/styles.css
++++ final/client/src/styles.css
+@@ -1021,3 +1021,12 @@
+ 
+ /* Item 4: shared customer picker used on the Loan disbursement screen */
+ .customer-picker { display: grid; gap: 10px; }
++
++/* Customer registry: filters, grouping, approval and View Loan quick actions */
++.registry-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
++.registry-controls .segmented-control { margin-bottom: 0; flex: 1 1 280px; }
++.registry-controls select { flex: 1 1 170px; min-height: 42px; }
++tr.group-row td { background: var(--surface-alt); color: var(--ink); font-weight: 800; letter-spacing: .02em; border-top: 2px solid var(--line); }
++tr.group-row small { color: var(--muted); font-weight: 600; }
++.quick-actions { margin-top: 14px; }
++.quick-actions form { display: grid; gap: 10px; }

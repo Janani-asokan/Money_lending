@@ -1,0 +1,59 @@
+--- original/server/main.py
++++ new/server/main.py
+@@ -117,6 +117,16 @@
+     "5200": ("Credit Write-off Expense", "Expense"),
+ }
+ LOAN_TYPES = ["Daily 100-Day", "Weekly", "Monthly EMI"]
++# Monthly interest rate (%) for NEW loans. Editable at loan creation within this range.
++# Change the limits here (or via environment variables) - this is the only place.
++DEFAULT_MONTHLY_INTEREST_RATE = float(os.getenv("DEFAULT_MONTHLY_INTEREST_RATE", "2.14"))
++MIN_MONTHLY_INTEREST_RATE = float(os.getenv("MIN_MONTHLY_INTEREST_RATE", "0.01"))
++MAX_MONTHLY_INTEREST_RATE = float(os.getenv("MAX_MONTHLY_INTEREST_RATE", "10"))
++
++
++def validate_new_loan_rate(rate: float) -> None:
++    if not (MIN_MONTHLY_INTEREST_RATE <= rate <= MAX_MONTHLY_INTEREST_RATE):
++        raise HTTPException(422, f"Monthly interest rate must be between {MIN_MONTHLY_INTEREST_RATE:g}% and {MAX_MONTHLY_INTEREST_RATE:g}%")
+ VERIFICATION_STATUSES = {
+     "Verified",
+     "Pending Verification",
+@@ -2163,8 +2173,7 @@
+ 
+ @app.post("/api/loan-quotes")
+ async def loan_quote(payload: LoanIn, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+-    if abs(payload.interest_rate - 2.14) > 0.000001:
+-        raise HTTPException(422, "New loans must use the approved monthly interest rate of 2.14%")
++    validate_new_loan_rate(payload.interest_rate)
+     payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat"})
+     borrow = parse_date(payload.borrow_date)
+     schedule = build_amortization(payload, borrow)
+@@ -2536,8 +2545,7 @@
+         raise HTTPException(409, "Verified handover amount does not match the loan principal")
+     if payload.loan_type not in LOAN_TYPES:
+         raise HTTPException(422, "Invalid loan type")
+-    if abs(payload.interest_rate - 2.14) > 0.000001:
+-        raise HTTPException(422, "New loans must use the approved monthly interest rate of 2.14%")
++    validate_new_loan_rate(payload.interest_rate)
+     payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat"})
+     collector = await find_one("users", {"id": payload.collector_id})
+     if not collector or collector.get("role") not in {"collector", "owner", "manager"} or not collector.get("active", True):
+--- original/client/src/main.jsx
++++ new/client/src/main.jsx
+@@ -832,7 +832,7 @@
+         <label>Customer<select value={form.customer_id} onChange={e => setForm({ ...form, customer_id: e.target.value })}>{customers.map(c => <option key={c.customer_id}>{c.customer_id}</option>)}</select></label>
+         <div className="two-col">
+           <label>Principal<input type="number" value={form.principal} onChange={e => setForm({ ...form, principal: e.target.value })} /></label>
+-          <label>Monthly interest %<input type="number" value="2.14" readOnly aria-readonly="true" /><small>2.14% per month, deducted before handover</small></label>
++          <label>Monthly interest %<input type="number" required min="0.01" max="10" step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /><small>{Number(form.interest_rate) || 0}% per month, deducted before handover (default 2.14%)</small></label>
+           <label>Loan type<select value={form.loan_type} onChange={e => setForm({ ...form, loan_type: e.target.value, repayment_period: e.target.value.includes('Daily') ? 100 : e.target.value === 'Weekly' ? 52 : 12 })}>{boot.loan_types.map(x => <option key={x}>{x}</option>)}</select></label>
+           <label>Period<input type="number" value={form.repayment_period} onChange={e => setForm({ ...form, repayment_period: e.target.value })} /></label>
+           <label>Interest method<input value="Monthly upfront deduction" readOnly aria-readonly="true" /></label>
+@@ -845,7 +845,7 @@
+         <button type="button" className="ghost" onClick={preview}><FileText size={18}/> Preview APR, KFS and schedule</button>
+         {loanError && <div className="error" role="alert">{loanError}</div>}
+         <button className="primary" disabled={savingLoan || !form.customer_id || !form.collector_id}><FileText size={18} /> {savingLoan ? 'Creating loan…' : 'Create loan directly'}</button>
+-        {quote && <div className="locked-note">Monthly rate 2.14% · Interest deducted {money(quote.total_interest)} · Cash handed over {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
++        {quote && <div className="locked-note">Monthly rate {quote.monthly_interest_rate}% · Interest deducted {money(quote.total_interest)} · Cash handed over {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
+       </form>
+       <section className="panel">
+         <div className="panel-head"><h2>Loan book</h2><span>Multiple daily, weekly and monthly plans per customer</span></div>
