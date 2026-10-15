@@ -1,0 +1,164 @@
+--- prev/server/main.py
++++ new/server/main.py
+@@ -120,7 +120,7 @@
+ # Monthly interest rate (%) for NEW loans. Editable at loan creation within this range.
+ # Change the limits here (or via environment variables) - this is the only place.
+ DEFAULT_MONTHLY_INTEREST_RATE = float(os.getenv("DEFAULT_MONTHLY_INTEREST_RATE", "2.14"))
+-MIN_MONTHLY_INTEREST_RATE = float(os.getenv("MIN_MONTHLY_INTEREST_RATE", "0.01"))
++MIN_MONTHLY_INTEREST_RATE = float(os.getenv("MIN_MONTHLY_INTEREST_RATE", "1"))
+ MAX_MONTHLY_INTEREST_RATE = float(os.getenv("MAX_MONTHLY_INTEREST_RATE", "10"))
+ 
+ 
+@@ -138,7 +138,15 @@
+ SMS_PROVIDER = os.getenv("SMS_PROVIDER", "").strip().lower()
+ MSG91_AUTH_KEY = os.getenv("MSG91_AUTH_KEY", "").strip()
+ MSG91_TEMPLATE_ID = os.getenv("MSG91_TEMPLATE_ID", "").strip()
+-SMS_PROVIDER_CONFIGURED = SMS_PROVIDER == "msg91" and bool(MSG91_AUTH_KEY and MSG91_TEMPLATE_ID)
++# Generic "webhook" provider: works with any HTTP SMS service, including an Android phone used as a free SMS gateway.
++# SMS_WEBHOOK_BODY is a JSON template; {otp} {message} {mobile} {mobile_e164} {mobile_91} are filled in for each OTP.
++SMS_WEBHOOK_URL = os.getenv("SMS_WEBHOOK_URL", "").strip()
++SMS_WEBHOOK_HEADERS = os.getenv("SMS_WEBHOOK_HEADERS", "").strip()
++SMS_WEBHOOK_BODY = os.getenv("SMS_WEBHOOK_BODY", "").strip()
++SMS_MESSAGE_TEMPLATE = os.getenv("SMS_MESSAGE_TEMPLATE", "Your OTP for Sri Sakthi Thirumurugan Finance registration is {otp}. It is valid for 5 minutes. Do not share it with anyone.")
++SMS_MSG91_CONFIGURED = SMS_PROVIDER == "msg91" and bool(MSG91_AUTH_KEY and MSG91_TEMPLATE_ID)
++SMS_WEBHOOK_CONFIGURED = SMS_PROVIDER == "webhook" and bool(SMS_WEBHOOK_URL and SMS_WEBHOOK_BODY)
++SMS_PROVIDER_CONFIGURED = SMS_MSG91_CONFIGURED or SMS_WEBHOOK_CONFIGURED
+ SMS_ON_SCREEN_MODE = not SMS_PROVIDER_CONFIGURED
+ SMS_OTP_LENGTH = 6
+ SMS_OTP_EXPIRY_SECONDS = 300          # OTP valid for 5 minutes
+@@ -2156,10 +2164,62 @@
+     return str(body.get("message") or body.get("request_id") or "") or None
+ 
+ 
++def _webhook_send_blocking(mobile: str, otp: str) -> Optional[str]:
++    """Send the OTP through any HTTP SMS service described by the SMS_WEBHOOK_* settings."""
++    import urllib.error
++    import urllib.request
++    values = {"{otp}": otp, "{message}": SMS_MESSAGE_TEMPLATE.replace("{otp}", otp), "{mobile_e164}": "+91" + mobile, "{mobile_91}": "91" + mobile, "{mobile}": mobile}
++
++    def fill(node: Any) -> Any:
++        if isinstance(node, str):
++            for key, value in values.items():
++                node = node.replace(key, value)
++            return node
++        if isinstance(node, list):
++            return [fill(item) for item in node]
++        if isinstance(node, dict):
++            return {key: fill(value) for key, value in node.items()}
++        return node
++
++    try:
++        body = fill(json.loads(SMS_WEBHOOK_BODY))
++        extra_headers = json.loads(SMS_WEBHOOK_HEADERS) if SMS_WEBHOOK_HEADERS else {}
++        if not isinstance(extra_headers, dict):
++            raise ValueError("headers must be a JSON object")
++    except ValueError as exc:
++        print(f"[sms-otp] SMS_WEBHOOK_BODY / SMS_WEBHOOK_HEADERS are not valid JSON: {exc}")
++        raise HTTPException(500, "The SMS settings on the server are not valid JSON. Ask the administrator to fix SMS_WEBHOOK_BODY / SMS_WEBHOOK_HEADERS.") from exc
++    headers = {"Content-Type": "application/json", "Accept": "application/json", **{str(key): str(value) for key, value in extra_headers.items()}}
++    request = urllib.request.Request(SMS_WEBHOOK_URL, data=json.dumps(body).encode("utf-8"), method="POST", headers=headers)
++    try:
++        with urllib.request.urlopen(request, timeout=15) as response:
++            raw = response.read().decode("utf-8", "ignore")
++    except urllib.error.HTTPError as exc:
++        print(f"[sms-otp] SMS service answered HTTP {exc.code}")
++        raise HTTPException(502, "The SMS service did not accept the message. Check its settings, key and balance.") from exc
++    except (urllib.error.URLError, TimeoutError) as exc:
++        print(f"[sms-otp] SMS service call failed: {type(exc).__name__}")
++        raise HTTPException(502, "The SMS could not be sent. Check the SMS service and try again.") from exc
++    try:
++        data = json.loads(raw) if raw.strip() else {}
++    except ValueError:
++        data = {}
++    if isinstance(data, dict):
++        inner = data.get("data") if isinstance(data.get("data"), dict) else {}
++        for source in (data, inner):
++            for key in ("message_id", "messageId", "id", "request_id", "smsBatchId", "_id"):
++                if source.get(key):
++                    return str(source[key])[:120]
++    return None
++
++
+ async def deliver_sms_otp(mobile: str, otp: str) -> dict[str, Any]:
+-    if SMS_PROVIDER_CONFIGURED:
++    if SMS_MSG91_CONFIGURED:
+         message_id = await asyncio.to_thread(_msg91_send_blocking, mobile, otp)
+         return {"gateway": "msg91", "gateway_message_id": message_id}
++    if SMS_WEBHOOK_CONFIGURED:
++        message_id = await asyncio.to_thread(_webhook_send_blocking, mobile, otp)
++        return {"gateway": "webhook", "gateway_message_id": message_id}
+     print(f"[sms-otp ON-SCREEN MODE] OTP for {mobile}: {otp}")
+     return {"gateway": "screen", "gateway_message_id": None}
+ 
+@@ -2214,7 +2274,7 @@
+ @app.get("/api/otp/sms/status")
+ async def sms_otp_status(user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+     return {
+-        "required": SMS_OTP_REQUIRED, "configured": SMS_PROVIDER_CONFIGURED, "development_mode": SMS_ON_SCREEN_MODE,
++        "required": SMS_OTP_REQUIRED, "configured": SMS_PROVIDER_CONFIGURED, "development_mode": SMS_ON_SCREEN_MODE, "provider": "msg91" if SMS_MSG91_CONFIGURED else "webhook" if SMS_WEBHOOK_CONFIGURED else "on-screen",
+         "expiry_seconds": SMS_OTP_EXPIRY_SECONDS, "max_attempts": SMS_OTP_MAX_ATTEMPTS,
+         "max_resends": SMS_OTP_MAX_RESENDS, "resend_gap_seconds": SMS_OTP_RESEND_GAP_SECONDS,
+     }
+--- prev/client/src/main.jsx
++++ new/client/src/main.jsx
+@@ -940,7 +940,7 @@
+         <CustomerPicker customers={customers} value={form.customer_id} onChange={id => setForm({ ...form, customer_id: id })} />
+         <div className="two-col">
+           <label>Principal<input type="number" value={form.principal} onChange={e => setForm({ ...form, principal: e.target.value })} /></label>
+-          <label>Monthly interest %<input type="number" required min="0.01" max="10" step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /><small>{Number(form.interest_rate) || 0}% per month, deducted before handover (default 2.14%)</small></label>
++          <label>Monthly interest %<input type="number" required min="1" max="10" step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /><small>{Number(form.interest_rate) || 0}% per month, deducted before handover (default 2.14%, allowed 1% to 10%)</small></label>
+           <label>Loan type<select value={form.loan_type} onChange={e => setForm({ ...form, loan_type: e.target.value, repayment_period: e.target.value.includes('Daily') ? 100 : e.target.value === 'Weekly' ? 52 : 12 })}>{boot.loan_types.map(x => <option key={x}>{x}</option>)}</select></label>
+           <label>Period<input type="number" value={form.repayment_period} onChange={e => setForm({ ...form, repayment_period: e.target.value })} /></label>
+           <label>Interest method<input value="Monthly upfront deduction" readOnly aria-readonly="true" /></label>
+@@ -1428,7 +1428,10 @@
+ 
+ function EmiPlanner() {
+   const [principal, setPrincipal] = useState(250000);
+-  const rate = 2.14;
++  const [rateText, setRateText] = useState('2.14');
++  const parsedRate = parseFloat(rateText);
++  const rateValid = Number.isFinite(parsedRate) && parsedRate >= 1 && parsedRate <= 10;
++  const rate = Math.min(10, Math.max(1, Number.isFinite(parsedRate) ? parsedRate : 2.14));
+   const [months, setMonths] = useState(24);
+   const interest = principal * rate * months / 100;
+   const cashHandover = principal - interest;
+@@ -1441,9 +1444,9 @@
+       <section className="panel planner-controls">
+         <div className="panel-head"><div><span className="section-kicker">Instant estimate</span><h2>Build a comfortable repayment plan</h2></div><Calculator size={24} /></div>
+         <label>Loan amount <strong>{money(principal)}</strong><input type="range" min="10000" max="2000000" step="10000" value={principal} onChange={e => setPrincipal(Number(e.target.value))} /></label>
+-        <label>Monthly interest <strong>{rate}%</strong><input type="range" min="2.14" max="2.14" step="0.01" value={rate} readOnly aria-label="Approved monthly interest rate 2.14 percent" /><small>Fixed at 2.14% per month</small></label>
++        <label>Monthly interest <strong>{rate}%</strong><input type="range" min="1" max="10" step="0.01" value={rate} onChange={e => setRateText(e.target.value)} aria-label="Monthly interest rate" /><div className="rate-entry"><input type="number" min="1" max="10" step="0.01" inputMode="decimal" value={rateText} onChange={e => setRateText(e.target.value)} aria-label="Type the monthly interest rate" /><span>% per month</span></div><small>{rateValid ? 'Set the rate for each customer (for example 1, 1.5, 2.14 or 3.2). Allowed range: 1% to 10%.' : `Enter a rate between 1% and 10%. The estimate below uses ${rate}%.`}</small></label>
+         <label>Repayment tenure <strong>{months} months</strong><input type="range" min="3" max="60" value={months} onChange={e => setMonths(Number(e.target.value))} /></label>
+-        <div className="planner-note"><ShieldCheck size={18} /><span>Interest = sanctioned amount × 2.14% × months. It is deducted before cash handover; the sanctioned amount is repaid across the selected months.</span></div>
++        <div className="planner-note"><ShieldCheck size={18} /><span>Interest = sanctioned amount × {rate}% × months. It is deducted before cash handover; the sanctioned amount is repaid across the selected months.</span></div>
+       </section>
+       <section className="planner-result">
+         <span>{invalidPlan ? 'Loan estimate unavailable' : 'Your estimated monthly payment'}</span><strong>{invalidPlan ? 'Invalid plan' : money(emi)}</strong><small>{invalidPlan ? `Select ${maximumTenure} months or fewer` : `for ${months} months`}</small>
+--- prev/client/src/styles.css
++++ new/client/src/styles.css
+@@ -1034,3 +1034,13 @@
+ /* SMS OTP step in customer registration */
+ .sms-otp-box .otp-input { max-width: 190px; letter-spacing: .3em; font-weight: 800; text-align: center; }
+ .sms-otp-box .dev-otp strong { font-size: 20px; letter-spacing: .25em; }
++
++/* Interest rate entry in the EMI planner */
++.rate-entry { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
++.rate-entry input { max-width: 130px; }
++.rate-entry span { color: var(--muted); font-weight: 700; }
++
++/* Fonts: Plus Jakarta Sans for text, Sora for titles (loaded from Google Fonts in index.html; system fonts are the fallback) */
++body, button, input, select, textarea { font-family: "Plus Jakarta Sans", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
++h1, h2, h3, .brand strong, .login-hero h1, .welcome-strip h2, .drawer-head h2 { font-family: "Sora", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif; }
++.kpi strong, .planner-result > strong { font-family: "Plus Jakarta Sans", "Inter", ui-sans-serif, system-ui, sans-serif; font-weight: 800; }
+--- prev/client/index.html
++++ new/client/index.html
+@@ -6,6 +6,9 @@
+     <link rel="icon" type="image/svg+xml" href="/logo-mark.svg" />
+     <meta name="theme-color" content="#2b143f" />
+     <meta name="description" content="Sri Sakthi Thirumurugan Finance — premium lending operations platform." />
++    <link rel="preconnect" href="https://fonts.googleapis.com" />
++    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
++    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet" />
+     <title>Sri Sakthi Thirumurugan Finance</title>
+   </head>
+   <body>

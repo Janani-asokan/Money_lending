@@ -1,0 +1,448 @@
+--- final/server/main.py
++++ sms/server/main.py
+@@ -130,6 +130,28 @@
+ LATE_CHARGE_DEFAULTER_DAYS = int(os.getenv("LATE_CHARGE_DEFAULTER_DAYS", "30"))
+ 
+ 
++# SMS OTP for customer registration (own OTP service; MSG91 only delivers the SMS).
++# With SMS_PROVIDER=msg91 + MSG91_AUTH_KEY + MSG91_TEMPLATE_ID the OTP is sent by real SMS.
++# Without a gateway (no paid SMS account) the app runs in ON-SCREEN mode: the OTP is shown to the staff member on screen
++# (and printed in the API log) to read out / confirm. That keeps the same flow but does NOT prove the customer's phone.
++SMS_OTP_REQUIRED = os.getenv("SMS_OTP_REQUIRED", "true").lower() == "true"
++SMS_PROVIDER = os.getenv("SMS_PROVIDER", "").strip().lower()
++MSG91_AUTH_KEY = os.getenv("MSG91_AUTH_KEY", "").strip()
++MSG91_TEMPLATE_ID = os.getenv("MSG91_TEMPLATE_ID", "").strip()
++SMS_PROVIDER_CONFIGURED = SMS_PROVIDER == "msg91" and bool(MSG91_AUTH_KEY and MSG91_TEMPLATE_ID)
++SMS_ON_SCREEN_MODE = not SMS_PROVIDER_CONFIGURED
++SMS_OTP_LENGTH = 6
++SMS_OTP_EXPIRY_SECONDS = 300          # OTP valid for 5 minutes
++SMS_OTP_MAX_ATTEMPTS = 3              # wrong tries before the OTP is locked
++SMS_OTP_MAX_RESENDS = 3               # resends per OTP
++SMS_OTP_RESEND_GAP_SECONDS = 30       # minimum gap between sends
++SMS_OTP_MAX_PER_HOUR = 8              # SMS per mobile number per hour
++SMS_OTP_VERIFIED_VALID_SECONDS = 900  # a verified OTP must be used to register within 15 minutes
++SMS_OTP_HMAC_KEY = hashlib.sha256((os.getenv("SMS_OTP_HMAC_KEY") or APP_SECRET_KEY + ":sms-otp").encode()).digest()
++if SMS_OTP_REQUIRED and SMS_ON_SCREEN_MODE:
++    print("[sms-otp] No SMS gateway configured: OTPs are shown on screen to staff (no SMS is sent).")
++
++
+ def validate_new_loan_rate(rate: float) -> None:
+     if not (MIN_MONTHLY_INTEREST_RATE <= rate <= MAX_MONTHLY_INTEREST_RATE):
+         raise HTTPException(422, f"Monthly interest rate must be between {MIN_MONTHLY_INTEREST_RATE:g}% and {MAX_MONTHLY_INTEREST_RATE:g}%")
+@@ -239,6 +261,7 @@
+     aadhaar_consent_given: bool = False
+     aadhaar_consent_purpose: str = Field(default="", max_length=300)
+     aadhaar_consent_reference: str = Field(default="", max_length=120)
++    mobile_otp_id: Optional[str] = Field(default=None, max_length=40)
+ 
+     def model_post_init(self, __context: Any) -> None:
+         if self.status not in VERIFICATION_STATUSES:
+@@ -392,6 +415,39 @@
+             raise ValueError("UPI transaction/reference ID is required")
+ 
+ 
++def normalize_indian_mobile(value: str) -> str:
++    digits = "".join(ch for ch in (value or "") if ch.isdigit())
++    if len(digits) != 10 or digits[0] not in "6789":
++        raise ValueError("Mobile must be a valid 10-digit Indian number")
++    return digits
++
++
++class SmsOtpSendIn(BaseModel):
++    mobile: str
++    purpose: str = "registration"
++
++    @field_validator("mobile")
++    @classmethod
++    def valid_mobile(cls, value: str) -> str:
++        return normalize_indian_mobile(value)
++
++    @field_validator("purpose")
++    @classmethod
++    def valid_purpose(cls, value: str) -> str:
++        if value != "registration":
++            raise ValueError("Unsupported OTP purpose")
++        return value
++
++
++class SmsOtpVerifyIn(BaseModel):
++    otp_id: str = Field(min_length=4, max_length=40)
++    otp: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
++
++
++class SmsOtpResendIn(BaseModel):
++    otp_id: str = Field(min_length=4, max_length=40)
++
++
+ class LoanClosureIn(BaseModel):
+     mode: str
+     payment_reference: Optional[str] = Field(default=None, max_length=120)
+@@ -893,6 +949,8 @@
+     if USE_MEMORY:
+         return
+     await db.customers.create_index("customer_id", name="idx_customers_customer_id", unique=True)
++    await db.sms_otps.create_index("otp_id", name="idx_sms_otps_otp_id", unique=True)
++    await db.sms_otps.create_index([("mobile", 1), ("created_at", -1)], name="idx_sms_otps_mobile_created")
+     indexes = await db.customers.index_information()
+     mobile_index = indexes.get("idx_customers_mobile")
+     if mobile_index and not mobile_index.get("unique", False):
+@@ -1994,6 +2052,7 @@
+         await audit(user, "mobile_duplicate_check", "customer", view["customer_id"], {"result": "existing"}, request)
+         ack_seq = await next_sequence("MOB", "id", "acknowledgements")
+         return {"duplicate": True, "customer": view, "ack_no": f"MOB-{now().strftime('%Y%m%d')}-{ack_seq:06d}"}
++    sms_otp_record = await require_verified_sms_otp(payload.mobile_otp_id, payload.mobile) if SMS_OTP_REQUIRED else None
+     seq = await next_sequence(payload.area, "_customer_seq", "customers")
+     customer_id = f"{payload.area}{seq:03d}"
+     customer = {
+@@ -2013,6 +2072,10 @@
+         "operator": user["name"],
+         "risk_score": risk_score(payload.model_dump()),
+     }
++    if sms_otp_record:
++        customer["mobile_verified_at"] = sms_otp_record["verified_at"]
++        customer["mobile_verification_method"] = "SMS OTP"
++        customer["mobile_otp_id"] = sms_otp_record["otp_id"]
+     if payload.aadhaar:
+         customer["aadhaar_encrypted"] = encrypt_aadhaar(payload.aadhaar)
+         customer["aadhaar_hash"] = aadhaar_hash(payload.aadhaar)
+@@ -2029,9 +2092,11 @@
+     if payload.aadhaar:
+         consent_seq = await next_sequence("CNS", "consent_id", "aadhaar_consents")
+         consent = {"consent_id": f"CNS-{consent_seq:09d}", "customer_id": customer_id, "status": "Active", "purpose_disclosed": payload.aadhaar_consent_purpose.strip(), "customer_consent_reference": payload.aadhaar_consent_reference.strip(), "captured_at": iso(now()), "captured_by": user["name"], "captured_by_id": user["id"]}
+-    audit_details = {"masked_aadhaar": mask_aadhaar(payload.aadhaar) if payload.aadhaar else "Not provided", "method": "aadhaar" if payload.aadhaar else "manual", "status": "Pending Verification"}
++    audit_details = {"masked_aadhaar": mask_aadhaar(payload.aadhaar) if payload.aadhaar else "Not provided", "method": "aadhaar" if payload.aadhaar else "manual", "status": "Pending Verification", "mobile_verified_by_sms_otp": sms_otp_record["otp_id"] if sms_otp_record else "Not required"}
+     try:
+         if USE_MEMORY:
++            if sms_otp_record and not await sms_otp_update(sms_otp_record, {"status": "Consumed", "consumed_at": iso(now()), "consumed_for": customer_id}, "Verified"):
++                raise HTTPException(409, "This OTP was already used. Send a new OTP.")
+             await insert_one("customers", customer)
+             await insert_one("verification_events", verification_event)
+             if consent: await insert_one("aadhaar_consents", consent)
+@@ -2039,6 +2104,10 @@
+         else:
+             async with await mongo_client.start_session() as session:
+                 async with session.start_transaction():
++                    if sms_otp_record:
++                        consumed = await db.sms_otps.update_one({"otp_id": sms_otp_record["otp_id"], "status": "Verified"}, {"$set": {"status": "Consumed", "consumed_at": iso(now()), "consumed_for": customer_id}}, session=session)
++                        if consumed.modified_count != 1:
++                            raise HTTPException(409, "This OTP was already used. Send a new OTP.")
+                     await db.customers.insert_one(deepcopy(customer), session=session)
+                     await db.verification_events.insert_one(deepcopy(verification_event), session=session)
+                     if consent: await db.aadhaar_consents.insert_one(deepcopy(consent), session=session)
+@@ -2053,6 +2122,195 @@
+     return {"duplicate": False, "customer": await customer_view(customer), "ack_no": f"REG-{now().strftime('%Y%m%d')}-{seq:03d}"}
+ 
+ 
++def sms_otp_hash(otp_id: str, mobile: str, otp: str) -> str:
++    # The OTP is never stored or logged in clear text; only this keyed hash (bound to the OTP id and the mobile number).
++    return hmac.new(SMS_OTP_HMAC_KEY, f"{otp_id}:{mobile}:{otp}".encode(), hashlib.sha256).hexdigest()
++
++
++def mask_mobile(mobile: str) -> str:
++    return "XXXXXX" + mobile[-4:]
++
++
++def _msg91_send_blocking(mobile: str, otp: str) -> Optional[str]:
++    """Send the OTP through MSG91's OTP API. Only this function knows the gateway's request format."""
++    import urllib.error
++    import urllib.parse
++    import urllib.request
++    query = urllib.parse.urlencode({
++        "template_id": MSG91_TEMPLATE_ID, "mobile": "91" + mobile, "authkey": MSG91_AUTH_KEY,
++        "otp": otp, "otp_expiry": max(SMS_OTP_EXPIRY_SECONDS // 60, 1),
++    })
++    request = urllib.request.Request(
++        "https://control.msg91.com/api/v5/otp?" + query, data=b"{}", method="POST",
++        headers={"Content-Type": "application/json", "Accept": "application/json", "authkey": MSG91_AUTH_KEY},
++    )
++    try:
++        with urllib.request.urlopen(request, timeout=10) as response:
++            body = json.loads(response.read().decode("utf-8") or "{}")
++    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
++        print(f"[sms-otp] gateway call failed: {type(exc).__name__}")
++        raise HTTPException(502, "The SMS could not be sent. Please try again in a moment.") from exc
++    if str(body.get("type", "")).lower() != "success":
++        print(f"[sms-otp] gateway rejected the request: {str(body.get('message', ''))[:120]}")
++        raise HTTPException(502, "The SMS gateway did not accept the message. Check the MSG91 template and balance.")
++    return str(body.get("message") or body.get("request_id") or "") or None
++
++
++async def deliver_sms_otp(mobile: str, otp: str) -> dict[str, Any]:
++    if SMS_PROVIDER_CONFIGURED:
++        message_id = await asyncio.to_thread(_msg91_send_blocking, mobile, otp)
++        return {"gateway": "msg91", "gateway_message_id": message_id}
++    print(f"[sms-otp ON-SCREEN MODE] OTP for {mobile}: {otp}")
++    return {"gateway": "screen", "gateway_message_id": None}
++
++
++async def sms_sends_in_last_hour(mobile: str) -> int:
++    cutoff = now() - timedelta(hours=1)
++    return sum(1 for record in await find_many("sms_otps", {"mobile": mobile}) for stamp in record.get("send_timestamps", []) if parse_date(stamp) >= cutoff)
++
++
++def sms_otp_public(record: dict[str, Any], dev_otp: Optional[str] = None) -> dict[str, Any]:
++    stamp = now()
++    result = {
++        "otp_id": record["otp_id"], "status": record["status"], "mobile_masked": mask_mobile(record["mobile"]),
++        "expires_at": record["expires_at"], "expires_in_seconds": max(int((parse_date(record["expires_at"]) - stamp).total_seconds()), 0),
++        "resend_available_at": iso(parse_date(record["last_sent_at"]) + timedelta(seconds=SMS_OTP_RESEND_GAP_SECONDS)),
++        "resends_remaining": max(SMS_OTP_MAX_RESENDS - int(record.get("resend_count", 0)), 0),
++        "attempts_remaining": max(SMS_OTP_MAX_ATTEMPTS - int(record.get("attempt_count", 0)), 0),
++        "development_mode": record.get("gateway") == "screen",
++    }
++    if dev_otp and record.get("gateway") == "screen":
++        result["dev_otp"] = dev_otp
++    return result
++
++
++async def sms_otp_update(record: dict[str, Any], fields: dict[str, Any], expected_status: str) -> bool:
++    """Apply `fields` only if the OTP still has the status and attempt count we read (stops double use and races)."""
++    if USE_MEMORY:
++        current = await find_one("sms_otps", {"otp_id": record["otp_id"]})
++        if not current or current.get("status") != expected_status or int(current.get("attempt_count", 0)) != int(record.get("attempt_count", 0)):
++            return False
++        await replace_one("sms_otps", {"otp_id": record["otp_id"]}, {**current, **fields})
++        return True
++    result = await db.sms_otps.update_one({"otp_id": record["otp_id"], "status": expected_status, "attempt_count": int(record.get("attempt_count", 0))}, {"$set": fields})
++    return result.modified_count == 1
++
++
++async def require_verified_sms_otp(otp_id: Optional[str], mobile: str) -> dict[str, Any]:
++    if not otp_id:
++        raise HTTPException(422, "Verify the customer's mobile number with an SMS OTP before registering.")
++    record = await find_one("sms_otps", {"otp_id": otp_id})
++    if not record or record.get("purpose") != "registration" or record.get("mobile") != mobile:
++        raise HTTPException(422, "The SMS OTP does not belong to this mobile number. Send and verify a new OTP.")
++    if record.get("status") == "Consumed":
++        raise HTTPException(422, "This OTP was already used for a registration. Send a new OTP.")
++    if record.get("status") != "Verified":
++        raise HTTPException(422, "Verify the SMS OTP sent to this mobile number before registering.")
++    if parse_date(record["verified_at"]) + timedelta(seconds=SMS_OTP_VERIFIED_VALID_SECONDS) < now():
++        raise HTTPException(422, "The OTP verification expired. Send a new OTP.")
++    return record
++
++
++@app.get("/api/otp/sms/status")
++async def sms_otp_status(user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
++    return {
++        "required": SMS_OTP_REQUIRED, "configured": SMS_PROVIDER_CONFIGURED, "development_mode": SMS_ON_SCREEN_MODE,
++        "expiry_seconds": SMS_OTP_EXPIRY_SECONDS, "max_attempts": SMS_OTP_MAX_ATTEMPTS,
++        "max_resends": SMS_OTP_MAX_RESENDS, "resend_gap_seconds": SMS_OTP_RESEND_GAP_SECONDS,
++    }
++
++
++@app.post("/api/otp/sms/send")
++async def send_sms_otp(payload: SmsOtpSendIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
++    existing = await find_one("customers", {"mobile": payload.mobile})
++    if existing:
++        raise HTTPException(409, f"A customer with this mobile number already exists ({existing['customer_id']}). Select the existing profile instead.")
++    if await sms_sends_in_last_hour(payload.mobile) >= SMS_OTP_MAX_PER_HOUR:
++        raise HTTPException(429, f"Too many OTP messages were sent to this number. Try again after an hour (limit {SMS_OTP_MAX_PER_HOUR} per hour).")
++    otp = "".join(secrets.choice("0123456789") for _ in range(SMS_OTP_LENGTH))
++    otp_id = f"SOT-{await next_sequence('SOT', 'otp_id', 'sms_otps'):09d}"
++    delivery = await deliver_sms_otp(payload.mobile, otp)
++    stamp = now()
++    record = {
++        "otp_id": otp_id, "purpose": payload.purpose, "mobile": payload.mobile, "otp_hash": sms_otp_hash(otp_id, payload.mobile, otp),
++        "status": "Sent", "created_at": iso(stamp), "last_sent_at": iso(stamp), "expires_at": iso(stamp + timedelta(seconds=SMS_OTP_EXPIRY_SECONDS)),
++        "send_timestamps": [iso(stamp)], "resend_count": 0, "attempt_count": 0,
++        "gateway": delivery["gateway"], "gateway_message_ids": [delivery["gateway_message_id"]] if delivery["gateway_message_id"] else [],
++        "requested_by": user["name"], "requested_by_id": user["id"],
++    }
++    for older in await find_many("sms_otps", {"mobile": payload.mobile, "purpose": payload.purpose}):
++        if older.get("status") in {"Sent", "Verified"}:
++            await sms_otp_update(older, {"status": "Cancelled", "cancelled_at": iso(stamp)}, older["status"])
++    await insert_one("sms_otps", record)
++    await audit(user, "sms_otp_sent", "sms_otp", otp_id, {"mobile": mask_mobile(payload.mobile), "purpose": payload.purpose, "gateway": delivery["gateway"], "gateway_message_id": delivery["gateway_message_id"]}, request)
++    return sms_otp_public(record, dev_otp=otp)
++
++
++@app.post("/api/otp/sms/resend")
++async def resend_sms_otp(payload: SmsOtpResendIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
++    record = await find_one("sms_otps", {"otp_id": payload.otp_id})
++    if not record:
++        raise HTTPException(404, "OTP request not found")
++    if record.get("status") != "Sent":
++        raise HTTPException(409, "This OTP can no longer be resent. Send a new OTP.")
++    stamp = now()
++    if parse_date(record["expires_at"]) <= stamp:
++        await sms_otp_update(record, {"status": "Expired", "completed_at": iso(stamp)}, "Sent")
++        raise HTTPException(410, "OTP expired. Send a new OTP.")
++    if int(record.get("resend_count", 0)) >= SMS_OTP_MAX_RESENDS:
++        raise HTTPException(429, f"Resend limit reached ({SMS_OTP_MAX_RESENDS}). Wait for the OTP to expire, then send a new one.")
++    wait = SMS_OTP_RESEND_GAP_SECONDS - int((stamp - parse_date(record["last_sent_at"])).total_seconds())
++    if wait > 0:
++        raise HTTPException(429, f"Wait {wait} more second{'s' if wait != 1 else ''} before resending.")
++    if await sms_sends_in_last_hour(record["mobile"]) >= SMS_OTP_MAX_PER_HOUR:
++        raise HTTPException(429, f"Too many OTP messages were sent to this number. Try again after an hour (limit {SMS_OTP_MAX_PER_HOUR} per hour).")
++    otp = "".join(secrets.choice("0123456789") for _ in range(SMS_OTP_LENGTH))
++    delivery = await deliver_sms_otp(record["mobile"], otp)
++    stamp = now()
++    fields = {
++        "otp_hash": sms_otp_hash(record["otp_id"], record["mobile"], otp), "last_sent_at": iso(stamp),
++        "expires_at": iso(stamp + timedelta(seconds=SMS_OTP_EXPIRY_SECONDS)), "resend_count": int(record.get("resend_count", 0)) + 1,
++        "send_timestamps": [*record.get("send_timestamps", []), iso(stamp)], "attempt_count": 0, "gateway": delivery["gateway"],
++        "gateway_message_ids": [*record.get("gateway_message_ids", []), *([delivery["gateway_message_id"]] if delivery["gateway_message_id"] else [])],
++    }
++    if not await sms_otp_update(record, fields, "Sent"):
++        raise HTTPException(409, "OTP state changed. Please try again.")
++    await audit(user, "sms_otp_resent", "sms_otp", record["otp_id"], {"mobile": mask_mobile(record["mobile"]), "resend_number": fields["resend_count"], "gateway": delivery["gateway"], "gateway_message_id": delivery["gateway_message_id"]}, request)
++    return sms_otp_public({**record, **fields}, dev_otp=otp)
++
++
++@app.post("/api/otp/sms/verify")
++async def verify_sms_otp(payload: SmsOtpVerifyIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
++    record = await find_one("sms_otps", {"otp_id": payload.otp_id})
++    if not record:
++        raise HTTPException(404, "OTP request not found")
++    if record.get("status") == "Verified":
++        return {**sms_otp_public(record), "verified": True, "verified_at": record["verified_at"]}
++    if record.get("status") != "Sent":
++        raise HTTPException(409, "This OTP is no longer valid. Send a new OTP.")
++    stamp = now()
++    if parse_date(record["expires_at"]) <= stamp:
++        await sms_otp_update(record, {"status": "Expired", "completed_at": iso(stamp)}, "Sent")
++        raise HTTPException(410, "OTP expired. Send a new OTP.")
++    if not hmac.compare_digest(record["otp_hash"], sms_otp_hash(record["otp_id"], record["mobile"], payload.otp)):
++        attempts = int(record.get("attempt_count", 0)) + 1
++        remaining = max(SMS_OTP_MAX_ATTEMPTS - attempts, 0)
++        fields: dict[str, Any] = {"attempt_count": attempts, "last_failed_at": iso(stamp)}
++        if remaining == 0:
++            fields["status"] = "Locked"
++        if not await sms_otp_update(record, fields, "Sent"):
++            raise HTTPException(409, "OTP state changed. Please try again.")
++        await audit(user, "sms_otp_failed", "sms_otp", record["otp_id"], {"mobile": mask_mobile(record["mobile"]), "attempt_number": attempts, "attempts_remaining": remaining}, request)
++        if remaining == 0:
++            raise HTTPException(423, f"OTP locked after {SMS_OTP_MAX_ATTEMPTS} incorrect attempts. Send a new OTP.")
++        raise HTTPException(422, f"Incorrect OTP. {remaining} attempt{'s' if remaining != 1 else ''} remaining.")
++    fields = {"status": "Verified", "verified_at": iso(stamp), "verified_by": user["name"], "verified_by_id": user["id"]}
++    if not await sms_otp_update(record, fields, "Sent"):
++        raise HTTPException(409, "OTP state changed. Please try again.")
++    await audit(user, "sms_otp_verified", "sms_otp", record["otp_id"], {"mobile": mask_mobile(record["mobile"]), "purpose": record["purpose"]}, request)
++    return {**sms_otp_public({**record, **fields}), "verified": True, "verified_at": fields["verified_at"]}
++
++
+ @app.patch("/api/customers/{customer_id}/verification")
+ async def update_customer_verification(customer_id: str, payload: VerificationIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+     customer = await find_one("customers", {"customer_id": customer_id})
+--- final/client/src/main.jsx
++++ sms/client/src/main.jsx
+@@ -451,6 +451,8 @@
+   );
+ }
+ 
++const emptySmsOtp = { otp_id: '', mobile: '', phase: 'idle', otp: '', expires_at: '', resend_available_at: '', resends_remaining: 3, attempts_remaining: 3, mobile_masked: '', dev_otp: '', development_mode: false, busy: false, error: '' };
++
+ function Customers({ api, user, notify }) {
+   const [rows, setRows] = useState([]);
+   const [knownCustomers, setKnownCustomers] = useState([]);
+@@ -473,6 +475,9 @@
+   const [registryFilter, setRegistryFilter] = useState('all');
+   const [areaFilter, setAreaFilter] = useState('');
+   const [areaView, setAreaView] = useState('none');
++  const [smsStatus, setSmsStatus] = useState({ required: true, configured: false, development_mode: true });
++  const [smsOtp, setSmsOtp] = useState(emptySmsOtp);
++  const [smsTick, setSmsTick] = useState(0);
+   const load = async (query = customerQuery) => {
+     const boot = await api('/api/bootstrap');
+     setAreas(boot.areas);
+@@ -501,16 +506,55 @@
+     setReceipt({ type: 'Existing Customer Selected', ack: customer.customer_id, customer });
+     notify(`Loaded existing customer ${customer.customer_id}. Create another loan from the Loans page; no duplicate profile was created.`);
+   }
++  useEffect(() => {
++    if (['owner', 'manager'].includes(user.role)) api('/api/otp/sms/status').then(setSmsStatus).catch(() => {});
++  }, []);
++  useEffect(() => {
++    if (smsOtp.otp_id && form.mobile !== smsOtp.mobile) setSmsOtp(emptySmsOtp);
++  }, [form.mobile]);
++  useEffect(() => {
++    if (smsOtp.phase !== 'sent') return undefined;
++    const timer = setInterval(() => setSmsTick(value => value + 1), 1000);
++    return () => clearInterval(timer);
++  }, [smsOtp.phase]);
++  const resendInSeconds = smsOtp.resend_available_at ? Math.max(0, Math.ceil((new Date(smsOtp.resend_available_at).getTime() - Date.now()) / 1000)) : 0;
++  const otpExpired = smsOtp.phase === 'sent' && smsOtp.expires_at && new Date(smsOtp.expires_at).getTime() <= Date.now();
++  const otpLocked = smsOtp.phase === 'sent' && smsOtp.attempts_remaining === 0;
++  async function sendSmsOtp(resend) {
++    setSmsOtp(current => ({ ...current, busy: true, error: '' }));
++    try {
++      const result = resend
++        ? await api('/api/otp/sms/resend', { method: 'POST', body: JSON.stringify({ otp_id: smsOtp.otp_id }) })
++        : await api('/api/otp/sms/send', { method: 'POST', body: JSON.stringify({ mobile: form.mobile, purpose: 'registration' }) });
++      setSmsOtp({ ...emptySmsOtp, ...result, mobile: form.mobile, phase: 'sent', otp: '', busy: false, dev_otp: result.dev_otp || '' });
++      notify(resend ? 'A new OTP was sent by SMS.' : `OTP sent by SMS to ${result.mobile_masked}.`);
++    } catch (err) {
++      setSmsOtp(current => ({ ...current, busy: false, error: err.message }));
++    }
++  }
++  async function verifySmsOtp() {
++    if (smsOtp.otp.length !== 6) return setSmsOtp(current => ({ ...current, error: 'Enter the 6-digit OTP.' }));
++    setSmsOtp(current => ({ ...current, busy: true, error: '' }));
++    try {
++      const result = await api('/api/otp/sms/verify', { method: 'POST', body: JSON.stringify({ otp_id: smsOtp.otp_id, otp: smsOtp.otp }) });
++      setSmsOtp(current => ({ ...current, phase: 'verified', busy: false, otp: '', dev_otp: '', verified_at: result.verified_at }));
++      notify('Mobile number verified by SMS OTP.');
++    } catch (err) {
++      const remaining = err.message.match(/(\d+) attempts? remaining/i);
++      setSmsOtp(current => ({ ...current, busy: false, otp: '', attempts_remaining: remaining ? Number(remaining[1]) : err.message.toLowerCase().includes('locked') ? 0 : current.attempts_remaining, error: err.message }));
++    }
++  }
+   async function submit(e) {
+     e.preventDefault();
+     if (saving) return;
+     setFormError('');
+     if (form.mobile.length !== 10) return setFormError('Enter a valid 10-digit Indian mobile number.');
++    if (smsStatus.required && smsOtp.phase !== 'verified') return setFormError('Verify the customer mobile number with the SMS OTP before registering.');
+     if (registrationMode === 'aadhaar' && form.aadhaar.length !== 12) return setFormError('Aadhaar must contain exactly 12 digits.');
+     if (registrationMode === 'aadhaar' && (!form.aadhaar_consent_given || form.aadhaar_consent_reference.trim().length < 3)) return setFormError('Record customer consent and its reference before continuing.');
+     setSaving(true);
+     try {
+-      const payload = { ...form, aadhaar: registrationMode === 'aadhaar' ? form.aadhaar : '' };
++      const payload = { ...form, aadhaar: registrationMode === 'aadhaar' ? form.aadhaar : '', mobile_otp_id: smsOtp.phase === 'verified' ? smsOtp.otp_id : null };
+       const res = await api('/api/customers', { method: 'POST', body: JSON.stringify(payload) });
+       setReceipt({ type: res.duplicate ? 'Verification Acknowledgement' : 'Registration Acknowledgement', ack: res.ack_no, customer: res.customer });
+       if (!res.duplicate && registrationMode === 'aadhaar' && providerStatus.configured) {
+@@ -521,6 +565,7 @@
+         notify(res.duplicate ? 'Existing customer found. Duplicate customer was not created.' : registrationMode === 'aadhaar' ? 'Customer saved pending automatic Aadhaar verification.' : 'Manual profile saved as Pending Verification.');
+       }
+       setForm(current => ({ ...current, name: '', father_name: '', mobile: '', aadhaar: '', address: '', guarantor: '', status: 'Pending Verification', aadhaar_consent_given: false, aadhaar_consent_reference: '' }));
++      setSmsOtp(emptySmsOtp);
+       await load();
+     } catch (err) {
+       setFormError(err.message || 'Customer could not be registered. Please try again.');
+@@ -626,6 +671,24 @@
+           <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
+         </div>
+         <CustomerSuggestions matches={previousMatches} onSelect={usePreviousCustomer} />
++        {smsStatus.required && <div className="servicing-box sms-otp-box">
++          <h3>Mobile verification by SMS OTP</h3>
++          {smsStatus.development_mode && <div className="locked-note"><AlertTriangle size={16} /> On-screen OTP mode: no SMS gateway is connected, so no SMS is sent. The OTP appears below after you press Send, to confirm with the customer. This does not prove the customer's phone.</div>}
++          {smsOtp.phase === 'verified'
++            ? <div className="locked-note"><CheckCircle2 size={16} /> {smsOtp.mobile_masked} verified by SMS OTP. This OTP can be used for one registration only.</div>
++            : smsOtp.phase === 'sent'
++              ? <>
++                  <small>OTP sent to {smsOtp.mobile_masked}. Ask the customer for the 6-digit code. {otpExpired ? 'This OTP has expired.' : otpLocked ? 'This OTP is locked.' : `${smsOtp.attempts_remaining} attempt${smsOtp.attempts_remaining === 1 ? '' : 's'} left, ${smsOtp.resends_remaining} resend${smsOtp.resends_remaining === 1 ? '' : 's'} left.`}</small>
++                  {smsOtp.dev_otp && <div className="locked-note dev-otp">OTP: <strong>{smsOtp.dev_otp}</strong></div>}
++                  <div className="action-row">
++                    <input className="otp-input" inputMode="numeric" autoComplete="one-time-code" maxLength="6" placeholder="6-digit OTP" disabled={otpExpired || otpLocked} value={smsOtp.otp} onChange={e => setSmsOtp({ ...smsOtp, otp: e.target.value.replace(/\D/g, '').slice(0, 6) })} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); verifySmsOtp(); } }} />
++                    <button type="button" className="primary small" disabled={smsOtp.busy || otpExpired || otpLocked || smsOtp.otp.length !== 6} onClick={verifySmsOtp}>{smsOtp.busy ? 'Please wait…' : 'Verify OTP'}</button>
++                    <button type="button" className="ghost small" disabled={smsOtp.busy || (!(otpExpired || otpLocked) && (resendInSeconds > 0 || smsOtp.resends_remaining === 0))} onClick={() => sendSmsOtp(!(otpExpired || otpLocked))}>{otpExpired || otpLocked ? 'Send a new OTP' : resendInSeconds > 0 ? `Resend in ${resendInSeconds}s` : 'Resend OTP'}</button>
++                  </div>
++                </>
++              : <div className="action-row"><button type="button" className="ghost" disabled={smsOtp.busy || !/^[6-9][0-9]{9}$/.test(form.mobile)} onClick={() => sendSmsOtp(false)}>{smsOtp.busy ? 'Sending…' : 'Send OTP by SMS'}</button><small>{/^[6-9][0-9]{9}$/.test(form.mobile) ? 'The customer receives a 6-digit code valid for 5 minutes.' : 'Enter the 10-digit mobile number above first.'}</small></div>}
++          {smsOtp.error && <div className="error" role="alert">{smsOtp.error}</div>}
++        </div>}
+         <label>Address<textarea required value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></label>
+         <label>Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
+         {formError && <div className="error" role="alert">{formError}</div>}
+--- final/client/src/styles.css
++++ sms/client/src/styles.css
+@@ -1030,3 +1030,7 @@
+ tr.group-row small { color: var(--muted); font-weight: 600; }
+ .quick-actions { margin-top: 14px; }
+ .quick-actions form { display: grid; gap: 10px; }
++
++/* SMS OTP step in customer registration */
++.sms-otp-box .otp-input { max-width: 190px; letter-spacing: .3em; font-weight: 800; text-align: center; }
++.sms-otp-box .dev-otp strong { font-size: 20px; letter-spacing: .25em; }

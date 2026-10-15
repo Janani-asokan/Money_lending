@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.env
+.env.production
+backups/
+*.stfbak
+node_modules/
+dist/
+dist-prod/
+work/
+.venv/
+.venv*/
+venv/
+*.log
+*.pid
+.DS_Store

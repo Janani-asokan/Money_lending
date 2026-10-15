@@ -1,0 +1,418 @@
+--- prev/server/main.py
++++ new/server/main.py
+@@ -2,6 +2,7 @@
+ 
+ import base64
+ import asyncio
++from contextvars import ContextVar
+ import gzip
+ import hashlib
+ import hmac
+@@ -281,8 +282,8 @@
+     def model_post_init(self, __context: Any) -> None:
+         if self.status not in VERIFICATION_STATUSES:
+             raise ValueError("Invalid verification status")
+-        if self.aadhaar and (not self.aadhaar_consent_given or len(self.aadhaar_consent_purpose.strip()) < 5 or len(self.aadhaar_consent_reference.strip()) < 3):
+-            raise ValueError("Recorded customer consent, disclosed purpose, and consent reference are required for Aadhaar")
++        if self.aadhaar and (not self.aadhaar_consent_given or len(self.aadhaar_consent_purpose.strip()) < 5):
++            raise ValueError("Recorded customer consent and the disclosed purpose are required for Aadhaar")
+ 
+     @field_validator("name", "father_name", "address", "guarantor")
+     @classmethod
+@@ -1216,7 +1217,10 @@
+     borrow = parse_date(loan["borrow_date"])
+     elapsed = max((now() - borrow).days, 0)
+     schedule = loan_schedule(loan)
+-    schedule_doc = await find_one("loan_schedules", {"loan_id": loan["loan_id"], "version": int(loan.get("schedule_version", 1))})
++    cache = _LOAN_DATA.get()
++    schedule_doc = cache["schedules"].get((loan["loan_id"], int(loan.get("schedule_version", 1)))) if cache is not None else None
++    if schedule_doc is None:
++        schedule_doc = await find_one("loan_schedules", {"loan_id": loan["loan_id"], "version": int(loan.get("schedule_version", 1))})
+     repayment_rows = [row for row in (schedule_doc or {}).get("rows", []) if not row.get("moratorium") and float(row.get("payment", 0)) > 0]
+     paid_remaining = Decimal(str(paid))
+     installments_paid = 0
+@@ -1249,17 +1253,59 @@
+     }
+ 
+ 
++# Request-scoped preload for list screens: one query per collection instead of five queries for every loan.
++_LOAN_DATA: ContextVar[Optional[dict[str, Any]]] = ContextVar("loan_data_cache", default=None)
++
++
++async def build_loan_cache(raw_loans: list[dict[str, Any]]) -> dict[str, Any]:
++    def group(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
++        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
++        for row in rows:
++            if row.get("status", "Posted") != "Reversed":
++                grouped[row["loan_id"]].append(row)
++        return grouped
++    payments = group(await find_many("payments"))
++    for rows in payments.values():
++        rows.sort(key=lambda payment: payment.get("timestamp", ""))
++    needed = {(loan["loan_id"], int(loan.get("schedule_version", 1))) for loan in raw_loans}
++    schedules: dict[tuple[str, int], dict[str, Any]] = {}
++    for doc in await find_many("loan_schedules"):
++        key = (doc["loan_id"], int(doc.get("version", 1)))
++        if key in needed:
++            schedules[key] = doc
++    return {
++        "payments": payments, "adjustments": group(await find_many("loan_adjustments")),
++        "part_payments": group(await find_many("part_payments")), "writeoffs": group(await find_many("writeoffs")),
++        "schedules": schedules,
++    }
++
++
++async def enrich_all(raw_loans: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """enrich_loan for many loans using a handful of queries in total (fast for the Loan book, dashboards and reports)."""
++    if not raw_loans:
++        return []
++    token = _LOAN_DATA.set(await build_loan_cache(raw_loans))
++    try:
++        return [await enrich_loan(loan) for loan in raw_loans]
++    finally:
++        _LOAN_DATA.reset(token)
++
++
+ async def loan_component_balances(loan: dict[str, Any], session: Any = None) -> dict[str, int]:
+-    if USE_MEMORY:
++    cache = _LOAN_DATA.get() if session is None else None
++    if cache is not None:
++        payments = cache["payments"].get(loan["loan_id"], [])
++        adjustments = cache["adjustments"].get(loan["loan_id"], [])
++        part_payments = cache["part_payments"].get(loan["loan_id"], [])
++        writeoffs = cache["writeoffs"].get(loan["loan_id"], [])
++    elif USE_MEMORY:
+         payments = [p for p in await find_many("payments", {"loan_id": loan["loan_id"]}) if p.get("status", "Posted") != "Reversed"]
+         adjustments = [a for a in await find_many("loan_adjustments", {"loan_id": loan["loan_id"]}) if a.get("status", "Posted") != "Reversed"]
+-    else:
+-        payments = await db.payments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).sort("timestamp", 1).to_list(length=None)
+-        adjustments = await db.loan_adjustments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
+-    if USE_MEMORY:
+         part_payments = [p for p in await find_many("part_payments", {"loan_id": loan["loan_id"]}) if p.get("status", "Posted") != "Reversed"]
+         writeoffs = [p for p in await find_many("writeoffs", {"loan_id": loan["loan_id"]}) if p.get("status", "Posted") != "Reversed"]
+     else:
++        payments = await db.payments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).sort("timestamp", 1).to_list(length=None)
++        adjustments = await db.loan_adjustments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
+         part_payments = await db.part_payments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
+         writeoffs = await db.writeoffs.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
+     principal = to_paise(loan["principal"])
+@@ -1459,7 +1505,7 @@
+     if USE_MEMORY:
+         STORE["overdue_alerts"] = []
+         STORE["notifications"] = []
+-    loans = [await enrich_loan(x) for x in await find_many("loans")]
++    loans = await enrich_all(await find_many("loans"))
+     for loan in loans:
+         if loan["status"] == "Closed":
+             continue
+@@ -1904,7 +1950,7 @@
+ @app.get("/api/dashboard")
+ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+     customers = [await customer_view(x) for x in await find_many("customers") if not x.get("profile_deleted_at")]
+-    loans = [await enrich_loan(x) for x in await find_many("loans")]
++    loans = await enrich_all(await find_many("loans"))
+     payments = await find_many("payments")
+     today_key = business_now().date().isoformat()
+     month_key = business_now().strftime("%Y-%m")
+@@ -2152,7 +2198,7 @@
+     consent = None
+     if payload.aadhaar:
+         consent_seq = await next_sequence("CNS", "consent_id", "aadhaar_consents")
+-        consent = {"consent_id": f"CNS-{consent_seq:09d}", "customer_id": customer_id, "status": "Active", "purpose_disclosed": payload.aadhaar_consent_purpose.strip(), "customer_consent_reference": payload.aadhaar_consent_reference.strip(), "captured_at": iso(now()), "captured_by": user["name"], "captured_by_id": user["id"]}
++        consent = {"consent_id": f"CNS-{consent_seq:09d}", "customer_id": customer_id, "status": "Active", "purpose_disclosed": payload.aadhaar_consent_purpose.strip(), "customer_consent_reference": payload.aadhaar_consent_reference.strip() or f"CONSENT-{customer_id}", "captured_at": iso(now()), "captured_by": user["name"], "captured_by_id": user["id"]}
+     audit_details = {"masked_aadhaar": mask_aadhaar(payload.aadhaar) if payload.aadhaar else "Not provided", "method": "aadhaar" if payload.aadhaar else "manual", "status": "Pending Verification", "mobile_verified_by_sms_otp": sms_otp_record["otp_id"] if sms_otp_record else "Not required"}
+     try:
+         if USE_MEMORY:
+@@ -2655,7 +2701,7 @@
+ @app.get("/api/loans")
+ async def loans(q: str = "", status_filter: str = "", loan_type: str = "", area: str = "", collector_id: str = "", user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+     raw_loans = await find_many("loans")
+-    rows = [await enrich_loan(x) for x in raw_loans]
++    rows = await enrich_all(raw_loans)
+     healed = False
+     for raw, row in zip(raw_loans, rows):
+         # Repayment already complete but the stored status is still Active/Overdue: close it now (never breaks the list).
+@@ -2666,7 +2712,7 @@
+                 print(f"[auto-close] could not close {raw.get('loan_id')}: {exc}")
+     if healed:
+         raw_loans = await find_many("loans")
+-        rows = [await enrich_loan(x) for x in raw_loans]
++        rows = await enrich_all(raw_loans)
+     customers_map = {c["customer_id"]: await customer_view(c) for c in await find_many("customers")}
+     out = []
+     for loan in rows:
+@@ -3736,7 +3782,7 @@
+ 
+ 
+ async def build_report(payload: ReportRequest) -> dict[str, Any]:
+-    loans_rows = [await enrich_loan(x) for x in await find_many("loans")]
++    loans_rows = await enrich_all(await find_many("loans"))
+     payment_rows = await find_many("payments")
+     customers_rows = [await customer_view(x) for x in await find_many("customers")]
+     if payload.report_type == "customer-ledger":
+--- prev/client/src/main.jsx
++++ new/client/src/main.jsx
+@@ -1,4 +1,4 @@
+-import React, { useEffect, useMemo, useState } from 'react';
++import React, { useEffect, useMemo, useRef, useState } from 'react';
+ import { createRoot } from 'react-dom/client';
+ import * as Icons from 'lucide-react';
+ import './styles.css';
+@@ -482,18 +482,29 @@
+   const [smsStatus, setSmsStatus] = useState({ required: true, configured: false, development_mode: true });
+   const [smsOtp, setSmsOtp] = useState(emptySmsOtp);
+   const [smsTick, setSmsTick] = useState(0);
+-  const load = async (query = customerQuery) => {
+-    const boot = await api('/api/bootstrap');
+-    setAreas(boot.areas);
++  const isManagerView = ['owner', 'manager'].includes(user.role);
++  const loadCustomers = async (query = customerQuery) => {
+     const customerRows = await api(`/api/customers?q=${encodeURIComponent(query)}`);
+     setRows(customerRows);
+     if (!query.trim()) setKnownCustomers(customerRows);
+-    setAadhaarRequests(['owner','manager'].includes(user.role) ? await api('/api/aadhaar/access-requests') : []);
+-    if (['owner','manager'].includes(user.role)) setProviderStatus(await api('/api/aadhaar/provider-status'));
+   };
++  const loadSupport = async () => {
++    const [boot, requests, provider] = await Promise.all([
++      api('/api/bootstrap'),
++      isManagerView ? api('/api/aadhaar/access-requests') : Promise.resolve([]),
++      isManagerView ? api('/api/aadhaar/provider-status') : Promise.resolve(null)
++    ]);
++    setAreas(boot.areas);
++    setAadhaarRequests(requests);
++    if (provider) setProviderStatus(provider);
++  };
++  // Everything in parallel on open / after saving; typing in the search box only refreshes the customer list.
++  const load = async (query = customerQuery) => { await Promise.all([loadSupport(), loadCustomers(query)]); };
+   useEffect(() => { load(); }, []);
++  const firstSearchRun = useRef(true);
+   useEffect(() => {
+-    const timer = setTimeout(() => load(customerQuery), 250);
++    if (firstSearchRun.current) { firstSearchRun.current = false; return undefined; }
++    const timer = setTimeout(() => loadCustomers(customerQuery), 300);
+     return () => clearTimeout(timer);
+   }, [customerQuery]);
+   const previousMatches = useMemo(() => findCustomerMatches(knownCustomers, form.name, form.mobile), [knownCustomers, form.name, form.mobile]);
+@@ -524,6 +535,7 @@
+   const resendInSeconds = smsOtp.resend_available_at ? Math.max(0, Math.ceil((new Date(smsOtp.resend_available_at).getTime() - Date.now()) / 1000)) : 0;
+   const otpExpired = smsOtp.phase === 'sent' && smsOtp.expires_at && new Date(smsOtp.expires_at).getTime() <= Date.now();
+   const otpLocked = smsOtp.phase === 'sent' && smsOtp.attempts_remaining === 0;
++  const validMobile = /^[6-9][0-9]{9}$/.test(form.mobile);
+   async function sendSmsOtp(resend) {
+     setSmsOtp(current => ({ ...current, busy: true, error: '' }));
+     try {
+@@ -555,14 +567,14 @@
+     if (form.mobile.length !== 10) return setFormError('Enter a valid 10-digit Indian mobile number.');
+     if (smsStatus.required && smsOtp.phase !== 'verified') return setFormError('Verify the customer mobile number with the SMS OTP before registering.');
+     if (registrationMode === 'aadhaar' && form.aadhaar.length !== 12) return setFormError('Aadhaar must contain exactly 12 digits.');
+-    if (registrationMode === 'aadhaar' && (!form.aadhaar_consent_given || form.aadhaar_consent_reference.trim().length < 3)) return setFormError('Record customer consent and its reference before continuing.');
++    if (registrationMode === 'aadhaar' && !form.aadhaar_consent_given) return setFormError('Tick the customer consent box before continuing.');
+     setSaving(true);
+     try {
+       const payload = { ...form, aadhaar: registrationMode === 'aadhaar' ? form.aadhaar : '', mobile_otp_id: smsOtp.phase === 'verified' ? smsOtp.otp_id : null };
+       const res = await api('/api/customers', { method: 'POST', body: JSON.stringify(payload) });
+       setReceipt({ type: res.duplicate ? 'Verification Acknowledgement' : 'Registration Acknowledgement', ack: res.ack_no, customer: res.customer });
+       if (!res.duplicate && registrationMode === 'aadhaar' && providerStatus.configured) {
+-        const otpResult = await api('/api/aadhaar/otp/start', { method:'POST', body:JSON.stringify({ customer_id:res.customer.customer_id, purpose:form.aadhaar_consent_purpose, consent_reference:form.aadhaar_consent_reference, proposed_disbursal_amount:0, owner_notes:'Automatic verification during customer onboarding' }) });
++        const otpResult = await api('/api/aadhaar/otp/start', { method:'POST', body:JSON.stringify({ customer_id:res.customer.customer_id, purpose:form.aadhaar_consent_purpose, consent_reference:form.aadhaar_consent_reference || 'Consent recorded at registration', proposed_disbursal_amount:0, owner_notes:'Automatic verification during customer onboarding' }) });
+         setOnboardingOtp({ customer_id:res.customer.customer_id, otp:'', verified_at:'', ...otpResult });
+         notify(`Customer saved. Aadhaar OTP sent to ${otpResult.masked_destination}.`);
+       } else {
+@@ -660,52 +672,74 @@
+   async function decideAccess(id, decision) { await api(`/api/aadhaar/access-requests/${id}/decision`, {method:'POST',body:JSON.stringify({decision,comments:'Reviewed against case reference'})}); notify(`Aadhaar access ${decision.toLowerCase()}d.`); await load(); }
+   async function viewApproved(r) { const result = await api(`/api/customers/${r.customer_id}/aadhaar?access_request_id=${encodeURIComponent(r.request_id)}`); setFullAadhaar(current=>({...current,[r.customer_id]:result.aadhaar})); window.setTimeout(()=>setFullAadhaar(current=>({...current,[r.customer_id]:undefined})),15000); await load(); }
+   return (
+-    <div className="split-layout">
++    <div className="split-layout customers-layout">
+       {['owner','manager'].includes(user.role) && <section className="panel full customer-editor"><div className="panel-head"><div><span className="section-kicker">Customer corrections</span><h2>Edit an existing customer</h2></div><select aria-label="Select customer to edit" value={editCandidate?.customer_id || ''} onChange={e=>setEditCandidate(rows.find(row=>row.customer_id===e.target.value) || null)}><option value="">Select customer</option>{rows.map(row=><option key={row.customer_id} value={row.customer_id}>{row.name} · {row.customer_id}</option>)}</select></div>{editCandidate && <form onSubmit={saveCustomerEdit}><div className="two-col"><label>Name<input required minLength="2" value={editCandidate.name} onChange={e=>setEditCandidate({...editCandidate,name:e.target.value})}/></label><label>Father's name<input required minLength="2" value={editCandidate.father_name} onChange={e=>setE
+-      <form className="panel form-panel" onSubmit={submit}>
++      <form className="panel form-panel register-form" onSubmit={submit}>
+         <div className="panel-head"><div><span className="section-kicker">Secure onboarding</span><h2>Register a customer</h2></div><ShieldCheck size={22} /></div>
+         <div className="segmented-control"><button type="button" className={registrationMode === 'aadhaar' ? 'active' : ''} onClick={() => setRegistrationMode('aadhaar')}>Aadhaar registration</button><button type="button" className={registrationMode === 'manual' ? 'active' : ''} onClick={() => { setRegistrationMode('manual'); setForm({ ...form, aadhaar: '' }); }}>Manual registration</button></div>
+         <p className="form-intro">{registrationMode === 'aadhaar' ? providerStatus.configured ? `Aadhaar is encrypted and ${providerStatus.provider} sends an OTP to the Aadhaar-linked mobile. The profile remains pending until that OTP succeeds.` : 'Automatic Aadhaar verification needs an authorised AUA/KUA provider. Until connected, Aadhaar remains pending; a normal SMS is not presented as UIDAI verification.' : 'Create the profile without Aadhaar. It remains Pending Verification until an Owner or Manager approves it.'}</p>
+-        <div className="two-col">
+-          <label>Name<input required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></label>
+-          <label>Father's name<input required value={form.father_name} onChange={e => setForm({ ...form, father_name: e.target.value })} /></label>
+-          <label>Mobile<input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" value={form.mobile} onChange={e => setForm({ ...form, mobile: e.target.value.replace(/\D/g, '') })} /></label>
+-          {registrationMode === 'aadhaar' && <><label>Aadhaar<input required inputMode="numeric" minLength="12" maxLength="12" pattern="[0-9]{12}" value={form.aadhaar} onChange={e => setForm({ ...form, aadhaar: e.target.value.replace(/\D/g, '') })} /></label><label>Purpose disclosed<input required minLength="5" value={form.aadhaar_consent_purpose} onChange={e=>setForm({...form,aadhaar_consent_purpose:e.target.value})}/></label><label>Consent reference<input required minLength="3" placeholder="Signed form / OTP reference" value={form.aadhaar_consent_reference} onChange={e=>setForm({...form,aadhaar_consent_reference:e.target.value})}/></label><label className="check-row"><input type="checkbox" checked={form.aadhaar_consent_given} onChange={e=>setForm({...form,aadhaar_consent_given:e.target.checked})}/> Customer gave informed consent for this disclosed purpose</label></>}
+-          <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code} value={a.code}>{a.name}</option>)}</select></label>
+-          <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
++        <div className="form-section">
++          <h3 className="form-section-title">Customer details</h3>
++          <div className="form-grid">
++            <label>Name<input required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></label>
++            <label>Father's name<input required value={form.father_name} onChange={e => setForm({ ...form, father_name: e.target.value })} /></label>
++            <label>Mobile number
++              <div className="input-action">
++                <input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" placeholder="10-digit mobile" value={form.mobile} onChange={e => setForm({ ...form, mobile: e.target.value.replace(/\D/g, '') })} />
++                {smsStatus.required && (smsOtp.phase === 'idle'
++                  ? <button type="button" className="primary small" disabled={smsOtp.busy || !validMobile} onClick={() => sendSmsOtp(false)}>{smsOtp.busy ? 'Sending…' : 'Send OTP'}</button>
++                  : <span className={`otp-chip ${smsOtp.phase}`}>{smsOtp.phase === 'verified' ? 'Verified' : 'OTP sent'}</span>)}
++              </div>
++            </label>
++            <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code} value={a.code}>{a.name}</option>)}</select></label>
++          </div>
+         </div>
+         <CustomerSuggestions matches={previousMatches} onSelect={usePreviousCustomer} />
+-        {smsStatus.required && <div className={`servicing-box sms-otp-box otp-${smsOtp.phase}`}>
+-          <div className="otp-head"><h3>Mobile number verification</h3><span className={`otp-chip ${smsOtp.phase}`}>{smsOtp.phase === 'verified' ? 'Verified' : smsOtp.phase === 'sent' ? 'OTP sent' : 'Not verified'}</span></div>
+-          {smsStatus.development_mode && <small className="otp-mode">No SMS service is connected, so the code is shown below instead of being sent to the phone.</small>}
+-          {smsOtp.phase === 'idle' && <div className="otp-step">
+-            <span className="otp-step-no">1</span>
+-            <div><strong>Send the OTP</strong><small>{/^[6-9][0-9]{9}$/.test(form.mobile) ? `A 6-digit code will be sent for ${form.mobile}.` : 'Enter the 10-digit mobile number above first.'}</small></div>
+-            <button type="button" className="primary small" disabled={smsOtp.busy || !/^[6-9][0-9]{9}$/.test(form.mobile)} onClick={() => sendSmsOtp(false)}>{smsOtp.busy ? 'Sending…' : 'Send OTP'}</button>
+-          </div>}
+-          {smsOtp.phase === 'sent' && <>
+-            {smsOtp.dev_otp && <div className="otp-code-display"><small>OTP for {smsOtp.mobile_masked}</small><strong>{smsOtp.dev_otp}</strong></div>}
+-            <div className="otp-step">
+-              <span className="otp-step-no">2</span>
+-              <div><strong>Enter the 6-digit code</strong><small>{otpExpired ? 'This OTP has expired. Send a new one.' : otpLocked ? 'This OTP is locked. Send a new one.' : `${smsOtp.attempts_remaining} attempt${smsOtp.attempts_remaining === 1 ? '' : 's'} left · ${smsOtp.resends_remaining} resend${smsOtp.resends_remaining === 1 ? '' : 's'} left`}</small></div>
+-            </div>
+-            <div className="action-row">
+-              <input className="otp-input" inputMode="numeric" autoComplete="one-time-code" maxLength="6" placeholder="------" disabled={otpExpired || otpLocked} value={smsOtp.otp} onChange={e => setSmsOtp({ ...smsOtp, otp: e.target.value.replace(/\D/g, '').slice(0, 6) })} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); verifySmsOtp(); } }} />
+-              <button type="button" className="primary small" disabled={smsOtp.busy || otpExpired || otpLocked || smsOtp.otp.length !== 6} onClick={verifySmsOtp}>{smsOtp.busy ? 'Please wait…' : 'Verify'}</button>
+-              <button type="button" className="ghost small" disabled={smsOtp.busy || (!(otpExpired || otpLocked) && (resendInSeconds > 0 || smsOtp.resends_remaining === 0))} onClick={() => sendSmsOtp(!(otpExpired || otpLocked))}>{otpExpired || otpLocked ? 'Send a new OTP' : resendInSeconds > 0 ? `Resend in ${resendInSeconds}s` : 'Resend OTP'}</button>
++        {smsStatus.required && <div className="form-section">
++          <h3 className="form-section-title">Mobile verification</h3>
++          <div className={`otp-card otp-${smsOtp.phase}`}>
++            <div className="otp-head">
++              <div className="otp-title"><strong>{smsOtp.phase === 'verified' ? 'Mobile number verified' : smsOtp.phase === 'sent' ? 'Enter the OTP' : 'Verify the mobile number'}</strong>{smsStatus.development_mode && smsOtp.phase !== 'verified' && <small>No SMS service is connected, so the code appears here instead of being sent to the phone.</small>}</div>
++              <span className={`otp-chip ${smsOtp.phase}`}>{smsOtp.phase === 'verified' ? 'Verified' : smsOtp.phase === 'sent' ? 'OTP sent' : 'Not verified'}</span>
+             </div>
+-          </>}
+-          {smsOtp.phase === 'verified' && <div className="otp-step done">
+-            <span className="otp-step-no">✓</span>
+-            <div><strong>Mobile number verified</strong><small>{smsOtp.mobile_masked} is confirmed. This OTP works for one registration only.</small></div>
+-          </div>}
+-          {smsOtp.error && <div className="error" role="alert">{smsOtp.error}</div>}
+-          {smsOtp.phase !== 'idle' && <button type="button" className="link-button otp-clear" onClick={() => setSmsOtp(emptySmsOtp)}>Clear and start over</button>}
++            {smsOtp.phase === 'idle' && <div className="otp-row">
++              <small>{validMobile ? `Press Send OTP to get a 6-digit code for ${form.mobile}.` : 'Type the 10-digit mobile number above, then press Send OTP.'}</small>
++              <button type="button" className="primary small" disabled={smsOtp.busy || !validMobile} onClick={() => sendSmsOtp(false)}>{smsOtp.busy ? 'Sending…' : 'Send OTP'}</button>
++            </div>}
++            {smsOtp.phase === 'sent' && <>
++              {smsOtp.dev_otp && <div className="otp-code-display"><small>OTP for {smsOtp.mobile_masked}</small><strong>{smsOtp.dev_otp}</strong></div>}
++              <small>{otpExpired ? 'This OTP has expired. Send a new one.' : otpLocked ? 'This OTP is locked. Send a new one.' : `Enter the 6-digit code · ${smsOtp.attempts_remaining} attempt${smsOtp.attempts_remaining === 1 ? '' : 's'} left · ${smsOtp.resends_remaining} resend${smsOtp.resends_remaining === 1 ? '' : 's'} left`}</small>
++              <div className="otp-row">
++                <input className="otp-input" inputMode="numeric" autoComplete="one-time-code" maxLength="6" placeholder="------" disabled={otpExpired || otpLocked} value={smsOtp.otp} onChange={e => setSmsOtp({ ...smsOtp, otp: e.target.value.replace(/\D/g, '').slice(0, 6) })} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); verifySmsOtp(); } }} />
++                <button type="button" className="primary small" disabled={smsOtp.busy || otpExpired || otpLocked || smsOtp.otp.length !== 6} onClick={verifySmsOtp}>{smsOtp.busy ? 'Please wait…' : 'Verify'}</button>
++                <button type="button" className="ghost small" disabled={smsOtp.busy || (!(otpExpired || otpLocked) && (resendInSeconds > 0 || smsOtp.resends_remaining === 0))} onClick={() => sendSmsOtp(!(otpExpired || otpLocked))}>{otpExpired || otpLocked ? 'Send a new OTP' : resendInSeconds > 0 ? `Resend in ${resendInSeconds}s` : 'Resend OTP'}</button>
++              </div>
++            </>}
++            {smsOtp.phase === 'verified' && <small>{smsOtp.mobile_masked} is confirmed. This OTP works for one registration only.</small>}
++            {smsOtp.error && <div className="error" role="alert">{smsOtp.error}</div>}
++            {smsOtp.phase !== 'idle' && <button type="button" className="link-button otp-clear" onClick={() => setSmsOtp(emptySmsOtp)}>Clear and start over</button>}
++          </div>
+         </div>}
+-        <label>Address<textarea required value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></label>
+-        <label>Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
++        {registrationMode === 'aadhaar' && <div className="form-section">
++          <h3 className="form-section-title">Aadhaar and consent</h3>
++          <div className="form-grid">
++            <label>Aadhaar number<input required inputMode="numeric" minLength="12" maxLength="12" pattern="[0-9]{12}" placeholder="12-digit Aadhaar" value={form.aadhaar} onChange={e => setForm({ ...form, aadhaar: e.target.value.replace(/\D/g, '') })} /></label>
++            <label>Purpose disclosed<input required minLength="5" value={form.aadhaar_consent_purpose} onChange={e => setForm({ ...form, aadhaar_consent_purpose: e.target.value })} /></label>
++            <label className="check-row span-2"><input type="checkbox" checked={form.aadhaar_consent_given} onChange={e => setForm({ ...form, aadhaar_consent_given: e.target.checked })} /><span>Customer gave informed consent for this disclosed purpose</span></label>
++          </div>
++        </div>}
++        <div className="form-section">
++          <h3 className="form-section-title">Address and guarantor</h3>
++          <div className="form-grid">
++            <label className="span-2">Address<textarea required value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></label>
++            <label className="span-2">Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
++          </div>
++        </div>
+         {formError && <div className="error" role="alert">{formError}</div>}
+-        <button className="primary" disabled={saving}><Plus size={18} /> {saving ? 'Saving securely…' : registrationMode === 'aadhaar' ? 'Register and send Aadhaar OTP' : 'Create pending profile'}</button>
++        <div className="form-footer">
++          <div className="form-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
++          <button className="primary" disabled={saving}><Plus size={18} /> {saving ? 'Saving securely…' : 'Register'}</button>
++        </div>
+         {onboardingOtp.verification_id && <div className="servicing-box"><h3>Aadhaar OTP verification</h3><p>Customer {onboardingOtp.customer_id} · sent to {onboardingOtp.masked_destination || 'Aadhaar-linked mobile'}</p>{onboardingOtp.verified_at ? <div className="locked-note"><CheckCircle2 size={16}/> Verified at {new Date(onboardingOtp.verified_at).toLocaleString('en-IN')} · proof {onboardingOtp.verification_id}</div> : <><label>4 or 6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" value={onboardingOtp.otp} onChange={e=>setOnboardingOtp({...onboardingOtp,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/></label><div className="action-row"><button type="button" className="primary small" disabled={otpBusy || onboardingOtp.attempts_remaining===0 || ![4,6].includes(onboardingOtp.otp.length)} onClick={verify
+       </form>
+       <section className="panel">
+@@ -756,11 +790,7 @@
+   const [deleting, setDeleting] = useState(false);
+ 
+   async function load() {
+-    const cs = await api('/api/customers');
+-    const ls = await api('/api/loans');
+-    const ps = await api('/api/payments');
+-    const ve = await api('/api/verification-events');
+-    const il = await api('/api/identity-verifications');
++    const [cs, ls, ps, ve, il] = await Promise.all([api('/api/customers'), api('/api/loans'), api('/api/payments'), api('/api/verification-events'), api('/api/identity-verifications')]);
+     setCustomers(cs);
+     setLoans(ls);
+     setPayments(ps);
+@@ -904,12 +934,14 @@
+   const [adjustmentConfirmed, setAdjustmentConfirmed] = useState(false);
+   const [migration, setMigration] = useState(null);
+   const load = async () => {
+-    const b = await api('/api/bootstrap');
+-    const cs = await api('/api/customers');
+-    if (['owner','manager'].includes(user.role)) setProviderStatus(await api('/api/aadhaar/provider-status'));
++    const [b, cs, provider, loanRows] = await Promise.all([
++      api('/api/bootstrap'), api('/api/customers'),
++      ['owner','manager'].includes(user.role) ? api('/api/aadhaar/provider-status') : Promise.resolve(null),
++      api('/api/loans')
++    ]);
++    if (provider) setProviderStatus(provider);
+     setBoot(b);
+     setCustomers(cs);
+-    const loanRows = await api('/api/loans');
+     setRows(loanRows.map(row=>({...row,contract_version:row.contract_version ?? 1})));
+     setForm(f => ({ ...f, customer_id: f.customer_id, collector_id: f.collector_id || b.collectors[0]?.id || '' }));
+     setService(s => ({ ...s, loan_id: s.loan_id || loanRows[0]?.loan_id || '' }));
+--- prev/client/src/styles.css
++++ new/client/src/styles.css
+@@ -1069,3 +1069,39 @@
+ .otp-code-display strong { font-size: 28px; letter-spacing: .35em; color: #7a5b00; }
+ .otp-mode { display: block; margin-bottom: 4px; }
+ .otp-clear { margin-top: 6px; }
++
++/* Customer registration: aligned sections, no scattered boxes */
++.register-form { display: grid; gap: 18px; align-content: start; }
++.register-form label { margin: 0; }
++.register-form .form-intro { margin: 0; }
++.form-section { display: grid; gap: 14px; padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
++.form-section-title { margin: 0; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
++.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 18px; align-items: start; }
++.form-grid .span-2 { grid-column: 1 / -1; }
++.register-form .check-row { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); font-size: 13px; font-weight: 600; cursor: pointer; }
++.register-form .check-row input[type="checkbox"] { flex: 0 0 20px; width: 20px; height: 20px; min-height: 0; padding: 0; margin: 0; accent-color: var(--accent); }
++.input-action { display: flex; gap: 8px; align-items: stretch; }
++.input-action input { flex: 1 1 auto; min-width: 0; }
++.input-action button, .input-action .otp-chip { flex: 0 0 auto; white-space: nowrap; align-self: center; }
++.otp-card { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-alt); }
++.otp-card.otp-verified { border-color: #86efac; background: #f0fdf4; }
++.otp-card .otp-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
++.otp-card .otp-title { display: grid; gap: 4px; }
++.otp-card .otp-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
++.otp-card .otp-row small { flex: 1 1 220px; }
++.otp-card .otp-input { flex: 0 0 170px; max-width: 170px; }
++.form-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 18px; padding-top: 4px; }
++.form-note { display: flex; align-items: center; gap: 8px; flex: 1 1 260px; color: var(--muted); font-size: 13px; }
++.form-footer .primary { min-width: 170px; }
++@media (max-width: 700px) { .form-grid { grid-template-columns: 1fr; } }
++/* Customers page: editor on top, form and registry side by side, no empty gaps */
++@media (min-width: 1101px) {
++  .customers-layout > .customer-editor, .customers-layout > .panel.full { grid-column: 1 / -1; }
++  .customers-layout > .form-panel { grid-column: 1; }
++  .customers-layout > .panel:not(.full):not(.form-panel) { grid-column: 2; }
++}
++
++/* Typography: Poppins with normal letter spacing */
++body, button, input, select, textarea { font-family: "Poppins", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; letter-spacing: 0; }
++h1, h2, h3, h4, .brand strong, .login-hero h1, .welcome-strip h2, .drawer-head h2 { font-family: "Poppins", ui-sans-serif, system-ui, sans-serif; letter-spacing: 0; font-weight: 700; }
++.kpi strong, .planner-result > strong { font-family: "Poppins", ui-sans-serif, system-ui, sans-serif; letter-spacing: 0; font-weight: 700; overflow-wrap: anywhere; }
+--- prev/client/index.html
++++ new/client/index.html
+@@ -8,7 +8,7 @@
+     <meta name="description" content="Sri Sakthi Thirumurugan Finance — premium lending operations platform." />
+     <link rel="preconnect" href="https://fonts.googleapis.com" />
+     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Sora:wght@500;600;700;800&display=swap" rel="stylesheet" />
++    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+     <title>Sri Sakthi Thirumurugan Finance</title>
+   </head>
+   <body>

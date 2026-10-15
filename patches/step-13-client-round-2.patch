@@ -1,0 +1,566 @@
+--- prev/server/main.py
++++ new/server/main.py
+@@ -160,6 +160,13 @@
+     print("[sms-otp] No SMS gateway configured: OTPs are shown on screen to staff (no SMS is sent).")
+ 
+ 
++# A balance below this many paise (Rs 1) is rounding dust: the amount shows as "Rs 0" on screen, so the loan is settled and closed
++# automatically (the few paise are booked to "Waiver and Correction Expense" with a visible record).
++AUTO_CLOSE_RESIDUAL_PAISE = int(os.getenv("AUTO_CLOSE_RESIDUAL_PAISE", "99"))
++# Manual round-off of the cash handed to the customer at disbursement may not exceed this many rupees either way.
++MAX_MANUAL_ROUND_OFF = 100
++
++
+ def validate_new_loan_rate(rate: float) -> None:
+     if not (MIN_MONTHLY_INTEREST_RATE <= rate <= MAX_MONTHLY_INTEREST_RATE):
+         raise HTTPException(422, f"Monthly interest rate must be between {MIN_MONTHLY_INTEREST_RATE:g}% and {MAX_MONTHLY_INTEREST_RATE:g}%")
+@@ -335,6 +342,7 @@
+     interest_method: str = "Upfront Monthly Flat"
+     processing_fee: float = Field(default=0, ge=0, le=10000000)
+     tax_rate: float = Field(default=0, ge=0, le=100)
++    round_off: float = Field(default=0, ge=-100, le=100)
+     first_due_date: Optional[str] = None
+     moratorium_periods: int = Field(default=0, ge=0, le=24)
+     moratorium_interest_capitalized: bool = True
+@@ -773,7 +781,8 @@
+         upfront_interest = (principal * monthly_rate * tenure_months).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+         fee = Decimal(str(payload.processing_fee)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+         tax = (fee * Decimal(str(payload.tax_rate)) / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+-        net_disbursed = principal - upfront_interest - fee - tax
++        round_off = Decimal(str(getattr(payload, "round_off", 0) or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
++        net_disbursed = principal - upfront_interest - fee - tax + round_off
+         if net_disbursed <= 0:
+             raise HTTPException(422, "Upfront interest, fee and tax cannot equal or exceed the sanctioned amount")
+         first_due = parse_date(payload.first_due_date) if payload.first_due_date else (borrow + timedelta(days=1) if payload.loan_type == "Daily 100-Day" else borrow + timedelta(days=7) if payload.loan_type == "Weekly" else add_months(borrow, 1))
+@@ -796,7 +805,7 @@
+         return {
+             "rows": rows, "emi": float(base_payment), "principal": float(principal),
+             "interest_total": float(upfront_interest), "processing_fee": float(fee), "tax": float(tax),
+-            "net_disbursed": float(net_disbursed), "apr": float(annual_apr.quantize(Decimal("0.0001"))),
++            "net_disbursed": float(net_disbursed), "round_off": float(round_off), "apr": float(annual_apr.quantize(Decimal("0.0001"))),
+             "first_due_date": iso(first_due), "maturity_date": rows[-1]["due_date"],
+             "total_repayment": float(principal), "monthly_interest_rate": float(payload.interest_rate),
+             "tenure_months": float(tenure_months.quantize(Decimal("0.0001"))),
+@@ -848,7 +857,8 @@
+         previous_due = due
+     fee = Decimal(str(payload.processing_fee)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+     tax = (fee * Decimal(str(payload.tax_rate)) / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+-    net_disbursed = principal - fee - tax
++    round_off = Decimal(str(getattr(payload, "round_off", 0) or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
++    net_disbursed = principal - fee - tax + round_off
+     cashflows = [-net_disbursed] + [Decimal(str(row["payment"])) for row in rows if row["payment"] > 0]
+     irr = periodic_irr(cashflows)
+     annual_apr = ((Decimal(1) + irr) ** int(periods_per_year) - 1) * 100
+@@ -1220,7 +1230,7 @@
+     remaining_installments = max(len(repayment_rows) - installments_paid, 0)
+     frequency = "Daily" if loan["loan_type"] == "Daily 100-Day" else "Weekly" if loan["loan_type"] == "Weekly" else "Monthly"
+     status_value = loan.get("status", "Active")
+-    if balance <= 0:
++    if balance <= 0 or balance * 100 <= AUTO_CLOSE_RESIDUAL_PAISE:
+         status_value = "Closed"
+     elif loan["loan_type"] == "Daily 100-Day" and elapsed > 130:
+         status_value = "Overdue"
+@@ -1543,6 +1553,45 @@
+ 
+ 
+ AUTO_CLOSE_REASON = "Balance reached zero - closed automatically"
++AUTO_CLOSE_ROUNDING_REASON = "Repayment complete (balance below Rs 1 is rounding) - closed automatically"
++
++
++async def settle_rounding_residual(loan: dict[str, Any], balances: dict[str, int]) -> None:
++    """Book a leftover balance below Rs 1 (rounding dust) so the loan balance becomes exactly 0. Idempotent."""
++    amount = balances["balance_paise"]
++    loan_id = loan["loan_id"]
++    rounding_key = f"ROUNDING-{loan_id}-{amount}"
++    if await find_one("writeoffs", {"rounding_key": rounding_key}):
++        return
++    remaining = amount
++    penalty = min(remaining, balances["penalty_balance_paise"]); remaining -= penalty
++    interest = min(remaining, balances["interest_balance_paise"]); remaining -= interest
++    principal = remaining
++    writeoff_id = f"WOF-{await next_sequence('WOF', 'writeoff_id', 'writeoffs'):08d}"
++    entry_id = f"JRN-{await next_sequence('JRN', 'entry_id', 'journal_entries'):09d}"
++    stamp = iso(now())
++    record = {
++        "writeoff_id": writeoff_id, "loan_id": loan_id, "amount": from_paise(amount), "kind": "Rounding", "rounding_key": rounding_key,
++        "reason": "Rounding balance below Rs 1 settled automatically because the repayment is complete",
++        "approval_reference": "AUTO-ROUNDING",
++        "allocation": {"penalty_paise": penalty, "interest_paise": interest, "principal_paise": principal},
++        "timestamp": stamp, "status": "Posted", "journal_entry_id": entry_id, "approved_by": "System",
++    }
++    lines = [ledger_line("5100", debit_paise=amount, loan_id=loan_id)]
++    if penalty: lines.append(ledger_line("1300", credit_paise=penalty, loan_id=loan_id))
++    if interest: lines.append(ledger_line("1200", credit_paise=interest, loan_id=loan_id))
++    if principal: lines.append(ledger_line("1100", credit_paise=principal, loan_id=loan_id))
++    system_user = {"id": "SYSTEM", "name": "System", "role": "system"}
++    description = f"Rounding balance settled on completion of {loan_id}"
++    if USE_MEMORY:
++        await insert_one("writeoffs", record)
++        await post_journal(entry_id, "loan_writeoff", writeoff_id, description, lines, system_user)
++    else:
++        async with await mongo_client.start_session() as session:
++            async with session.start_transaction():
++                await db.writeoffs.insert_one(deepcopy(record), session=session)
++                await post_journal(entry_id, "loan_writeoff", writeoff_id, description, lines, system_user, session=session)
++    await audit(None, "loan_rounding_settled", "loan", loan_id, record)
+ 
+ 
+ async def sync_loan_status(loan_id: str, allow_reopen: bool = False) -> Optional[str]:
+@@ -1562,11 +1611,15 @@
+         return None
+     balances = await loan_component_balances(loan)
+     stamp = iso(now())
+-    if balances["balance_paise"] <= 0 and current != "Closed":
+-        fields = {"status": "Closed", "closed_at": stamp, "closed_by": "System", "closure_reason": AUTO_CLOSE_REASON}
+-        event_type, reason, outcome = "Loan Closed", AUTO_CLOSE_REASON, "Closed"
++    dust = 0 < balances["balance_paise"] <= AUTO_CLOSE_RESIDUAL_PAISE
++    if (balances["balance_paise"] <= 0 or dust) and current != "Closed":
++        close_reason = AUTO_CLOSE_ROUNDING_REASON if dust else AUTO_CLOSE_REASON
++        if dust:
++            await settle_rounding_residual(loan, balances)
++        fields = {"status": "Closed", "closed_at": stamp, "closed_by": "System", "closure_reason": close_reason}
++        event_type, reason, outcome = "Loan Closed", close_reason, "Closed"
+         guard = {"loan_id": loan_id, "status": {"$nin": ["Closed", "Written Off"]}}
+-    elif allow_reopen and balances["balance_paise"] > 0 and current == "Closed":
++    elif allow_reopen and balances["balance_paise"] > AUTO_CLOSE_RESIDUAL_PAISE and current == "Closed":
+         fields = {"status": "Active", "reopened_at": stamp, "reopened_reason": "A reversal made the balance outstanding again"}
+         event_type, reason, outcome = "Loan Reopened", fields["reopened_reason"], "Reopened"
+         guard = {"loan_id": loan_id, "status": "Closed"}
+@@ -2601,7 +2654,19 @@
+ 
+ @app.get("/api/loans")
+ async def loans(q: str = "", status_filter: str = "", loan_type: str = "", area: str = "", collector_id: str = "", user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+-    rows = [await enrich_loan(x) for x in await find_many("loans")]
++    raw_loans = await find_many("loans")
++    rows = [await enrich_loan(x) for x in raw_loans]
++    healed = False
++    for raw, row in zip(raw_loans, rows):
++        # Repayment already complete but the stored status is still Active/Overdue: close it now (never breaks the list).
++        if row["status"] == "Closed" and raw.get("status", "Active") not in {"Closed", "Written Off"}:
++            try:
++                healed = bool(await sync_loan_status(raw["loan_id"])) or healed
++            except Exception as exc:
++                print(f"[auto-close] could not close {raw.get('loan_id')}: {exc}")
++    if healed:
++        raw_loans = await find_many("loans")
++        rows = [await enrich_loan(x) for x in raw_loans]
+     customers_map = {c["customer_id"]: await customer_view(c) for c in await find_many("customers")}
+     out = []
+     for loan in rows:
+@@ -2640,7 +2705,7 @@
+     schedule = build_amortization(payload, borrow)
+     return {
+         "quote_id": f"QTE-{uuid.uuid4().hex[:12].upper()}", "generated_at": iso(now()),
+-        "sanctioned_amount": payload.principal, "net_disbursed_amount": schedule["net_disbursed"],
++        "sanctioned_amount": payload.principal, "net_disbursed_amount": schedule["net_disbursed"], "round_off": schedule.get("round_off", 0),
+         "monthly_interest_rate": payload.interest_rate, "interest_method": payload.interest_method,
+         "apr": schedule["apr"], "processing_fee": schedule["processing_fee"], "tax_on_fee": schedule["tax"],
+         "periodic_instalment": schedule["emi"], "total_interest": schedule["interest_total"],
+@@ -3014,7 +3079,7 @@
+         "contract_version": 2,
+         "interest_method": payload.interest_method,
+         "processing_fee": schedule["processing_fee"], "tax_rate": payload.tax_rate, "tax_amount": schedule["tax"],
+-        "net_disbursed": schedule["net_disbursed"], "apr": schedule["apr"],
++        "net_disbursed": schedule["net_disbursed"], "round_off": schedule.get("round_off", 0), "apr": schedule["apr"],
+         "first_due_date": schedule["first_due_date"], "maturity_date": schedule["maturity_date"],
+         "moratorium_periods": payload.moratorium_periods, "moratorium_interest_capitalized": payload.moratorium_interest_capitalized,
+         "preclosure_charge_rate": payload.preclosure_charge_rate, "late_fee": payload.late_fee,
+@@ -3040,6 +3105,11 @@
+         lines.append(ledger_line("2100", credit_paise=tax_paise, loan_id=loan_id))
+     if interest_paise:
+         lines.append(ledger_line("4000", credit_paise=interest_paise, loan_id=loan_id))
++    round_off_paise = to_paise(schedule.get("round_off", 0))
++    if round_off_paise > 0:
++        lines.append(ledger_line("5100", debit_paise=round_off_paise, loan_id=loan_id))
++    elif round_off_paise < 0:
++        lines.append(ledger_line("5100", credit_paise=-round_off_paise, loan_id=loan_id))
+     if USE_MEMORY:
+         await insert_one("loans", loan)
+         await insert_one("loan_schedules", {"loan_id": loan_id, "version": 1, "reason": "Origination", "created_at": iso(now()), **schedule})
+--- prev/client/src/main.jsx
++++ new/client/src/main.jsx
+@@ -138,6 +138,9 @@
+   const [notificationsOpen, setNotificationsOpen] = useState(false);
+   const [assistantOpen, setAssistantOpen] = useState(false);
+   const [selectedCustomerId, setSelectedCustomerId] = useState('');
++  const [selectedLoanId, setSelectedLoanId] = useState('');
++  const openCustomer = id => { setSelectedCustomerId(id); setView('profile'); };
++  const openLoan = id => { setSelectedLoanId(id); setView('loans'); };
+   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('stf_sidebar_collapsed') === 'true');
+   const api = useApi(setUser);
+   const t = lang === 'ta' ? {
+@@ -246,11 +249,11 @@
+         {notificationsOpen && <NotificationCenter api={api} onClose={() => setNotificationsOpen(false)} />}
+         {view === 'dashboard' && <Dashboard api={api} onNavigate={setView} onOpenCustomer={id => { setSelectedCustomerId(id); setView('profile'); }} user={user} />}
+         {view === 'customers' && <Customers api={api} user={user} notify={setToast} />}
+-        {view === 'profile' && <Customer360 api={api} initialCustomerId={selectedCustomerId} user={user} notify={setToast} />}
+-        {view === 'loans' && <Loans api={api} notify={setToast} user={user} />}
++        {view === 'profile' && <Customer360 api={api} initialCustomerId={selectedCustomerId} user={user} notify={setToast} onOpenLoan={openLoan} />}
++        {view === 'loans' && <Loans api={api} notify={setToast} user={user} initialLoanId={selectedLoanId} onInitialLoanConsumed={() => setSelectedLoanId('')} />}
+         {view === 'collections' && <Collections api={api} user={user} notify={setToast} />}
+         {view === 'planner' && <EmiPlanner />}
+-        {view === 'search' && <SearchView api={api} />}
++        {view === 'search' && <SearchView api={api} onOpenCustomer={openCustomer} onOpenLoan={openLoan} />}
+         {view === 'reports' && <Reports api={api} />}
+         {view === 'accounting' && <Accounting api={api} user={user} notify={setToast} />}
+         {view === 'audit' && <Audit api={api} />}
+@@ -432,6 +435,7 @@
+   const [mobile, setMobile] = useState('');
+   const matches = useMemo(() => findCustomerMatches(customers, name, mobile), [customers, name, mobile]);
+   const selected = customers.find(c => c.customer_id === value);
++  useEffect(() => { if (!value) { setName(''); setMobile(''); } }, [value]);
+   function pick(customer) {
+     setName(customer.name || '');
+     setMobile(customer.mobile || '');
+@@ -671,24 +675,33 @@
+           <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
+         </div>
+         <CustomerSuggestions matches={previousMatches} onSelect={usePreviousCustomer} />
+-        {smsStatus.required && <div className="servicing-box sms-otp-box">
+-          <h3>Mobile verification by SMS OTP</h3>
+-          {smsStatus.development_mode && <div className="locked-note"><AlertTriangle size={16} /> On-screen OTP mode: no SMS gateway is connected, so no SMS is sent. The OTP appears below after you press Send, to confirm with the customer. This does not prove the customer's phone.</div>}
+-          {smsOtp.phase === 'verified'
+-            ? <div className="locked-note"><CheckCircle2 size={16} /> {smsOtp.mobile_masked} verified by SMS OTP. This OTP can be used for one registration only.</div>
+-            : smsOtp.phase === 'sent'
+-              ? <>
+-                  <small>OTP sent to {smsOtp.mobile_masked}. Ask the customer for the 6-digit code. {otpExpired ? 'This OTP has expired.' : otpLocked ? 'This OTP is locked.' : `${smsOtp.attempts_remaining} attempt${smsOtp.attempts_remaining === 1 ? '' : 's'} left, ${smsOtp.resends_remaining} resend${smsOtp.resends_remaining === 1 ? '' : 's'} left.`}</small>
+-                  {smsOtp.dev_otp && <div className="locked-note dev-otp">OTP: <strong>{smsOtp.dev_otp}</strong></div>}
+-                  <div className="action-row">
+-                    <input className="otp-input" inputMode="numeric" autoComplete="one-time-code" maxLength="6" placeholder="6-digit OTP" disabled={otpExpired || otpLocked} value={smsOtp.otp} onChange={e => setSmsOtp({ ...smsOtp, otp: e.target.value.replace(/\D/g, '').slice(0, 6) })} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); verifySmsOtp(); } }} />
+-                    <button type="button" className="primary small" disabled={smsOtp.busy || otpExpired || otpLocked || smsOtp.otp.length !== 6} onClick={verifySmsOtp}>{smsOtp.busy ? 'Please wait…' : 'Verify OTP'}</button>
+-                    <button type="button" className="ghost small" disabled={smsOtp.busy || (!(otpExpired || otpLocked) && (resendInSeconds > 0 || smsOtp.resends_remaining === 0))} onClick={() => sendSmsOtp(!(otpExpired || otpLocked))}>{otpExpired || otpLocked ? 'Send a new OTP' : resendInSeconds > 0 ? `Resend in ${resendInSeconds}s` : 'Resend OTP'}</button>
+-                  </div>
+-                </>
+-              : <div className="action-row"><button type="button" className="ghost" disabled={smsOtp.busy || !/^[6-9][0-9]{9}$/.test(form.mobile)} onClick={() => sendSmsOtp(false)}>{smsOtp.busy ? 'Sending…' : 'Send OTP by SMS'}</button><small>{/^[6-9][0-9]{9}$/.test(form.mobile) ? 'The customer receives a 6-digit code valid for 5 minutes.' : 'Enter the 10-digit mobile number above first.'}</small></div>}
+-          {smsOtp.error && <div className="error" role="alert">{smsOtp.error}</div>}
+-        </div>}
++        {smsStatus.required && <div className={`servicing-box sms-otp-box otp-${smsOtp.phase}`}>
++          <div className="otp-head"><h3>Mobile number verification</h3><span className={`otp-chip ${smsOtp.phase}`}>{smsOtp.phase === 'verified' ? 'Verified' : smsOtp.phase === 'sent' ? 'OTP sent' : 'Not verified'}</span></div>
++          {smsStatus.development_mode && <small className="otp-mode">No SMS service is connected, so the code is shown below instead of being sent to the phone.</small>}
++          {smsOtp.phase === 'idle' && <div className="otp-step">
++            <span className="otp-step-no">1</span>
++            <div><strong>Send the OTP</strong><small>{/^[6-9][0-9]{9}$/.test(form.mobile) ? `A 6-digit code will be sent for ${form.mobile}.` : 'Enter the 10-digit mobile number above first.'}</small></div>
++            <button type="button" className="primary small" disabled={smsOtp.busy || !/^[6-9][0-9]{9}$/.test(form.mobile)} onClick={() => sendSmsOtp(false)}>{smsOtp.busy ? 'Sending…' : 'Send OTP'}</button>
++          </div>}
++          {smsOtp.phase === 'sent' && <>
++            {smsOtp.dev_otp && <div className="otp-code-display"><small>OTP for {smsOtp.mobile_masked}</small><strong>{smsOtp.dev_otp}</strong></div>}
++            <div className="otp-step">
++              <span className="otp-step-no">2</span>
++              <div><strong>Enter the 6-digit code</strong><small>{otpExpired ? 'This OTP has expired. Send a new one.' : otpLocked ? 'This OTP is locked. Send a new one.' : `${smsOtp.attempts_remaining} attempt${smsOtp.attempts_remaining === 1 ? '' : 's'} left · ${smsOtp.resends_remaining} resend${smsOtp.resends_remaining === 1 ? '' : 's'} left`}</small></div>
++            </div>
++            <div className="action-row">
++              <input className="otp-input" inputMode="numeric" autoComplete="one-time-code" maxLength="6" placeholder="------" disabled={otpExpired || otpLocked} value={smsOtp.otp} onChange={e => setSmsOtp({ ...smsOtp, otp: e.target.value.replace(/\D/g, '').slice(0, 6) })} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); verifySmsOtp(); } }} />
++              <button type="button" className="primary small" disabled={smsOtp.busy || otpExpired || otpLocked || smsOtp.otp.length !== 6} onClick={verifySmsOtp}>{smsOtp.busy ? 'Please wait…' : 'Verify'}</button>
++              <button type="button" className="ghost small" disabled={smsOtp.busy || (!(otpExpired || otpLocked) && (resendInSeconds > 0 || smsOtp.resends_remaining === 0))} onClick={() => sendSmsOtp(!(otpExpired || otpLocked))}>{otpExpired || otpLocked ? 'Send a new OTP' : resendInSeconds > 0 ? `Resend in ${resendInSeconds}s` : 'Resend OTP'}</button>
++            </div>
++          </>}
++          {smsOtp.phase === 'verified' && <div className="otp-step done">
++            <span className="otp-step-no">✓</span>
++            <div><strong>Mobile number verified</strong><small>{smsOtp.mobile_masked} is confirmed. This OTP works for one registration only.</small></div>
++          </div>}
++          {smsOtp.error && <div className="error" role="alert">{smsOtp.error}</div>}
++          {smsOtp.phase !== 'idle' && <button type="button" className="link-button otp-clear" onClick={() => setSmsOtp(emptySmsOtp)}>Clear and start over</button>}
++        </div>}
+         <label>Address<textarea required value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></label>
+         <label>Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
+         {formError && <div className="error" role="alert">{formError}</div>}
+@@ -730,7 +743,7 @@
+   );
+ }
+ 
+-function Customer360({ api, initialCustomerId = '', user, notify }) {
++function Customer360({ api, initialCustomerId = '', user, notify, onOpenLoan }) {
+   const [customers, setCustomers] = useState([]);
+   const [loans, setLoans] = useState([]);
+   const [payments, setPayments] = useState([]);
+@@ -814,7 +827,7 @@
+           <Metric icon={CheckCircle2} label="Total repaid" value={money(totals.paid)} />
+           <Metric icon={BadgeIndianRupee} label="Outstanding" value={money(totals.balance)} />
+         </div>
+-        <LoanTable rows={customerLoans} />
++        <LoanTable rows={customerLoans} onView={onOpenLoan} />
+         <div className="locked-note">Completed plans are marked Closed and retained as financial history. They are never deleted. The same customer profile may simultaneously hold daily, weekly, and monthly plans.</div>
+       </section>
+ 
+@@ -837,7 +850,38 @@
+   );
+ }
+ 
+-function Loans({ api, notify, user }) {
++const emptyLoanFilters = { q: '', month: '', area: '', min: '', max: '', status: '', type: '', collector: '' };
++const emptyIdentity = { purpose: 'Identity verification before loan disbursal', consent_reference: '', owner_notes: '', verification_id: '', otp: '', attempts_remaining: 3, resends_remaining: 3, expires_at: '', resend_available_at: '' };
++
++function filterLoanBook(rows, filters) {
++  const q = (filters.q || '').trim().toLowerCase();
++  const min = filters.min === '' || filters.min === undefined ? null : Number(filters.min);
++  const max = filters.max === '' || filters.max === undefined ? null : Number(filters.max);
++  return rows.filter(loan => {
++    if (q && !`${loan.loan_id} ${loan.customer_id} ${loan.customer_name || ''} ${loan.mobile || ''} ${loan.area_code || loan.area || ''} ${loan.area_name || ''}`.toLowerCase().includes(q)) return false;
++    if (filters.status && loan.status !== filters.status) return false;
++    if (filters.type && loan.loan_type !== filters.type) return false;
++    if (filters.area && (loan.area_code || loan.area) !== filters.area) return false;
++    if (filters.collector && loan.collector_id !== filters.collector) return false;
++    if (filters.month && (!loan.borrow_date || indiaDayKey(loan.borrow_date).slice(0, 7) !== filters.month)) return false;
++    if (min !== null && Number.isFinite(min) && Number(loan.principal) < min) return false;
++    if (max !== null && Number.isFinite(max) && Number(loan.principal) > max) return false;
++    return true;
++  });
++}
++
++function summarizeLoans(rows) {
++  return rows.reduce((total, loan) => ({ count: total.count + 1, principal: total.principal + Number(loan.principal || 0), paid: total.paid + Number(loan.paid || 0), balance: total.balance + Number(loan.balance || 0) }), { count: 0, principal: 0, paid: 0, balance: 0 });
++}
++
++// The manual round-off (in rupees) that moves `base` to a multiple of `unit`. Used only when the user presses a button.
++function roundOffTo(base, unit, direction) {
++  const scaled = Number(base) / unit;
++  const target = (direction === 'down' ? Math.floor(scaled + 1e-9) : direction === 'up' ? Math.ceil(scaled - 1e-9) : Math.round(scaled)) * unit;
++  return Math.round((target - Number(base)) * 100) / 100;
++}
++
++function Loans({ api, notify, user, initialLoanId = '', onInitialLoanConsumed = () => {} }) {
+   const [rows, setRows] = useState([]);
+   const [boot, setBoot] = useState({ collectors: [], loan_types: [] });
+   const [customers, setCustomers] = useState([]);
+@@ -847,6 +891,8 @@
+   const [identityError, setIdentityError] = useState('');
+   const [identityBusy, setIdentityBusy] = useState(false);
+   const [quote, setQuote] = useState(null);
++  const [filters, setFilters] = useState(emptyLoanFilters);
++  const [roundOff, setRoundOff] = useState('');
+   const [loanDetails, setLoanDetails] = useState(null);
+   const [detailsBusy, setDetailsBusy] = useState(false);
+   const [closure, setClosure] = useState(null);
+@@ -869,21 +915,31 @@
+     setService(s => ({ ...s, loan_id: s.loan_id || loanRows[0]?.loan_id || '' }));
+   };
+   useEffect(() => { load(); }, []);
+-  useEffect(() => { setQuote(null); }, [form]);
++  useEffect(() => { setQuote(null); setRoundOff(''); }, [form]);
++  useEffect(() => { setIdentity(emptyIdentity); setIdentityError(''); }, [form.customer_id]);
++  useEffect(() => { if (initialLoanId) { openLoanDetails(initialLoanId).finally(onInitialLoanConsumed); } }, []);
+   async function submit(e) {
+     e.preventDefault();
+     setLoanError('');
+-    const body = { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null };
++    const body = { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null, round_off: Number(roundOff) || 0 };
+     setSavingLoan(true);
+     try {
+       await api('/api/loans', { method: 'POST', body: JSON.stringify(body) });
+       notify('Loan disbursed and acknowledgement ready.');
+       setQuote(null);
++      setRoundOff('');
++      setIdentity(emptyIdentity);
++      setIdentityError('');
++      setForm(current => ({ ...current, customer_id: '', identity_verification_id: null, kfs_acknowledgement_reference: '', processing_fee: 0, late_fee: 0, first_due_date: '' }));
+       await load();
+     } catch (err) {
+       setLoanError(err.message || 'Loan could not be created.');
+     } finally { setSavingLoan(false); }
+   }
++  const filteredRows = useMemo(() => filterLoanBook(rows, filters), [rows, filters]);
++  const bookSummary = useMemo(() => summarizeLoans(filteredRows), [filteredRows]);
++  const areaOptions = useMemo(() => [...new Map(rows.filter(r => r.area_code || r.area).map(r => [r.area_code || r.area, r.area_name || r.area_code || r.area])).entries()].sort((a, b) => a[0].localeCompare(b[0])), [rows]);
++  const filtersActive = JSON.stringify(filters) !== JSON.stringify(emptyLoanFilters);
+   async function preview() {
+     setLoanError('');
+     const body = { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null };
+@@ -937,7 +993,7 @@
+       <form className="panel form-panel" onSubmit={submit}>
+         <div className="panel-head"><h2>Loan disbursement</h2><span>Auto Loan ID, installment and completion date</span></div>
+         <div className="locked-note">Automatic Aadhaar: {providerStatus.configured ? `${providerStatus.provider} connected` : 'Not configured — authorized AUA/KUA provider credentials required'}</div>
+-        <CustomerPicker customers={customers} value={form.customer_id} onChange={id => setForm({ ...form, customer_id: id })} />
++        <CustomerPicker customers={customers} value={form.customer_id} onChange={id => setForm({ ...form, customer_id: id, identity_verification_id: null })} />
+         <div className="two-col">
+           <label>Principal<input type="number" value={form.principal} onChange={e => setForm({ ...form, principal: e.target.value })} /></label>
+           <label>Monthly interest %<input type="number" required min="1" max="10" step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /><small>{Number(form.interest_rate) || 0}% per month, deducted before handover (default 2.14%, allowed 1% to 10%)</small></label>
+@@ -952,12 +1008,38 @@
+         {providerStatus.configured && <div className="servicing-box"><h3>Fresh Aadhaar OTP before money handover</h3><label>Purpose<input value={identity.purpose} onChange={e=>setIdentity({...identity,purpose:e.target.value})}/></label><label>Consent reference<input value={identity.consent_reference} onChange={e=>setIdentity({...identity,consent_reference:e.target.value})}/></label><label>Owner handover note<input value={identity.owner_notes} onChange={e=>setIdentity({...identity,owner_notes:e.target.value})}/></label><div className="action-row"><button type="button" className="ghost" disabled={identityBusy || !form.customer_id} onClick={startIdentityOtp}>{identityBusy ? 'Please wait…' : 'Send Aadhaar-linked OTP'}</button>{identity.verification_id && <><input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" placeholder="4 or 
+         <button type="button" className="ghost" disabled={!form.customer_id} onClick={preview}><FileText size={18}/> Preview APR, KFS and schedule</button>
+         {loanError && <div className="error" role="alert">{loanError}</div>}
++        {quote && <div className="servicing-box round-off-box">
++          <h3>Cash in hand: manual round-off</h3>
++          <div className="round-off-line"><span>Cash handed over (exact)</span><b>{money(quote.net_disbursed_amount)}</b></div>
++          <label>Round-off adjustment (₹): + gives more cash, − gives less<input type="number" step="0.01" min="-100" max="100" value={roundOff} onChange={e => setRoundOff(e.target.value)} placeholder="0.00" /></label>
++          <div className="action-row">
++            <button type="button" className="ghost small" onClick={() => setRoundOff(String(roundOffTo(quote.net_disbursed_amount, 1, 'nearest')))}>Nearest ₹1</button>
++            <button type="button" className="ghost small" onClick={() => setRoundOff(String(roundOffTo(quote.net_disbursed_amount, 1, 'down')))}>Down to ₹1</button>
++            <button type="button" className="ghost small" onClick={() => setRoundOff(String(roundOffTo(quote.net_disbursed_amount, 1, 'up')))}>Up to ₹1</button>
++            <button type="button" className="ghost small" onClick={() => setRoundOff(String(roundOffTo(quote.net_disbursed_amount, 10, 'nearest')))}>Nearest ₹10</button>
++            <button type="button" className="ghost small" onClick={() => setRoundOff('')}>No round-off</button>
++          </div>
++          <div className="round-off-line final"><span>Final cash in hand</span><b>{money(Number(quote.net_disbursed_amount) + (Number(roundOff) || 0))}</b></div>
++          <small>Nothing is rounded automatically. Only the round-off you choose here is applied (up to ₹100 either way).</small>
++        </div>}
+         <button className="primary" disabled={savingLoan || !form.customer_id || !form.collector_id}><FileText size={18} /> {savingLoan ? 'Creating loan…' : 'Create loan directly'}</button>
+-        {quote && <div className="locked-note">Monthly rate {quote.monthly_interest_rate}% · Interest deducted {money(quote.total_interest)} · Cash handed over {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
++        {quote && <div className="locked-note">Monthly rate {quote.monthly_interest_rate}% · Interest deducted {money(quote.total_interest)} · Cash handed over (exact) {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
+       </form>
+       <section className="panel">
+         <div className="panel-head"><h2>Loan book</h2><span>Multiple daily, weekly and monthly plans per customer</span></div>
+-        <LoanTable rows={rows} onView={openLoanDetails} viewBusy={detailsBusy} />
++        <div className="loan-filters">
++          <label className="filter-search">Search<div className="searchbox"><Search size={16} /><input value={filters.q} onChange={e => setFilters({ ...filters, q: e.target.value })} placeholder="Loan ID, customer, mobile, area" /></div></label>
++          <label>Month<input type="month" value={filters.month} onChange={e => setFilters({ ...filters, month: e.target.value })} /></label>
++          <label>Area<select value={filters.area} onChange={e => setFilters({ ...filters, area: e.target.value })}><option value="">All areas</option>{areaOptions.map(([code, name]) => <option key={code} value={code}>{code} · {name}</option>)}</select></label>
++          <label>Amount from (₹)<input type="number" min="0" inputMode="numeric" value={filters.min} onChange={e => setFilters({ ...filters, min: e.target.value })} placeholder="Min" /></label>
++          <label>Amount to (₹)<input type="number" min="0" inputMode="numeric" value={filters.max} onChange={e => setFilters({ ...filters, max: e.target.value })} placeholder="Max" /></label>
++          <label>Status<select value={filters.status} onChange={e => setFilters({ ...filters, status: e.target.value })}><option value="">All statuses</option>{['Active', 'Overdue', 'Closed', 'Written Off'].map(x => <option key={x}>{x}</option>)}</select></label>
++          <label>Plan<select value={filters.type} onChange={e => setFilters({ ...filters, type: e.target.value })}><option value="">All plans</option>{boot.loan_types.map(x => <option key={x}>{x}</option>)}</select></label>
++          <label>Collector<select value={filters.collector} onChange={e => setFilters({ ...filters, collector: e.target.value })}><option value="">All collectors</option>{boot.collectors.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
++          <button type="button" className="ghost small" disabled={!filtersActive} onClick={() => setFilters(emptyLoanFilters)}>Clear filters</button>
++        </div>
++        <div className="filter-summary"><span><b>{bookSummary.count}</b> of {rows.length} loans</span><span>Sanctioned <b>{money(bookSummary.principal)}</b></span><span>Collected <b>{money(bookSummary.paid)}</b></span><span>Outstanding <b>{money(bookSummary.balance)}</b></span></div>
++        {filteredRows.length ? <LoanTable rows={filteredRows} onView={openLoanDetails} viewBusy={detailsBusy} onOpenCustomer={undefined} /> : <div className="locked-note">No loans match these filters.</div>}
+         {rows.length > 0 && <div className="servicing-box">
+           <h3>Controlled loan servicing</h3>
+           <label>Loan<select value={service.loan_id} onChange={e=>{setService({...service,loan_id:e.target.value});setAdjustmentPreview(null);setAdjustmentConfirmed(false)}}>{rows.map(l=><option key={l.loan_id}>{l.loan_id}</option>)}</select></label>
+@@ -990,7 +1072,8 @@
+   const canClose = isOpenLoan && ['owner', 'manager'].includes(user.role);
+   function openQuick(kind) {
+     setQuickError('');
+-    const suggested = kind === 'Collection' ? Math.min(Number(loan.installment) || 0, Number(loan.balance) || 0) : 0;
++    let suggested = kind === 'Collection' ? Math.min(Number(loan.installment) || 0, Number(loan.balance) || 0) : 0;
++    if (kind === 'Collection' && Number(loan.balance) - suggested < 1) suggested = Number(loan.balance) || 0;
+     setQuick({ kind, amount: suggested > 0 ? String(suggested) : '', mode: 'Cash', reference: '' });
+   }
+   function reviewQuick(e) {
+@@ -1045,7 +1128,7 @@
+   const servicingHistory=[...adjustments,...events,...partPayments,...writeoffs].sort((a,b)=>new Date(b.timestamp || b.created_at)-new Date(a.timestamp || a.created_at));
+   return <><div className="modal-backdrop" onClick={onClose}><div className="modal loan-details-modal" onClick={e=>e.stopPropagation()}>
+     <div className="panel-head"><div><span className="section-kicker">Complete loan record</span><h2>{loan.loan_id} · {customer.name}</h2><span>{loan.frequency} plan · {customer.area_name || customer.area}</span></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>
+-    <div className="finance-strip"><Metric icon={BadgeIndianRupee} label="Sanctioned" value={money(loan.principal)}/><Metric icon={WalletCards} label="Cash handed over" value={money(loan.net_disbursed)}/><Metric icon={CheckCircle2} label="Paid" value={money(loan.paid)}/><Metric icon={CalendarClock} label="Outstanding" value={money(loan.balance)}/></div>
++    <div className="finance-strip"><Metric icon={BadgeIndianRupee} label="Sanctioned" value={money(loan.principal)}/><Metric icon={WalletCards} label={Number(loan.round_off) ? 'Cash handed over (incl. manual round-off)' : 'Cash handed over'} value={money(loan.net_disbursed)}/><Metric icon={CheckCircle2} label="Paid" value={money(loan.paid)}/><Metric icon={CalendarClock} label="Outstanding" value={money(loan.balance)}/></div>
+     <div className="loan-detail-grid"><div><span>Monthly interest</span><strong>{loan.interest_rate}%</strong></div><div><span>Interest deducted</span><strong>{money(loan.contract_interest)}</strong></div><div><span>Processing fee + tax</span><strong>{money(Number(loan.processing_fee||0)+Number(loan.tax_amount||0))}</strong></div><div><span>APR</span><strong>{loan.apr ? `${loan.apr}%` : 'Legacy contract'}</strong></div><div><span>Installment</span><strong>{money(loan.installment)}</strong></div><div><span>Remaining installments</span><strong>{loan.remaining_installments}</strong></div><div><span>Borrow date</span><strong>{date(loan.borrow_date)}</strong></div><div><span>Maturity</span><strong>{date(loan.maturity_date || loan.expected_completion)}</strong></div><div><span>Status</span><Status value={loan.status}/></div></div>
+     <div className="locked-note"><ShieldCheck size={16}/>{verification ? `OTP verified ${date(verification.verified_at || verification.attempted_at)} · Proof ${verification.verification_id}` : 'No Aadhaar OTP proof was linked to this loan disbursement.'}</div>
+     {closure?.closed && <div className="locked-note"><CheckCircle2 size={16}/>Closed {closure.closed_at ? date(closure.closed_at) : ''}{closure.final_receipt ? ` · Final receipt ${closure.final_receipt}` : ''}</div>}
+@@ -1058,7 +1141,7 @@
+       {quick && <form onSubmit={reviewQuick}>
+         <p className="form-intro">{quick.kind === 'Prepayment' ? 'Prepayment: an extra payment made ahead of schedule. The outstanding balance falls immediately and the remaining instalments are cleared in order, earliest first.' : 'Collection: records a payment received on this loan. The outstanding balance updates immediately.'}</p>
+         <div className="two-col">
+-          <label>{quick.kind} amount<input type="number" required min="0.01" step="0.01" max={loan.balance} value={quick.amount} onChange={e => setQuick({ ...quick, amount: e.target.value })} /><small>Outstanding {money(loan.balance)}</small></label>
++          <label>{quick.kind} amount<input type="number" required min="0.01" step="0.01" max={loan.balance} value={quick.amount} onChange={e => setQuick({ ...quick, amount: e.target.value })} /><small>Outstanding {money(loan.balance)}{quick.kind === 'Collection' && <> · <button type="button" className="link-button" onClick={() => setQuick({ ...quick, amount: Number(loan.balance).toFixed(2) })}>Pay full balance</button></>}</small></label>
+           <label>Payment mode<select value={quick.mode} onChange={e => setQuick({ ...quick, mode: e.target.value, reference: '' })}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>
+         </div>
+         {quick.mode === 'UPI' && <label>UPI transaction/reference ID<input required minLength="3" value={quick.reference} onChange={e => setQuick({ ...quick, reference: e.target.value })} /></label>}
+@@ -1154,7 +1237,7 @@
+               {lastPayment&&<small>Last payment: {money(lastPayment.amount)} via {lastPayment.mode}{lastPayment.payment_reference?` · Ref ${lastPayment.payment_reference}`:''} · {date(lastPayment.timestamp)}</small>}
+             </div>
+             <div className="two-col">
+-              <label>Amount received<input type="number" required min="0.01" step="0.01" max={selected.balance} value={amount} onChange={e => setAmount(e.target.value)} /></label>
++              <label>Amount received<input type="number" required min="0.01" step="0.01" max={selected.balance} value={amount} onChange={e => setAmount(e.target.value)} /><small>Outstanding {money(selected.balance)} · <button type="button" className="link-button" onClick={() => setAmount(Number(selected.balance).toFixed(2))}>Pay full balance</button></small></label>
+               <label>Received through<select value={mode} onChange={e => { setMode(e.target.value); setPaymentReference(''); }}><option>Cash</option><option>UPI</option></select></label>
+             </div>
+             {mode==='UPI'&&<label>UPI transaction/reference ID<input required minLength="3" maxLength="120" value={paymentReference} onChange={e=>setPaymentReference(e.target.value)} placeholder="Example: UPI123456789"/><small>Required for settlement and reconciliation.</small></label>}
+@@ -1170,7 +1253,7 @@
+   );
+ }
+ 
+-function SearchView({ api }) {
++function SearchView({ api, onOpenCustomer, onOpenLoan }) {
+   const [q, setQ] = useState('');
+   const [result, setResult] = useState({ customers: [], loans: [] });
+   async function run() {
+@@ -1181,9 +1264,9 @@
+     <section className="panel full">
+       <div className="panel-head"><h2>Universal search</h2><span>Customer ID, Loan ID, mobile, name, area, Aadhaar last 4</span></div>
+       <div className="toolbar"><div className="searchbox"><Search size={18} /><input value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => e.key === 'Enter' && run()} placeholder="Try KUN, mobile, customer name..." /></div><button className="primary small" onClick={run}>Search</button></div>
+-      <h3>Loans</h3><LoanTable rows={result.loans} />
++      <h3>Loans</h3><LoanTable rows={result.loans} onView={onOpenLoan} onOpenCustomer={onOpenCustomer} />
+       <h3>Customers</h3>
+-      <table><thead><tr><th>ID</th><th>Name</th><th>Mobile</th><th>Aadhaar</th><th>Area</th><th>Risk</th></tr></thead><tbody>{result.customers.map(c => <tr key={c.customer_id}><td>{c.customer_id}</td><td>{c.name}</td><td>{c.mobile}</td><td>{c.aadhaar_masked}</td><td>{c.area_name || c.area}</td><td><Risk score={c.risk_score} /></td></tr>)}</tbody></table>
++      <table><thead><tr><th>ID</th><th>Name</th><th>Mobile</th><th>Aadhaar</th><th>Area</th><th>Risk</th><th>Action</th></tr></thead><tbody>{result.customers.map(c => <tr key={c.customer_id}><td>{c.customer_id}</td><td><button type="button" className="link-button" onClick={() => onOpenCustomer(c.customer_id)}>{c.name}</button></td><td>{c.mobile}</td><td>{c.aadhaar_masked}</td><td>{c.area_name || c.area}</td><td><Risk score={c.risk_score} /></td><td><button type="button" className="ghost small" onClick={() => onOpenCustomer(c.customer_id)}><Users size={15}/>Open profile</button></td></tr>)}</tbody></table>
+     </section>
+   );
+ }
+@@ -1433,8 +1516,11 @@
+   const rateValid = Number.isFinite(parsedRate) && parsedRate >= 1 && parsedRate <= 10;
+   const rate = Math.min(10, Math.max(1, Number.isFinite(parsedRate) ? parsedRate : 2.14));
+   const [months, setMonths] = useState(24);
++  const [roundText, setRoundText] = useState('');
+   const interest = principal * rate * months / 100;
+-  const cashHandover = principal - interest;
++  const cashHandover = principal - interest;
++  const manualRound = Math.max(-100, Math.min(100, parseFloat(roundText) || 0));
++  useEffect(() => { setRoundText(''); }, [principal, rateText, months]);
+   const invalidPlan = cashHandover <= 0;
+   const maximumTenure = Math.floor(100 / rate);
+   const emi = principal / months;
+@@ -1446,11 +1532,23 @@
+         <label>Loan amount <strong>{money(principal)}</strong><input type="range" min="10000" max="2000000" step="10000" value={principal} onChange={e => setPrincipal(Number(e.target.value))} /></label>
+         <label>Monthly interest <strong>{rate}%</strong><input type="range" min="1" max="10" step="0.01" value={rate} onChange={e => setRateText(e.target.value)} aria-label="Monthly interest rate" /><div className="rate-entry"><input type="number" min="1" max="10" step="0.01" inputMode="decimal" value={rateText} onChange={e => setRateText(e.target.value)} aria-label="Type the monthly interest rate" /><span>% per month</span></div><small>{rateValid ? 'Set the rate for each customer (for example 1, 1.5, 2.14 or 3.2). Allowed range: 1% to 10%.' : `Enter a rate between 1% and 10%. The estimate below uses ${rate}%.`}</small></label>
+         <label>Repayment tenure <strong>{months} months</strong><input type="range" min="3" max="60" value={months} onChange={e => setMonths(Number(e.target.value))} /></label>
++        <div className="servicing-box round-off-box">
++          <h3>Cash in hand: manual round-off</h3>
++          <label>Round-off adjustment (₹): + gives more cash, − gives less<input type="number" step="0.01" min="-100" max="100" value={roundText} onChange={e => setRoundText(e.target.value)} placeholder="0.00" /></label>
++          <div className="action-row">
++            <button type="button" className="ghost small" disabled={invalidPlan} onClick={() => setRoundText(String(roundOffTo(cashHandover, 1, 'nearest')))}>Nearest ₹1</button>
++            <button type="button" className="ghost small" disabled={invalidPlan} onClick={() => setRoundText(String(roundOffTo(cashHandover, 1, 'down')))}>Down to ₹1</button>
++            <button type="button" className="ghost small" disabled={invalidPlan} onClick={() => setRoundText(String(roundOffTo(cashHandover, 1, 'up')))}>Up to ₹1</button>
++            <button type="button" className="ghost small" disabled={invalidPlan} onClick={() => setRoundText(String(roundOffTo(cashHandover, 10, 'nearest')))}>Nearest ₹10</button>
++            <button type="button" className="ghost small" onClick={() => setRoundText('')}>No round-off</button>
++          </div>
++          <small>Nothing is rounded automatically. Only the round-off you choose is applied.</small>
++        </div>
+         <div className="planner-note"><ShieldCheck size={18} /><span>Interest = sanctioned amount × {rate}% × months. It is deducted before cash handover; the sanctioned amount is repaid across the selected months.</span></div>
+       </section>
+       <section className="planner-result">
+         <span>{invalidPlan ? 'Loan estimate unavailable' : 'Your estimated monthly payment'}</span><strong>{invalidPlan ? 'Invalid plan' : money(emi)}</strong><small>{invalidPlan ? `Select ${maximumTenure} months or fewer` : `for ${months} months`}</small>
+-        {invalidPlan ? <div className="error-banner" role="alert">Upfront interest equals or exceeds the sanctioned amount. Reduce the tenure before creating this loan.</div> : <><div className="result-grid"><div><span>Sanctioned amount</span><b>{money(principal)}</b></div><div><span>Interest deducted upfront</span><b>{money(interest)}</b></div><div><span>Cash handed over</span><b>{money(cashHandover)}</b></div><div><span>Total repayment</span><b>{money(total)}</b></div></div><div className="repayment-bar"><i style={{ width: `${principal / total * 100}%` }} /></div></>}
++        {invalidPlan ? <div className="error-banner" role="alert">Upfront interest equals or exceeds the sanctioned amount. Reduce the tenure before creating this loan.</div> : <><div className="result-grid"><div><span>Sanctioned amount</span><b>{money(principal)}</b></div><div><span>Interest deducted upfront</span><b>{money(interest)}</b></div><div><span>Cash handed over (exact)</span><b>{money(cashHandover)}</b></div>{manualRound !== 0 && <div><span>Final cash in hand (after round-off)</span><b>{money(cashHandover + manualRound)}</b></div>}<div><span>Total repayment</span><b>{money(total)}</b></div></div><div className="repayment-bar"><i style={{ width: `${principal / total * 100}%` }} /></div></>}
+         <div className="legend repayment-legend"><span><i className="dot success" />Principal</span><span><i className="dot accent" />Interest</span></div>
+       </section>
+     </div>
+@@ -1555,8 +1653,8 @@
+   );
+ }
+ 
+-function LoanTable({ rows, onView, viewBusy = false }) {
+-  return <div className="table-scroll"><table><thead><tr><th>Loan</th><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th><th>Status</th>{onView&&<th>Action</th>}</tr></thead><tbody>{rows.map(l => <tr key={l.loan_id}><td>{l.loan_id}<small>{date(l.borrow_date)}</small></td><td>{l.customer_name || l.customer_id}<small>{l.area_name || l.area}</small></td><td>{l.frequency || l.loan_type}</td><td>{money(l.installment)}</td><td>{money(l.paid)}</td><td>{money(l.balance)}</td><td>{l.remaining_installments ?? '—'}<small>{l.frequency ? `${l.frequency} installments` : ''}</small></td><td>{l.next_due_date ? date(l.next_due_date) : 'Completed'}</td><td><Status value={l.status} /></td>{onView&&<td><button className="ghost small" disabled={viewBusy} onClick={()=>onView(l.loan_id)}><FileText size={15}/>View loan</button></td>}</tr>)}</t
++function LoanTable({ rows, onView, viewBusy = false, onOpenCustomer }) {
++  return <div className="table-scroll"><table><thead><tr><th>Loan</th><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th><th>Status</th>{onView&&<th>Action</th>}</tr></thead><tbody>{rows.map(l => <tr key={l.loan_id}><td>{onView ? <button type="button" className="link-button" onClick={() => onView(l.loan_id)}>{l.loan_id}</button> : l.loan_id}<small>{date(l.borrow_date)}</small></td><td>{onOpenCustomer ? <button type="button" className="link-button" onClick={() => onOpenCustomer(l.customer_id)}>{l.customer_name || l.customer_id}</button> : (l.customer_name || l.customer_id)}<small>{l.area_name || l.area}</small></td><td>{l.frequency || l.loan_type}</td><td>{money(l.installment)}</td><td>{money(l.paid)}</td><td>{money(l.balance)}</td><td>{l.remaining_installments ?? '—'}<small>{l.frequency ? `${l.frequency} installments` :
+ }
+ 
+ function PaymentConfirmModal({ payment, saving, error, onCancel, onConfirm }) {
+@@ -1654,7 +1752,9 @@
+ }
+ 
+ function money(value) {
+-  return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(value || 0);
++  const amount = Number(value || 0);
++  const hasPaise = Math.round(Math.abs(amount) * 100) % 100 !== 0;
++  return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', minimumFractionDigits: hasPaise ? 2 : 0, maximumFractionDigits: hasPaise ? 2 : 0 }).format(amount);
+ }
+ 
+ function indiaDayKey(value) {
+--- prev/client/src/styles.css
++++ new/client/src/styles.css
+@@ -1044,3 +1044,28 @@
+ body, button, input, select, textarea { font-family: "Plus Jakarta Sans", "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+ h1, h2, h3, .brand strong, .login-hero h1, .welcome-strip h2, .drawer-head h2 { font-family: "Sora", "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif; }
+ .kpi strong, .planner-result > strong { font-family: "Plus Jakarta Sans", "Inter", ui-sans-serif, system-ui, sans-serif; font-weight: 800; }
++
++/* Clickable names / ids, loan book filters, manual round-off, OTP area */
++.link-button { background: none; border: 0; padding: 0; min-height: 0; color: var(--accent); font: inherit; font-weight: 800; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; box-shadow: none; }
++.link-button:hover { filter: brightness(.85); }
++.loan-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; margin: 6px 0 12px; }
++.loan-filters label { margin: 0; }
++.loan-filters .filter-search { grid-column: 1 / -1; }
++.filter-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 10px 14px; margin-bottom: 12px; border-radius: 12px; background: var(--surface-alt); color: var(--muted); font-weight: 600; }
++.filter-summary b { color: var(--ink); }
++.round-off-box .round-off-line { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px dashed var(--line); }
++.round-off-box .round-off-line.final { border-bottom: 0; font-size: 1.05em; }
++.round-off-box .round-off-line b { font-variant-numeric: tabular-nums; }
++.sms-otp-box .otp-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
++.sms-otp-box .otp-head h3 { margin: 0; }
++.otp-chip { padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 800; background: var(--surface-alt); color: var(--muted); }
++.otp-chip.sent { background: #e0ecff; color: #1d4ed8; }
++.otp-chip.verified { background: #dcfce7; color: #166534; }
++.otp-step { display: flex; align-items: center; gap: 12px; padding: 10px 0; }
++.otp-step > div { flex: 1; display: grid; gap: 2px; }
++.otp-step-no { flex: 0 0 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 800; }
++.otp-step.done .otp-step-no { background: #16a34a; }
++.otp-code-display { display: grid; gap: 2px; padding: 12px 16px; margin: 6px 0; border-radius: 14px; background: #fff7d6; border: 1px dashed #d4a017; }
++.otp-code-display strong { font-size: 28px; letter-spacing: .35em; color: #7a5b00; }
++.otp-mode { display: block; margin-bottom: 4px; }
++.otp-clear { margin-top: 6px; }

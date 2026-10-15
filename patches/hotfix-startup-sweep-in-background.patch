@@ -1,0 +1,37 @@
+--- before-fix/server/main.py
++++ after-fix/server/main.py
+@@ -1464,6 +1464,16 @@
+     return closed
+ 
+ 
++_background_tasks: set = set()
++
++
++def schedule_auto_close_sweep() -> None:
++    """Run the zero-balance sweep in the background so a slow or failing sweep can never delay or break server start-up."""
++    task = asyncio.create_task(auto_close_zero_balance_loans())
++    _background_tasks.add(task)
++    task.add_done_callback(_background_tasks.discard)
++
++
+ @app.on_event("startup")
+ async def startup() -> None:
+     global mongo_client, db, USE_MEMORY
+@@ -1471,7 +1481,7 @@
+     if not MONGO_ENABLED:
+         USE_MEMORY = True
+         await seed_data()
+-        await auto_close_zero_balance_loans()
++        schedule_auto_close_sweep()
+         return
+     try:
+         mongo_client = AsyncIOMotorClient(
+@@ -1493,7 +1503,7 @@
+         hello = await db.command("hello")
+         if not hello.get("setName"):
+             raise RuntimeError("Production MongoDB must be configured as a replica set")
+-    await auto_close_zero_balance_loans()
++    schedule_auto_close_sweep()
+ 
+ 
+ @app.get("/api/health")
