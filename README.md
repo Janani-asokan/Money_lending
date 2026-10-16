@@ -95,6 +95,8 @@ Owners and Managers can verify a customer's mobile number with a 6-digit SMS OTP
 
 Paid SMS APIs (MSG91, Twilio, Fast2SMS, ...) charge per message and need DLT registration in India. To keep this **free**, the app sends SMS through your own Android phone using the open-source [SMS Gateway for Android](https://sms-gate.app) app — each OTP is a normal SMS from your SIM, covered by your plan's free SMS (most Indian prepaid plans include 100 SMS/day).
 
+**Quickest setup:** after step 2 below, double-click `setup-sms.bat` (or run `python scripts/setup_sms.py`). It checks your gateway login, confirms the phone is online, sends you a test OTP and saves the settings into `server/.env` for you.
+
 1. Install **SMS Gateway for Android** on a spare Android phone with an active SIM (Play Store or [GitHub releases](https://github.com/capcom6/android-sms-gateway/releases)) and allow SMS permission.
 2. Open the app, enable **Cloud server**, tap **Online**, and note the username and password it shows.
    (Or enable **Local server** if the phone and backend are on the same Wi-Fi; the URL is then `http://<phone-ip>:8080/message`.)
