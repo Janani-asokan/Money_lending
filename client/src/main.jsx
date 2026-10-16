@@ -451,6 +451,55 @@ function CustomerPicker({ customers, value, onChange }) {
   );
 }
 
+function MobileOtpBox({ api, customer, notify, onVerified }) {
+  const [smsStatus, setSmsStatus] = useState(null);
+  const [session, setSession] = useState(null);
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [clock, setClock] = useState(Date.now());
+  useEffect(() => { api('/api/sms/status').then(setSmsStatus).catch(() => setSmsStatus({ configured:false })); }, []);
+  useEffect(() => { setSession(null); setCode(''); setError(''); }, [customer.customer_id, customer.mobile]);
+  useEffect(() => { if (!session) return; const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, [session]);
+  if (customer.mobile_verified) return <div className="locked-note"><CheckCircle2 size={16}/> Mobile {customer.mobile} verified by SMS OTP{customer.mobile_verified_at ? ` on ${date(customer.mobile_verified_at)}` : ''}</div>;
+  if (!smsStatus) return null;
+  if (!smsStatus.configured) return <div className="locked-note"><AlertTriangle size={16}/> Mobile not verified. SMS OTP is not configured on the server (set SMS_PROVIDER).</div>;
+  const resendIn = session ? Math.max(0, Math.ceil((new Date(session.resend_available_at) - clock) / 1000)) : 0;
+  const expired = session && new Date(session.expires_at) <= clock;
+  async function send() {
+    setBusy(true); setError('');
+    try {
+      const result = await api(`/api/customers/${encodeURIComponent(customer.customer_id)}/mobile-otp/send`, { method:'POST' });
+      setSession(result); setCode('');
+      notify(`OTP sent by SMS to ${result.masked_destination}.${result.dev_otp ? ` (Demo mode OTP: ${result.dev_otp})` : ''}`);
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+  async function verify() {
+    if (code.length !== 6) return setError('Enter the 6-digit OTP sent to the customer.');
+    setBusy(true); setError('');
+    try {
+      const result = await api(`/api/customers/${encodeURIComponent(customer.customer_id)}/mobile-otp/verify`, { method:'POST', body:JSON.stringify({ otp_id:session.otp_id, otp:code }) });
+      notify(`Mobile ${customer.mobile} verified.`); setSession(null); setCode('');
+      if (onVerified) await onVerified(result.customer);
+    } catch (err) {
+      const match = err.message.match(/(\d+) attempts? remaining/i);
+      setSession(current => current && ({ ...current, attempts_remaining: match ? Number(match[1]) : err.message.toLowerCase().includes('locked') ? 0 : current.attempts_remaining }));
+      setCode(''); setError(err.message);
+    } finally { setBusy(false); }
+  }
+  return <div className="servicing-box">
+    <h3>Mobile OTP verification</h3>
+    <p>{customer.name} · {customer.customer_id} · {customer.mobile}</p>
+    {session && !expired && session.attempts_remaining > 0 && <><label>6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" maxLength="6" pattern="[0-9]{6}" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} onKeyDown={e=>e.key==='Enter' && (e.preventDefault(), verify())}/></label>{session.dev_otp && <small>Demo mode (no real SMS): OTP is {session.dev_otp}</small>}</>}
+    <div className="action-row">
+      {session && !expired && session.attempts_remaining > 0 && <button type="button" className="primary small" disabled={busy || code.length !== 6} onClick={verify}>Verify OTP</button>}
+      <button type="button" className={session ? 'ghost small' : 'primary small'} disabled={busy || resendIn > 0} onClick={send}>{busy && !session ? 'Sending…' : session ? (resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend OTP') : 'Send OTP by SMS'}</button>
+    </div>
+    {session && <small>{expired ? 'OTP expired — send a new one.' : session.attempts_remaining > 0 ? `Sent to ${session.masked_destination} · ${session.attempts_remaining} attempts remaining · expires ${new Date(session.expires_at).toLocaleTimeString('en-IN')}` : 'OTP locked — send a new one.'}</small>}
+    {error && <div className="error-banner" role="alert">{error}</div>}
+  </div>;
+}
+
 function Customers({ api, user, notify }) {
   const [rows, setRows] = useState([]);
   const [knownCustomers, setKnownCustomers] = useState([]);
@@ -466,6 +515,7 @@ function Customers({ api, user, notify }) {
   const [providerStatus, setProviderStatus] = useState({ configured:false, provider:null });
   const [onboardingOtp, setOnboardingOtp] = useState({ customer_id:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, masked_destination:'', verified_at:'' });
   const [otpBusy, setOtpBusy] = useState(false);
+  const [mobileOtpCustomer, setMobileOtpCustomer] = useState(null);
   const [updatingCustomerId, setUpdatingCustomerId] = useState('');
   const [deleteCandidate, setDeleteCandidate] = useState(null);
   const [deleteForm, setDeleteForm] = useState({ confirmation:'', reason:'', understood:false });
@@ -513,6 +563,7 @@ function Customers({ api, user, notify }) {
       const payload = { ...form, aadhaar: registrationMode === 'aadhaar' ? form.aadhaar : '' };
       const res = await api('/api/customers', { method: 'POST', body: JSON.stringify(payload) });
       setReceipt({ type: res.duplicate ? 'Verification Acknowledgement' : 'Registration Acknowledgement', ack: res.ack_no, customer: res.customer });
+      setMobileOtpCustomer(res.duplicate ? null : res.customer);
       if (!res.duplicate && registrationMode === 'aadhaar' && providerStatus.configured) {
         const otpResult = await api('/api/aadhaar/otp/start', { method:'POST', body:JSON.stringify({ customer_id:res.customer.customer_id, purpose:form.aadhaar_consent_purpose, consent_reference:form.aadhaar_consent_reference, proposed_disbursal_amount:0, owner_notes:'Automatic verification during customer onboarding' }) });
         setOnboardingOtp({ customer_id:res.customer.customer_id, otp:'', verified_at:'', ...otpResult });
@@ -631,6 +682,7 @@ function Customers({ api, user, notify }) {
         {formError && <div className="error" role="alert">{formError}</div>}
         <button className="primary" disabled={saving}><Plus size={18} /> {saving ? 'Saving securely…' : registrationMode === 'aadhaar' ? 'Register and send Aadhaar OTP' : 'Create pending profile'}</button>
         {onboardingOtp.verification_id && <div className="servicing-box"><h3>Aadhaar OTP verification</h3><p>Customer {onboardingOtp.customer_id} · sent to {onboardingOtp.masked_destination || 'Aadhaar-linked mobile'}</p>{onboardingOtp.verified_at ? <div className="locked-note"><CheckCircle2 size={16}/> Verified at {new Date(onboardingOtp.verified_at).toLocaleString('en-IN')} · proof {onboardingOtp.verification_id}</div> : <><label>4 or 6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" value={onboardingOtp.otp} onChange={e=>setOnboardingOtp({...onboardingOtp,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/></label><div className="action-row"><button type="button" className="primary small" disabled={otpBusy || onboardingOtp.attempts_remaining===0 || ![4,6].includes(onboardingOtp.otp.length)} onClick={verifyOnboardingOtp}>Verify OTP</button><button type="button" className="ghost small" disabled={otpBusy || onboardingOtp.resends_remaining===0} onClick={resendOnboardingOtp}>Resend</button></div><small>{onboardingOtp.attempts_remaining > 0 ? `${onboardingOtp.attempts_remaining} attempts remaining` : 'OTP locked — resend or start a new verification'} · {onboardingOtp.resends_remaining} resends remaining</small></>}</div>}
+        {mobileOtpCustomer && <MobileOtpBox api={api} customer={mobileOtpCustomer} notify={notify} onVerified={async verified => { setMobileOtpCustomer(verified); await load(); }} />}
       </form>
       <section className="panel">
         <div className="panel-head"><h2>Customer registry</h2><span>{visibleRows.length} matching profiles</span></div>
@@ -653,7 +705,7 @@ function Customers({ api, user, notify }) {
         <div className="table-scroll">
           <table>
             <thead><tr><th>ID</th><th>Name</th><th>Aadhaar</th><th>Status</th><th>Risk</th><th>Area</th><th>Actions</th></tr></thead>
-            <tbody>{visibleRows.length === 0 && <tr><td colSpan="7">No customers match the current search and filters.</td></tr>}{visibleRows.map((r, index) => <React.Fragment key={r.customer_id}>{areaView === 'group' && (index === 0 || areaOf(visibleRows[index - 1]) !== areaOf(r)) && <tr className="group-row"><td colSpan="7">{areaOf(r) || 'No area'} · {r.area_name || 'Area not set'} <small>({areaCounts[areaOf(r)]} customer{areaCounts[areaOf(r)] === 1 ? '' : 's'})</small></td></tr>}<tr><td>{r.customer_id}</td><td><div className="table-person"><span>{r.name.split(' ').map(x => x[0]).join('').slice(0,2)}</span><div>{r.name}<small>{r.mobile}</small></div></div></td><td>{fullAadhaar[r.customer_id] || r.aadhaar_masked}{r.aadhaar_verified_at && <small>Verified {date(r.aadhaar_verified_at)}</small>}</td><td><Status value={r.status} /></td><td><Risk score={r.risk_score} /></td><td>{r.area_name || r.area}</td><td><div className="action-row">{['owner','manager'].includes(user.role) && <><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Pending Verification'} onClick={() => verify(r.customer_id, 'Pending Verification')}>Pending</button><button className={['Pending Verification','Verification Failed'].includes(r.status) ? 'primary small' : 'ghost'} disabled={updatingCustomerId===r.customer_id || ['Manual Verification Approved','Verified'].includes(r.status)} onClick={() => verify(r.customer_id, 'Manual Verification Approved')}><CheckCircle2 size={15} /> {updatingCustomerId===r.customer_id ? 'Approving…' : 'Approve'}</button><button className="ghost danger" disabled={updatingCustomerId===r.customer_id || r.status==='Verification Failed'} onClick={() => verify(r.customer_id, 'Verification Failed')}><AlertTriangle size={15} /> Fail</button></>}{user.role === 'owner' && <button className="ghost danger" disabled={updatingCustomerId===r.customer_id || !r.can_delete_profile} title={r.can_delete_profile ? 'Requires two confirmations and a reason' : 'Complete all loans and clear every balance first'} onClick={() => requestDelete(r)}><X size={15} /> {r.can_delete_profile ? 'Delete customer' : 'Loan active'}</button>}</div></td></tr></React.Fragment>)}</tbody>
+            <tbody>{visibleRows.length === 0 && <tr><td colSpan="7">No customers match the current search and filters.</td></tr>}{visibleRows.map((r, index) => <React.Fragment key={r.customer_id}>{areaView === 'group' && (index === 0 || areaOf(visibleRows[index - 1]) !== areaOf(r)) && <tr className="group-row"><td colSpan="7">{areaOf(r) || 'No area'} · {r.area_name || 'Area not set'} <small>({areaCounts[areaOf(r)]} customer{areaCounts[areaOf(r)] === 1 ? '' : 's'})</small></td></tr>}<tr><td>{r.customer_id}</td><td><div className="table-person"><span>{r.name.split(' ').map(x => x[0]).join('').slice(0,2)}</span><div>{r.name}<small>{r.mobile} · {r.mobile_verified ? 'Mobile verified' : 'Mobile not verified'}</small></div></div></td><td>{fullAadhaar[r.customer_id] || r.aadhaar_masked}{r.aadhaar_verified_at && <small>Verified {date(r.aadhaar_verified_at)}</small>}</td><td><Status value={r.status} /></td><td><Risk score={r.risk_score} /></td><td>{r.area_name || r.area}</td><td><div className="action-row">{['owner','manager'].includes(user.role) && <><button className="ghost" disabled={updatingCustomerId===r.customer_id || r.status==='Pending Verification'} onClick={() => verify(r.customer_id, 'Pending Verification')}>Pending</button><button className={['Pending Verification','Verification Failed'].includes(r.status) ? 'primary small' : 'ghost'} disabled={updatingCustomerId===r.customer_id || ['Manual Verification Approved','Verified'].includes(r.status)} onClick={() => verify(r.customer_id, 'Manual Verification Approved')}><CheckCircle2 size={15} /> {updatingCustomerId===r.customer_id ? 'Approving…' : 'Approve'}</button><button className="ghost danger" disabled={updatingCustomerId===r.customer_id || r.status==='Verification Failed'} onClick={() => verify(r.customer_id, 'Verification Failed')}><AlertTriangle size={15} /> Fail</button></>}{user.role === 'owner' && <button className="ghost danger" disabled={updatingCustomerId===r.customer_id || !r.can_delete_profile} title={r.can_delete_profile ? 'Requires two confirmations and a reason' : 'Complete all loans and clear every balance first'} onClick={() => requestDelete(r)}><X size={15} /> {r.can_delete_profile ? 'Delete customer' : 'Loan active'}</button>}</div></td></tr></React.Fragment>)}</tbody>
           </table>
         </div>
       </section>
@@ -739,7 +791,9 @@ function Customer360({ api, initialCustomerId = '', user, notify }) {
           <Status value={customer.status} />
           <span className="pill">Risk {customer.risk_score}</span>
           <span className="pill">Aadhaar {customer.aadhaar_masked}</span>
+          <span className="pill">{customer.mobile_verified ? 'Mobile verified' : 'Mobile not verified'}</span>
         </div>
+        {['owner','manager'].includes(user.role) && <MobileOtpBox api={api} customer={customer} notify={notify} onVerified={load} />}
         {user.role === 'owner' && <button className="ghost danger profile-delete" disabled={!customer.can_delete_profile} title={customer.can_delete_profile ? 'Delete with confirmation' : 'Active or unpaid loans must be completed first'} onClick={()=>requestDelete(customer)}><X size={16}/>{customer.can_delete_profile ? 'Delete customer' : 'Cannot delete — loan active'}</button>}
         {deleteError && <div className="error-banner" role="alert">{deleteError}</div>}
       </section>

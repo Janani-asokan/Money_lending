@@ -65,6 +65,20 @@ AADHAAR_AUTH_PROVIDER_URL = os.getenv("AADHAAR_AUTH_PROVIDER_URL", "").rstrip("/
 AADHAAR_AUTH_PROVIDER_KEY = os.getenv("AADHAAR_AUTH_PROVIDER_KEY", "")
 AADHAAR_AUTH_PROVIDER_NAME = os.getenv("AADHAAR_AUTH_PROVIDER_NAME", "Authorized AUA/KUA provider")
 REQUIRE_VERIFIED_DISBURSAL = os.getenv("REQUIRE_VERIFIED_DISBURSAL", "false").lower() == "true"
+# Customer mobile OTP over SMS. "android_gateway" sends through the free, open-source
+# SMS Gateway for Android app (https://sms-gate.app) using the SIM in your own phone, so
+# each OTP costs nothing beyond your normal mobile plan. "console" prints the OTP in the
+# server log (development only). "disabled" turns the feature off.
+SMS_PROVIDER = os.getenv("SMS_PROVIDER", "disabled" if APP_ENV == "production" else "console").strip().lower()
+SMS_GATEWAY_URL = os.getenv("SMS_GATEWAY_URL", "https://api.sms-gate.app/3rdparty/v1/message").strip()
+SMS_GATEWAY_USERNAME = os.getenv("SMS_GATEWAY_USERNAME", "")
+SMS_GATEWAY_PASSWORD = os.getenv("SMS_GATEWAY_PASSWORD", "")
+SMS_SENDER_NAME = os.getenv("SMS_SENDER_NAME", "Sri Sakthi Thirumurugan Finance")
+MOBILE_OTP_TTL_SECONDS = max(60, min(int(os.getenv("MOBILE_OTP_TTL_SECONDS", "300")), 900))
+MOBILE_OTP_MAX_ATTEMPTS = 3
+MOBILE_OTP_RESEND_SECONDS = 30
+MOBILE_OTP_DAILY_LIMIT = int(os.getenv("MOBILE_OTP_DAILY_LIMIT", "10"))
+REQUIRE_MOBILE_VERIFIED_DISBURSAL = os.getenv("REQUIRE_MOBILE_VERIFIED_DISBURSAL", "false").lower() == "true"
 CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(Path(__file__).resolve().parent.parent / "backups"))).resolve()
 BACKUP_KEY_RAW = os.getenv("BACKUP_ENCRYPTION_KEY", "")
@@ -206,6 +220,10 @@ def validate_production_config() -> None:
         problems.append("COOKIE_SECURE must be true")
     if len(BACKUP_ENCRYPTION_KEY) != 32:
         problems.append("BACKUP_ENCRYPTION_KEY must be exactly 32 UTF-8 bytes")
+    if SMS_PROVIDER not in {"disabled", "android_gateway"}:
+        problems.append("SMS_PROVIDER must be android_gateway or disabled (console mode prints OTPs to the log)")
+    if SMS_PROVIDER == "android_gateway" and not (SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD):
+        problems.append("SMS_GATEWAY_URL, SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD are required for android_gateway")
     if problems:
         raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
 
@@ -520,6 +538,11 @@ class AadhaarOtpVerifyIn(BaseModel):
 
 class AadhaarOtpResendIn(BaseModel):
     verification_id: str
+
+
+class MobileOtpVerifyIn(BaseModel):
+    otp_id: str = Field(min_length=3, max_length=40)
+    otp: str = Field(pattern=r"^\d{6}$")
 
 
 class LoanAdjustmentIn(BaseModel):
@@ -893,6 +916,8 @@ async def ensure_indexes() -> None:
     if USE_MEMORY:
         return
     await db.customers.create_index("customer_id", name="idx_customers_customer_id", unique=True)
+    await db.mobile_otps.create_index("otp_id", name="idx_mobile_otps_otp_id", unique=True)
+    await db.mobile_otps.create_index([("customer_id", 1), ("created_at", -1)], name="idx_mobile_otps_customer_created")
     indexes = await db.customers.index_information()
     mobile_index = indexes.get("idx_customers_mobile")
     if mobile_index and not mobile_index.get("unique", False):
@@ -1073,6 +1098,60 @@ async def aadhaar_provider_call(path: str, payload: dict[str, Any]) -> dict[str,
     return await asyncio.to_thread(send)
 
 
+def sms_configured() -> bool:
+    if SMS_PROVIDER == "console":
+        return APP_ENV != "production"
+    if SMS_PROVIDER == "android_gateway":
+        return bool(SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
+    return False
+
+
+def mask_mobile(mobile: str) -> str:
+    return f"+91 XXXXXX{mobile[-4:]}" if len(mobile) >= 4 else "registered mobile"
+
+
+def mobile_otp_hash(otp_id: str, otp: str) -> str:
+    return hmac.new(APP_SECRET_KEY.encode(), f"mobile-otp:{otp_id}:{otp}".encode(), hashlib.sha256).hexdigest()
+
+
+async def send_sms(mobile: str, text: str) -> None:
+    if not sms_configured():
+        raise HTTPException(409, "SMS is not configured. Set SMS_PROVIDER and the gateway credentials on the server.")
+    if SMS_PROVIDER == "console":
+        print(f"[SMS console] to +91{mobile}: {text}", flush=True)
+        return
+    def send() -> None:
+        body = json.dumps({"textMessage": {"text": text}, "phoneNumbers": [f"+91{mobile}"]}).encode()
+        credentials = base64.b64encode(f"{SMS_GATEWAY_USERNAME}:{SMS_GATEWAY_PASSWORD}".encode()).decode()
+        request = UrlRequest(SMS_GATEWAY_URL, data=body, method="POST", headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}"})
+        try:
+            with urlopen(request, timeout=20) as response: response.read()
+        except HTTPError as exc:
+            raise HTTPException(424, f"SMS gateway rejected the request with status {exc.code}") from exc
+        except (URLError, TimeoutError) as exc:
+            raise HTTPException(424, "SMS gateway is unreachable. Check that the gateway phone is online.") from exc
+    await asyncio.to_thread(send)
+
+
+async def update_where(collection: str, query: dict[str, Any], fields: dict[str, Any], inc: Optional[dict[str, int]] = None) -> bool:
+    """Conditionally update one document; returns False when nothing matched (state changed)."""
+    if USE_MEMORY:
+        for row in STORE.get(collection, []):
+            if matches(row, query):
+                row.update(deepcopy(fields))
+                for key, amount in (inc or {}).items(): row[key] = int(row.get(key, 0)) + amount
+                return True
+        return False
+    update: dict[str, Any] = {"$set": fields}
+    if inc: update["$inc"] = inc
+    result = await db[collection].update_one(query, update)
+    return result.modified_count == 1
+
+
+def mobile_verified(customer: dict[str, Any]) -> bool:
+    return bool(customer.get("mobile_verified_at")) and customer.get("mobile_verified_number") == customer.get("mobile")
+
+
 async def next_sequence(prefix: str, field: str, collection: str) -> int:
     if not USE_MEMORY:
         counter_id = f"{collection}:{prefix}"
@@ -1227,6 +1306,7 @@ async def customer_view(customer: dict[str, Any]) -> dict[str, Any]:
     visible = {k: v for k, v in customer.items() if k not in {"aadhaar_encrypted", "aadhaar_hash"}}
     visible["aadhaar_masked"] = f"XXXX XXXX {customer['aadhaar_last4']}" if customer.get("aadhaar_last4") else ("Stored securely" if customer.get("aadhaar_encrypted") else "Not provided")
     visible["has_aadhaar"] = bool(customer.get("aadhaar_encrypted"))
+    visible["mobile_verified"] = mobile_verified(customer)
     area = await find_one("areas", {"code": customer.get("area")})
     visible["area_code"] = customer.get("area", "")
     visible["area_name"] = area.get("name", customer.get("area", "")) if area else customer.get("area", "")
@@ -1961,6 +2041,9 @@ async def update_customer(customer_id: str, payload: CustomerUpdateIn, request: 
     updated = deepcopy(customer)
     updated.update(payload.model_dump())
     updated.update({"updated_at": iso(now()), "updated_by": user["name"]})
+    if payload.mobile != customer.get("mobile"):
+        for key in ("mobile_verified_at", "mobile_verified_by", "mobile_verified_number", "mobile_otp_id"):
+            updated.pop(key, None)
     details = {"before": before, "after": payload.model_dump(), "customer_id_unchanged": True}
     if USE_MEMORY:
         await replace_one("customers", {"customer_id": customer_id}, updated)
@@ -2178,6 +2261,77 @@ async def resend_aadhaar_otp(payload: AadhaarOtpResendIn, request: Request, user
     await insert_one("identity_verification_events", event)
     await audit(user, "aadhaar_otp_resent", "identity_verification", payload.verification_id, event, request)
     return {"verification_id": payload.verification_id, "status": "OTP Sent", "expires_in_seconds": expires_in, "expires_at": iso(stamp + timedelta(seconds=expires_in)), "attempts_remaining": int(attempt.get("max_attempts", 3)), "resends_remaining": int(attempt.get("max_resends", 3)) - next_resend_count, "resend_available_at": iso(stamp + timedelta(seconds=30))}
+
+
+@app.get("/api/sms/status")
+async def sms_status(user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+    return {"configured": sms_configured(), "provider": SMS_PROVIDER, "otp_ttl_seconds": MOBILE_OTP_TTL_SECONDS, "mobile_verified_disbursal_required": REQUIRE_MOBILE_VERIFIED_DISBURSAL}
+
+
+@app.post("/api/customers/{customer_id}/mobile-otp/send")
+async def send_mobile_otp(customer_id: str, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+    customer = await find_one("customers", {"customer_id": customer_id})
+    if not customer or customer.get("profile_deleted_at"):
+        raise HTTPException(404, "Active customer profile not found")
+    if mobile_verified(customer):
+        raise HTTPException(409, "This mobile number is already verified")
+    if not sms_configured():
+        raise HTTPException(409, "SMS is not configured. Set SMS_PROVIDER and the gateway credentials on the server.")
+    stamp = now()
+    history = await find_many("mobile_otps", {"customer_id": customer_id})
+    if sum(1 for row in history if parse_date(row["created_at"]) > stamp - timedelta(days=1)) >= MOBILE_OTP_DAILY_LIMIT:
+        raise HTTPException(429, "Daily OTP limit reached for this customer. Try again tomorrow.")
+    latest = max(history, key=lambda row: row["created_at"], default=None)
+    if latest and latest.get("status") == "Sent":
+        available_at = parse_date(latest["created_at"]) + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS)
+        if available_at > stamp:
+            raise HTTPException(429, f"Please wait {int((available_at - stamp).total_seconds()) + 1} seconds before resending OTP.")
+    seq = await next_sequence("MOTP", "otp_id", "mobile_otps")
+    otp_id = f"MOTP-{seq:09d}"
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    minutes = MOBILE_OTP_TTL_SECONDS // 60
+    await send_sms(customer["mobile"], f"{otp} is your OTP to verify your mobile number with {SMS_SENDER_NAME}. Valid for {minutes} minutes. Do not share it with anyone.")
+    for row in history:
+        if row.get("status") == "Sent":
+            await update_where("mobile_otps", {"otp_id": row["otp_id"], "status": "Sent"}, {"status": "Superseded", "completed_at": iso(stamp)})
+    record = {"otp_id": otp_id, "customer_id": customer_id, "mobile": customer["mobile"], "otp_hash": mobile_otp_hash(otp_id, otp), "provider": SMS_PROVIDER, "status": "Sent", "created_at": iso(stamp), "expires_at": iso(stamp + timedelta(seconds=MOBILE_OTP_TTL_SECONDS)), "attempt_count": 0, "max_attempts": MOBILE_OTP_MAX_ATTEMPTS, "requested_by": user["name"], "requested_by_id": user["id"]}
+    await insert_one("mobile_otps", record)
+    await audit(user, "mobile_otp_sent", "customer", customer_id, {"otp_id": otp_id, "mobile": mask_mobile(customer["mobile"]), "provider": SMS_PROVIDER}, request)
+    result = {"otp_id": otp_id, "status": "Sent", "masked_destination": mask_mobile(customer["mobile"]), "expires_at": record["expires_at"], "expires_in_seconds": MOBILE_OTP_TTL_SECONDS, "attempts_remaining": MOBILE_OTP_MAX_ATTEMPTS, "resend_available_at": iso(stamp + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS))}
+    if SMS_PROVIDER == "console" and APP_ENV != "production":
+        result["dev_otp"] = otp
+    return result
+
+
+@app.post("/api/customers/{customer_id}/mobile-otp/verify")
+async def verify_mobile_otp(customer_id: str, payload: MobileOtpVerifyIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+    record = await find_one("mobile_otps", {"otp_id": payload.otp_id, "customer_id": customer_id})
+    if not record: raise HTTPException(404, "OTP request not found")
+    if record["status"] != "Sent": raise HTTPException(409, "This OTP is no longer valid. Send a new OTP.")
+    stamp = now()
+    if parse_date(record["expires_at"]) <= stamp:
+        await update_where("mobile_otps", {"otp_id": payload.otp_id, "status": "Sent"}, {"status": "Expired", "completed_at": iso(stamp)})
+        raise HTTPException(410, "OTP expired. Send a new OTP.")
+    if not hmac.compare_digest(record["otp_hash"], mobile_otp_hash(payload.otp_id, payload.otp)):
+        attempts = int(record.get("attempt_count", 0))
+        remaining = max(int(record.get("max_attempts", MOBILE_OTP_MAX_ATTEMPTS)) - attempts - 1, 0)
+        changed = await update_where("mobile_otps", {"otp_id": payload.otp_id, "status": "Sent", "attempt_count": attempts}, {"status": "Locked" if remaining == 0 else "Sent", "last_failed_at": iso(stamp)}, {"attempt_count": 1})
+        if not changed: raise HTTPException(409, "OTP state changed. Please try again.")
+        await audit(user, "mobile_otp_failed", "customer", customer_id, {"otp_id": payload.otp_id, "attempts_remaining": remaining}, request)
+        if remaining == 0: raise HTTPException(423, "OTP locked after 3 incorrect attempts. Send a new OTP.")
+        raise HTTPException(422, f"Incorrect OTP. {remaining} attempt{'s' if remaining != 1 else ''} remaining.")
+    if not await update_where("mobile_otps", {"otp_id": payload.otp_id, "status": "Sent"}, {"status": "Verified", "completed_at": iso(stamp)}):
+        raise HTTPException(409, "This OTP was already used")
+    customer = await find_one("customers", {"customer_id": customer_id})
+    if not customer or customer.get("mobile") != record["mobile"]:
+        raise HTTPException(409, "The customer's mobile number changed after the OTP was sent. Send a new OTP.")
+    verified = {"mobile_verified_at": iso(stamp), "mobile_verified_by": user["name"], "mobile_verified_number": record["mobile"], "mobile_otp_id": payload.otp_id}
+    await update_where("customers", {"customer_id": customer_id, "mobile": record["mobile"]}, verified)
+    customer.update(verified)
+    verification_seq = await next_sequence("VEF", "id", "verification_events")
+    await insert_one("verification_events", {"id": f"VEF-{verification_seq:08d}", "customer_id": customer_id, "status": customer.get("status"), "reason": f"Mobile {mask_mobile(record['mobile'])} verified by SMS OTP", "verification_id": payload.otp_id, "provider": "SMS OTP", "timestamp": iso(stamp), "updated_by": user["name"]})
+    await audit(user, "mobile_otp_verified", "customer", customer_id, {"otp_id": payload.otp_id, "mobile": mask_mobile(record["mobile"])}, request)
+    return {"verified": True, "otp_id": payload.otp_id, "verified_at": iso(stamp), "customer": await customer_view(customer)}
 
 
 @app.get("/api/identity-verifications")
@@ -2665,6 +2819,8 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
     identity_verification = await find_one("verification_logs", {"verification_id": payload.identity_verification_id, "client_id": payload.customer_id, "otp_status": "Verified"}) if payload.identity_verification_id else None
     if REQUIRE_VERIFIED_DISBURSAL and not identity_verification:
         raise HTTPException(409, "A successful automatic Aadhaar verification reference is required before disbursal")
+    if REQUIRE_MOBILE_VERIFIED_DISBURSAL and not mobile_verified(customer):
+        raise HTTPException(409, "Verify the customer's mobile number by SMS OTP before disbursal")
     if identity_verification and float(identity_verification.get("disbursed_amount", 0)) != float(payload.principal):
         raise HTTPException(409, "Verified handover amount does not match the loan principal")
     if payload.loan_type not in LOAN_TYPES:

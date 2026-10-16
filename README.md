@@ -13,6 +13,7 @@ Money-lending operations platform using React, FastAPI, and MongoDB. It supports
 - JWT login with seeded roles: Owner, Manager, Collector, Accountant
 - Aadhaar AES-256-GCM encryption at rest, SHA-256 duplicate lookup, masked UI display
 - Customer registration and existing Aadhaar verification acknowledgement flow
+- Free customer mobile verification by SMS OTP (sent from your own Android phone)
 - Loan disbursement with Daily 100-Day and Monthly EMI schemes
 - Server-side timestamped collection entry with payment receipts
 - Area-wise dashboard for KUN, SLM, NMK, ERD
@@ -87,6 +88,32 @@ INITIAL_ADMIN_PASSWORD=use-a-unique-password-of-12-or-more-characters
 ```
 
 Remove `INITIAL_ADMIN_PASSWORD` after the first startup. Use HTTPS, encrypted storage, least-privilege database credentials, and automated off-site backups with a tested restore procedure.
+
+## Free SMS OTP (customer mobile verification)
+
+Owners and Managers can verify a customer's mobile number with a 6-digit SMS OTP from **Customer 360** or right after registering a new customer. Verified customers show "Mobile verified"; editing the mobile number clears the verification.
+
+Paid SMS APIs (MSG91, Twilio, Fast2SMS, ...) charge per message and need DLT registration in India. To keep this **free**, the app sends SMS through your own Android phone using the open-source [SMS Gateway for Android](https://sms-gate.app) app — each OTP is a normal SMS from your SIM, covered by your plan's free SMS (most Indian prepaid plans include 100 SMS/day).
+
+1. Install **SMS Gateway for Android** on a spare Android phone with an active SIM (Play Store or [GitHub releases](https://github.com/capcom6/android-sms-gateway/releases)) and allow SMS permission.
+2. Open the app, enable **Cloud server**, tap **Online**, and note the username and password it shows.
+   (Or enable **Local server** if the phone and backend are on the same Wi-Fi; the URL is then `http://<phone-ip>:8080/message`.)
+3. In `server/.env` set:
+
+```text
+SMS_PROVIDER=android_gateway
+SMS_GATEWAY_URL=https://api.sms-gate.app/3rdparty/v1/message
+SMS_GATEWAY_USERNAME=<from the app>
+SMS_GATEWAY_PASSWORD=<from the app>
+```
+
+4. Restart the backend. Keep the phone charged and connected.
+
+For local testing without any phone, leave `SMS_PROVIDER=console` (the default outside production): the OTP is printed in the server log and shown on screen as "Demo mode OTP". Console mode is refused in production.
+
+Security: OTPs are random 6-digit codes stored only as HMAC hashes, expire after 5 minutes, lock after 3 wrong attempts, can be resent after 30 seconds, and are limited to 10 per customer per day. Every send/verify is written to the audit log. Set `REQUIRE_MOBILE_VERIFIED_DISBURSAL=true` to block loan disbursal until the mobile is verified.
+
+API: `GET /api/sms/status`, `POST /api/customers/{customer_id}/mobile-otp/send`, `POST /api/customers/{customer_id}/mobile-otp/verify` (`{"otp_id": "...", "otp": "123456"}`).
 
 ## Go-live gate
 
