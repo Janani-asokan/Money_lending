@@ -28,7 +28,7 @@ CLOUD_API = "https://api.sms-gate.app/3rdparty/v1"
 def call(method: str, url: str, username: str, password: str, body: dict | None = None) -> tuple[int, object]:
     token = base64.b64encode(f"{username}:{password}".encode()).decode()
     data = json.dumps(body).encode() if body is not None else None
-    request = Request(url, data=data, method=method, headers={"Authorization": f"Basic {token}", "Content-Type": "application/json"})
+    request = Request(url, data=data, method=method, headers={"Authorization": f"Basic {token}", "Content-Type": "application/json", "User-Agent": "MoneyLendingSMS/1.0"})
     try:
         with urlopen(request, timeout=20) as response:
             raw = response.read()

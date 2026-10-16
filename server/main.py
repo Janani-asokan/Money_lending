@@ -1123,7 +1123,7 @@ async def send_sms(mobile: str, text: str) -> None:
     def send() -> None:
         body = json.dumps({"textMessage": {"text": text}, "phoneNumbers": [f"+91{mobile}"]}).encode()
         credentials = base64.b64encode(f"{SMS_GATEWAY_USERNAME}:{SMS_GATEWAY_PASSWORD}".encode()).decode()
-        request = UrlRequest(SMS_GATEWAY_URL, data=body, method="POST", headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}"})
+        request = UrlRequest(SMS_GATEWAY_URL, data=body, method="POST", headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}", "User-Agent": "MoneyLendingSMS/1.0"})
         try:
             with urlopen(request, timeout=20) as response: response.read()
         except HTTPError as exc:
