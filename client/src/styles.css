@@ -1030,3 +1030,64 @@ tr.group-row td { background: var(--surface-alt); color: var(--ink); font-weight
 tr.group-row small { color: var(--muted); font-weight: 600; }
 .quick-actions { margin-top: 14px; }
 .quick-actions form { display: grid; gap: 10px; }
+button.alert-item { width: 100%; text-align: left; color: var(--text); font: inherit; cursor: pointer; }
+button.alert-item:hover { background: rgba(245, 158, 11, 0.14); }
+.table-link:disabled { opacity: .6; cursor: progress; }
+.panel h3 small { color: var(--muted); font-weight: 600; }
+.otp-box-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.otp-box-head h3 { margin: 0; }
+.cash-handover { display: grid; gap: 4px; }
+.cash-handover small { color: var(--muted); }
+.form-error { color: var(--danger, #dc2626); }
+.loan-filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+.loan-filters .searchbox { flex: 1 1 220px; min-width: 0; }
+.loan-filters select, .loan-filters input[type="number"] { flex: 0 1 150px; min-width: 120px; min-height: 40px; }
+.loan-filter-summary { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 4px 0 10px; color: var(--muted); font-size: 13px; }
+.loan-filter-summary b { color: var(--text); }
+.show-more { width: 100%; margin-top: 10px; justify-content: center; }
+/* Panels marked "full" span the whole grid row on every two-column layout. */
+.content-grid > .full, .split-layout > .full, .profile-layout > .full { grid-column: 1 / -1; }
+.check-row { display: flex !important; flex-direction: row !important; align-items: center; gap: 10px; font-weight: 600; line-height: 1.35; }
+.check-row input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; flex: 0 0 18px; margin: 0; padding: 0; accent-color: var(--accent); }
+.two-col > .locked-note, .two-col > .check-row { grid-column: 1 / -1; }
+td .action-row { flex-wrap: nowrap; }
+td .action-row button { white-space: nowrap; }
+.onboarding-form .two-col { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.loan-table td { vertical-align: middle; }
+.loan-table td small { display: block; white-space: nowrap; }
+.loan-table .table-link { white-space: nowrap; }
+.segmented-control.five { grid-template-columns: repeat(auto-fit, minmax(84px, 1fr)); }
+.status.upcoming { color: #1d4ed8; background: #e0ebff; }
+.clickable-row { cursor: pointer; }
+.clickable-row:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.table-link.subtle { font-weight: 600; color: var(--muted); }
+.table-link.subtle:hover { color: var(--accent); }
+.loan-table td small + small { margin-top: 1px; }
+.modal.loan-details-modal { width: min(1040px, calc(100vw - 32px)); max-width: none; }
+.loan-details-modal .finance-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.loan-details-modal .loan-detail-grid small { color: var(--muted); font-size: 11px; }
+.loan-quick-actions h3 { margin: 0 0 10px; }
+.loan-quick-actions .action-row { flex-wrap: wrap; }
+@media (max-width: 700px) { .loan-details-modal .finance-strip { grid-template-columns: 1fr 1fr; } }
+.ghost.danger { color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent); }
+.ghost.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 8%, transparent); }
+.primary:disabled { opacity: .55; cursor: not-allowed; box-shadow: none; }
+.kpi strong.long-value { font-size: clamp(18px, 1.6vw, 24px); letter-spacing: -0.02em; overflow-wrap: anywhere; }
+.status.paid-today { color: #14713a; background: #e4f6e9; }
+.status.not-paid-today { color: #b4232d; background: #fde8e8; }
+:root[data-theme="dark"] .status.paid-today { color: #bbf7d0; background: rgba(34,197,94,.16); }
+:root[data-theme="dark"] .status.not-paid-today { color: #fecaca; background: rgba(239,68,68,.16); }
+.report-totals { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 12px; color: var(--muted); font-size: 13px; text-transform: capitalize; }
+.report-totals b { color: var(--text); }
+@media (max-width: 640px) {
+  .loan-table { max-height: none; }
+  .loan-table table { min-width: 0; width: 100%; }
+  .loan-table thead { display: none; }
+  .loan-table table, .loan-table tbody { display: block; }
+  .loan-table tr { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; padding: 12px; border-bottom: 1px solid var(--line); }
+  .loan-table td { display: block; padding: 0; border: 0; background: transparent !important; }
+  .loan-table td:first-child { grid-column: 1 / -1; }
+  .loan-table td small { white-space: normal; }
+}
+.toast { cursor: pointer; }
