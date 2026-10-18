@@ -477,8 +477,6 @@ function MobileOtpBox({ api, customer, notify, onVerified, onClose }) {
   useEffect(() => { setSession(null); setCode(''); setError(''); }, [customer.customer_id, customer.mobile]);
   useEffect(() => { if (!session) return; const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, [session]);
   if (customer.mobile_verified) return <div className="locked-note"><CheckCircle2 size={16}/> Mobile {customer.mobile} verified by SMS OTP{customer.mobile_verified_at ? ` on ${date(customer.mobile_verified_at)}` : ''}</div>;
-  if (!smsStatus) return null;
-  if (!smsStatus.configured) return <div className="locked-note"><AlertTriangle size={16}/> Mobile not verified. SMS OTP is not configured on the server (set SMS_PROVIDER).</div>;
   const resendIn = session ? Math.max(0, Math.ceil((new Date(session.resend_available_at) - clock) / 1000)) : 0;
   const expired = session && new Date(session.expires_at) <= clock;
   async function send() {
@@ -486,7 +484,7 @@ function MobileOtpBox({ api, customer, notify, onVerified, onClose }) {
     try {
       const result = await api(`/api/customers/${encodeURIComponent(customer.customer_id)}/mobile-otp/send`, { method:'POST' });
       setSession(result); setCode('');
-      notify(`OTP sent by SMS to ${result.masked_destination}.${result.dev_otp ? ` (Demo mode OTP: ${result.dev_otp})` : ''}`);
+      notify(`OTP sent to ${result.masked_destination}.${result.dev_otp ? ` (Demo mode OTP: ${result.dev_otp})` : ''}`);
     } catch (err) { setError(err.message); } finally { setBusy(false); }
   }
   async function verify() {
@@ -503,12 +501,17 @@ function MobileOtpBox({ api, customer, notify, onVerified, onClose }) {
     } finally { setBusy(false); }
   }
   return <div className="servicing-box otp-box">
-    <div className="otp-box-head"><h3>Mobile OTP verification</h3>{onClose && <button type="button" className="icon-btn" aria-label="Close mobile OTP verification" onClick={onClose}><X size={16}/></button>}</div>
+    <div className="otp-box-head">
+      <h3>Mobile OTP verification</h3>
+      <span className="pill">{smsStatus?.configured ? 'Live SMS' : 'Demo OTP'}</span>
+      {onClose && <button type="button" className="icon-btn" aria-label="Close mobile OTP verification" onClick={onClose}><X size={16}/></button>}
+    </div>
     <p>{customer.name} · {customer.customer_id} · {customer.mobile}</p>
-    {session && !expired && session.attempts_remaining > 0 && <><label>6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" maxLength="6" pattern="[0-9]{6}" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} onKeyDown={e=>e.key==='Enter' && (e.preventDefault(), verify())}/></label>{session.dev_otp && <small>Demo mode (no real SMS): OTP is {session.dev_otp}</small>}</>}
+    {!smsStatus?.configured && <div className="locked-note"><AlertTriangle size={15}/> SMS Gateway not connected on this server · Demo mode active</div>}
+    {session && !expired && session.attempts_remaining > 0 && <><label>6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" maxLength="6" pattern="[0-9]{6}" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} onKeyDown={e=>e.key==='Enter' && (e.preventDefault(), verify())}/></label>{session.dev_otp && <div className="locked-note dev-otp-badge">Demo mode OTP: <strong>{session.dev_otp}</strong></div>}</>}
     <div className="action-row">
       {session && !expired && session.attempts_remaining > 0 && <button type="button" className="primary small" disabled={busy || code.length !== 6} onClick={verify}>Verify OTP</button>}
-      <button type="button" className={session ? 'ghost small' : 'primary small'} disabled={busy || resendIn > 0} onClick={send}>{busy && !session ? 'Sending…' : session ? (resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend OTP') : 'Send OTP by SMS'}</button>
+      <button type="button" className={session ? 'ghost small' : 'primary small'} disabled={busy || resendIn > 0} onClick={send}>{busy && !session ? 'Sending…' : session ? (resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend OTP') : (smsStatus?.configured ? 'Send OTP by SMS' : 'Send Demo OTP')}</button>
     </div>
     {session && <small>{expired ? 'OTP expired — send a new one.' : session.attempts_remaining > 0 ? `Sent to ${session.masked_destination} · ${session.attempts_remaining} attempts remaining · expires ${new Date(session.expires_at).toLocaleTimeString('en-IN')}` : 'OTP locked — send a new one.'}</small>}
     {error && <div className="error-banner" role="alert">{error}</div>}
@@ -528,6 +531,9 @@ function Customers({ api, user, notify }) {
   const [saving, setSaving] = useState(false);
   const [aadhaarRequests, setAadhaarRequests] = useState([]);
   const [providerStatus, setProviderStatus] = useState({ configured:false, provider:null });
+  const [smsStatus, setSmsStatus] = useState({ configured:false, demo_mode:true });
+  const [registrationOtp, setRegistrationOtp] = useState({ session: null, code: '', verified: false, otp_id: '', busy: false, error: '', verifiedMobile: '' });
+  const [otpClock, setOtpClock] = useState(Date.now());
   const [onboardingOtp, setOnboardingOtp] = useState({ customer_id:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, masked_destination:'', verified_at:'' });
   const [otpBusy, setOtpBusy] = useState(false);
   const [mobileOtpCustomer, setMobileOtpCustomer] = useState(null);
@@ -549,9 +555,62 @@ function Customers({ api, user, notify }) {
   };
   useEffect(() => { load(); }, []);
   useEffect(() => {
+    api('/api/sms/status').then(setSmsStatus).catch(() => setSmsStatus({ configured: false, demo_mode: true }));
+  }, []);
+  useEffect(() => {
     const timer = setTimeout(() => load(customerQuery), 250);
     return () => clearTimeout(timer);
   }, [customerQuery]);
+  useEffect(() => {
+    if (!registrationOtp.session) return;
+    const t = setInterval(() => setOtpClock(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [registrationOtp.session]);
+
+  const registrationResendIn = registrationOtp.session
+    ? Math.max(0, Math.ceil((new Date(registrationOtp.session.resend_available_at) - otpClock) / 1000))
+    : 0;
+
+  async function sendRegistrationOtp() {
+    if (!/^[6-9]\d{9}$/.test(form.mobile)) return setFormError('Enter a valid 10-digit Indian mobile number to send OTP.');
+    setRegistrationOtp(cur => ({ ...cur, busy: true, error: '' }));
+    setFormError('');
+    try {
+      const result = await api('/api/registration/mobile-otp/send', { method: 'POST', body: JSON.stringify({ mobile: form.mobile }) });
+      setRegistrationOtp(cur => ({ ...cur, session: result, code: '', error: '' }));
+      notify(`OTP sent to +91 ${form.mobile}.${result.dev_otp ? ` (Demo mode OTP: ${result.dev_otp})` : ''}`);
+    } catch (err) {
+      setRegistrationOtp(cur => ({ ...cur, error: err.message }));
+    } finally {
+      setRegistrationOtp(cur => ({ ...cur, busy: false }));
+    }
+  }
+
+  async function verifyRegistrationOtp() {
+    if (registrationOtp.code.length !== 6) {
+      return setRegistrationOtp(cur => ({ ...cur, error: 'Enter the 6-digit OTP.' }));
+    }
+    setRegistrationOtp(cur => ({ ...cur, busy: true, error: '' }));
+    try {
+      const result = await api('/api/registration/mobile-otp/verify', {
+        method: 'POST',
+        body: JSON.stringify({ otp_id: registrationOtp.session.otp_id, mobile: form.mobile, otp: registrationOtp.code }),
+      });
+      setRegistrationOtp(cur => ({ ...cur, verified: true, otp_id: result.otp_id, verifiedMobile: form.mobile, session: null, code: '', error: '' }));
+      notify(`Mobile +91 ${form.mobile} successfully verified!`);
+    } catch (err) {
+      const match = err.message.match(/(\d+) attempts? remaining/i);
+      setRegistrationOtp(cur => ({
+        ...cur,
+        code: '',
+        error: err.message,
+        session: cur.session ? { ...cur.session, attempts_remaining: match ? Number(match[1]) : err.message.toLowerCase().includes('locked') ? 0 : cur.session.attempts_remaining } : null,
+      }));
+    } finally {
+      setRegistrationOtp(cur => ({ ...cur, busy: false }));
+    }
+  }
+
   const previousMatches = useMemo(() => findCustomerMatches(knownCustomers, form.name, form.mobile), [knownCustomers, form.name, form.mobile]);
   const areaOf = row => row.area_code || row.area || '';
   const pendingCount = useMemo(() => rows.filter(row => row.status === 'Pending Verification').length, [rows]);
@@ -575,18 +634,24 @@ function Customers({ api, user, notify }) {
     if (registrationMode === 'aadhaar' && (!form.aadhaar_consent_given || form.aadhaar_consent_reference.trim().length < 3)) return setFormError('Record customer consent and its reference before continuing.');
     setSaving(true);
     try {
-      const payload = { ...form, aadhaar: registrationMode === 'aadhaar' ? form.aadhaar : '' };
+      const isMobileVerified = registrationOtp.verified && registrationOtp.verifiedMobile === form.mobile;
+      const payload = {
+        ...form,
+        aadhaar: registrationMode === 'aadhaar' ? form.aadhaar : '',
+        mobile_otp_id: isMobileVerified ? registrationOtp.otp_id : '',
+      };
       const res = await api('/api/customers', { method: 'POST', body: JSON.stringify(payload) });
       setReceipt({ type: res.duplicate ? 'Verification Acknowledgement' : 'Registration Acknowledgement', ack: res.ack_no, customer: res.customer });
-      setMobileOtpCustomer(res.duplicate ? null : res.customer);
+      setMobileOtpCustomer(res.duplicate || isMobileVerified ? null : res.customer);
       if (!res.duplicate && registrationMode === 'aadhaar' && providerStatus.configured) {
         const otpResult = await api('/api/aadhaar/otp/start', { method:'POST', body:JSON.stringify({ customer_id:res.customer.customer_id, purpose:form.aadhaar_consent_purpose, consent_reference:form.aadhaar_consent_reference, proposed_disbursal_amount:0, owner_notes:'Automatic verification during customer onboarding' }) });
         setOnboardingOtp({ customer_id:res.customer.customer_id, otp:'', verified_at:'', ...otpResult });
         notify(`Customer saved. Aadhaar OTP sent to ${otpResult.masked_destination}.`);
       } else {
-        notify(res.duplicate ? 'Existing customer found. Duplicate customer was not created.' : registrationMode === 'aadhaar' ? 'Customer saved pending automatic Aadhaar verification.' : 'Manual profile saved as Pending Verification.');
+        notify(res.duplicate ? 'Existing customer found. Duplicate customer was not created.' : isMobileVerified ? 'Customer saved with verified mobile number.' : registrationMode === 'aadhaar' ? 'Customer saved pending automatic Aadhaar verification.' : 'Manual profile saved as Pending Verification.');
       }
       setForm(current => ({ ...current, name: '', father_name: '', mobile: '', aadhaar: '', address: '', guarantor: '', status: 'Pending Verification', aadhaar_consent_given: false, aadhaar_consent_reference: '' }));
+      setRegistrationOtp({ session: null, code: '', verified: false, otp_id: '', busy: false, error: '', verifiedMobile: '' });
       await load();
     } catch (err) {
       setFormError(err.message || 'Customer could not be registered. Please try again.');
@@ -686,7 +751,74 @@ function Customers({ api, user, notify }) {
         <div className="two-col">
           <label>Name<input required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></label>
           <label>Father's name<input required value={form.father_name} onChange={e => setForm({ ...form, father_name: e.target.value })} /></label>
-          <label>Mobile<input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" value={form.mobile} onChange={e => setForm({ ...form, mobile: e.target.value.replace(/\D/g, '') })} /></label>
+          <label>Mobile<input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" value={form.mobile} onChange={e => {
+            const val = e.target.value.replace(/\D/g, '').slice(0, 10);
+            setForm({ ...form, mobile: val });
+            if (val !== registrationOtp.verifiedMobile) {
+              setRegistrationOtp(cur => ({ ...cur, verified: false, otp_id: '', verifiedMobile: '' }));
+            }
+          }} /></label>
+          {form.mobile.length === 10 && (
+            <div className="registration-otp-box">
+              {registrationOtp.verified && registrationOtp.verifiedMobile === form.mobile ? (
+                <div className="locked-note verified-badge">
+                  <span><CheckCircle2 size={16} /> Mobile <strong>+91 {form.mobile}</strong> verified by SMS OTP!</span>
+                  <button type="button" className="ghost small subtle-btn" onClick={() => setRegistrationOtp({ session: null, code: '', verified: false, otp_id: '', busy: false, error: '', verifiedMobile: '' })}>Change number</button>
+                </div>
+              ) : (
+                <div className="servicing-box otp-box">
+                  <div className="otp-box-head">
+                    <span className="section-kicker" style={{margin:0}}>Mobile OTP verification</span>
+                    <span className="pill">{smsStatus?.configured ? 'Live SMS' : 'Demo OTP'}</span>
+                  </div>
+                  <p style={{margin:'4px 0 8px', fontSize:13}}>Send an OTP to verify <strong>+91 {form.mobile}</strong> before onboarding.</p>
+                  {!smsStatus?.configured && <div className="locked-note" style={{marginBottom:8, fontSize:12}}><AlertTriangle size={14}/> SMS Gateway not connected on this server · Demo OTP will be displayed</div>}
+                  {registrationOtp.session && (
+                    <>
+                      <label style={{marginTop: 6}}>
+                        6-digit OTP
+                        <input
+                          inputMode="numeric"
+                          autoComplete="one-time-code"
+                          maxLength="6"
+                          placeholder="Enter 6-digit OTP"
+                          value={registrationOtp.code}
+                          onChange={e => setRegistrationOtp({ ...registrationOtp, code: e.target.value.replace(/\D/g, '').slice(0, 6) })}
+                          onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), verifyRegistrationOtp())}
+                        />
+                      </label>
+                      {registrationOtp.session.dev_otp && (
+                        <div className="locked-note dev-otp-badge">
+                          Demo mode OTP: <strong>{registrationOtp.session.dev_otp}</strong>
+                        </div>
+                      )}
+                    </>
+                  )}
+                  <div className="action-row" style={{marginTop: 8}}>
+                    {registrationOtp.session && (
+                      <button
+                        type="button"
+                        className="primary small"
+                        disabled={registrationOtp.busy || registrationOtp.code.length !== 6}
+                        onClick={verifyRegistrationOtp}
+                      >
+                        {registrationOtp.busy ? 'Verifying…' : 'Verify OTP'}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className={registrationOtp.session ? 'ghost small' : 'primary small'}
+                      disabled={registrationOtp.busy || registrationResendIn > 0}
+                      onClick={sendRegistrationOtp}
+                    >
+                      {registrationOtp.busy && !registrationOtp.session ? 'Sending…' : registrationOtp.session ? (registrationResendIn > 0 ? `Resend in ${registrationResendIn}s` : 'Resend OTP') : (smsStatus?.configured ? 'Send OTP by SMS' : 'Send Demo OTP')}
+                    </button>
+                  </div>
+                  {registrationOtp.error && <div className="form-error" role="alert" style={{marginTop: 6}}>{registrationOtp.error}</div>}
+                </div>
+              )}
+            </div>
+          )}
           {registrationMode === 'aadhaar' && <><label>Aadhaar<input required inputMode="numeric" minLength="12" maxLength="12" pattern="[0-9]{12}" value={form.aadhaar} onChange={e => setForm({ ...form, aadhaar: e.target.value.replace(/\D/g, '') })} /></label><label>Purpose disclosed<input required minLength="5" value={form.aadhaar_consent_purpose} onChange={e=>setForm({...form,aadhaar_consent_purpose:e.target.value})}/></label><label>Consent reference<input required minLength="3" placeholder="Signed form / OTP reference" value={form.aadhaar_consent_reference} onChange={e=>setForm({...form,aadhaar_consent_reference:e.target.value})}/></label><label className="check-row"><input type="checkbox" checked={form.aadhaar_consent_given} onChange={e=>setForm({...form,aadhaar_consent_given:e.target.checked})}/> Customer gave informed consent for this disclosed purpose</label></>}
           <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code} value={a.code}>{a.name}</option>)}</select></label>
           <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
@@ -695,7 +827,7 @@ function Customers({ api, user, notify }) {
         <label>Address<textarea required value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></label>
         <label>Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
         {formError && <div className="error" role="alert">{formError}</div>}
-        <button className="primary" disabled={saving}><Plus size={18} /> {saving ? 'Saving securely…' : registrationMode === 'aadhaar' ? 'Register and send Aadhaar OTP' : 'Create pending profile'}</button>
+        <button className="primary" disabled={saving}><Plus size={18} /> {saving ? 'Saving securely…' : registrationMode === 'aadhaar' ? 'Register and send Aadhaar OTP' : (registrationOtp.verified && registrationOtp.verifiedMobile === form.mobile ? 'Register verified customer' : 'Create pending profile')}</button>
         {onboardingOtp.verification_id && <div className="servicing-box otp-box"><div className="otp-box-head"><h3>Aadhaar OTP verification</h3><button type="button" className="icon-btn" aria-label="Close OTP verification" onClick={() => { setOnboardingOtp({ customer_id:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, masked_destination:'', verified_at:'' }); setFormError(''); }}><X size={16}/></button></div><p>Customer {onboardingOtp.customer_id} · sent to {onboardingOtp.masked_destination || 'Aadhaar-linked mobile'}</p>{onboardingOtp.verified_at ? <div className="locked-note"><CheckCircle2 size={16}/> Verified at {new Date(onboardingOtp.verified_at).toLocaleString('en-IN')} · proof {onboardingOtp.verification_id}</div> : <><label>4 or 6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" value={onboardingOtp.otp} onChange={e=>setOnboardingOtp({...onboardingOtp,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/></label><div className="action-row"><button type="button" className="primary small" disabled={otpBusy || onboardingOtp.attempts_remaining===0 || ![4,6].includes(onboardingOtp.otp.length)} onClick={verifyOnboardingOtp}>Verify OTP</button><button type="button" className="ghost small" disabled={otpBusy || onboardingOtp.resends_remaining===0} onClick={resendOnboardingOtp}>Resend</button></div><small>{onboardingOtp.attempts_remaining > 0 ? `${onboardingOtp.attempts_remaining} attempts remaining` : 'OTP locked — resend or start a new verification'} · {onboardingOtp.resends_remaining} resends remaining</small></>}</div>}
         {mobileOtpCustomer && <MobileOtpBox api={api} customer={mobileOtpCustomer} notify={notify} onClose={() => setMobileOtpCustomer(null)} onVerified={async () => { setMobileOtpCustomer(null); await load(); }} />}
       </form>

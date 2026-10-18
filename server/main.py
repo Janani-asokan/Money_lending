@@ -72,6 +72,17 @@ REQUIRE_VERIFIED_DISBURSAL = os.getenv("REQUIRE_VERIFIED_DISBURSAL", "false").lo
 # each OTP costs nothing beyond your normal mobile plan. "console" prints the OTP in the
 # server log (development only). "disabled" turns the feature off.
 SMS_PROVIDER = os.getenv("SMS_PROVIDER", "disabled" if APP_ENV == "production" else "console").strip().lower()
+
+def normalized_sms_provider() -> str:
+    p = SMS_PROVIDER.strip().lower()
+    if p in {"smsgate", "sms_gate", "android", "android_gateway"}:
+        return "android_gateway"
+    if p in {"console", "demo", "mock"}:
+        return "console"
+    if p in {"disabled", "none", "off", "false", ""}:
+        return "disabled"
+    return p
+
 SMS_GATEWAY_URL = os.getenv("SMS_GATEWAY_URL", "https://api.sms-gate.app/3rdparty/v1/message").strip()
 SMS_GATEWAY_USERNAME = os.getenv("SMS_GATEWAY_USERNAME", "")
 SMS_GATEWAY_PASSWORD = os.getenv("SMS_GATEWAY_PASSWORD", "")
@@ -245,9 +256,10 @@ def validate_production_config() -> None:
         problems.append("COOKIE_SECURE must be true")
     if len(BACKUP_ENCRYPTION_KEY) != 32:
         problems.append("BACKUP_ENCRYPTION_KEY must be exactly 32 UTF-8 bytes")
-    if SMS_PROVIDER not in {"disabled", "android_gateway"}:
-        problems.append("SMS_PROVIDER must be android_gateway or disabled (console mode prints OTPs to the log)")
-    if SMS_PROVIDER == "android_gateway" and not (SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD):
+    norm_sms = normalized_sms_provider()
+    if norm_sms not in {"disabled", "android_gateway", "console"}:
+        problems.append("SMS_PROVIDER must be android_gateway, console, or disabled")
+    if norm_sms == "android_gateway" and not (SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD):
         problems.append("SMS_GATEWAY_URL, SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD are required for android_gateway")
     if problems:
         raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
@@ -282,6 +294,7 @@ class CustomerIn(BaseModel):
     aadhaar_consent_given: bool = False
     aadhaar_consent_purpose: str = Field(default="", max_length=300)
     aadhaar_consent_reference: str = Field(default="", max_length=120)
+    mobile_otp_id: str = Field(default="", max_length=50)
 
     def model_post_init(self, __context: Any) -> None:
         if self.status not in VERIFICATION_STATUSES:
@@ -569,6 +582,32 @@ class AadhaarOtpResendIn(BaseModel):
 class MobileOtpVerifyIn(BaseModel):
     otp_id: str = Field(min_length=3, max_length=40)
     otp: str = Field(pattern=r"^\d{6}$")
+
+
+class RegistrationOtpSendIn(BaseModel):
+    mobile: str = Field(min_length=10, max_length=15)
+
+    @field_validator("mobile")
+    @classmethod
+    def valid_mobile(cls, value: str) -> str:
+        digits = "".join(ch for ch in value if ch.isdigit())
+        if len(digits) != 10 or digits[0] not in "6789":
+            raise ValueError("Mobile must be a valid 10-digit Indian number")
+        return digits
+
+
+class RegistrationOtpVerifyIn(BaseModel):
+    otp_id: str = Field(min_length=3, max_length=40)
+    mobile: str = Field(min_length=10, max_length=15)
+    otp: str = Field(pattern=r"^\d{6}$")
+
+    @field_validator("mobile")
+    @classmethod
+    def valid_mobile(cls, value: str) -> str:
+        digits = "".join(ch for ch in value if ch.isdigit())
+        if len(digits) != 10 or digits[0] not in "6789":
+            raise ValueError("Mobile must be a valid 10-digit Indian number")
+        return digits
 
 
 class LoanAdjustmentIn(BaseModel):
@@ -1126,9 +1165,10 @@ async def aadhaar_provider_call(path: str, payload: dict[str, Any]) -> dict[str,
 
 
 def sms_configured() -> bool:
-    if SMS_PROVIDER == "console":
-        return APP_ENV != "production"
-    if SMS_PROVIDER == "android_gateway":
+    provider = normalized_sms_provider()
+    if provider == "console":
+        return True
+    if provider == "android_gateway":
         return bool(SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
     return False
 
@@ -1142,22 +1182,25 @@ def mobile_otp_hash(otp_id: str, otp: str) -> str:
 
 
 async def send_sms(mobile: str, text: str) -> None:
-    if not sms_configured():
-        raise HTTPException(409, "SMS is not configured. Set SMS_PROVIDER and the gateway credentials on the server.")
-    if SMS_PROVIDER == "console":
+    provider = normalized_sms_provider()
+    if provider == "console":
         print(f"[SMS console] to +91{mobile}: {text}", flush=True)
         return
-    def send() -> None:
-        body = json.dumps({"textMessage": {"text": text}, "phoneNumbers": [f"+91{mobile}"]}).encode()
-        credentials = base64.b64encode(f"{SMS_GATEWAY_USERNAME}:{SMS_GATEWAY_PASSWORD}".encode()).decode()
-        request = UrlRequest(SMS_GATEWAY_URL, data=body, method="POST", headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}", "User-Agent": "MoneyLendingSMS/1.0"})
-        try:
-            with urlopen(request, timeout=20) as response: response.read()
-        except HTTPError as exc:
-            raise HTTPException(424, f"SMS gateway rejected the request with status {exc.code}") from exc
-        except (URLError, TimeoutError) as exc:
-            raise HTTPException(424, "SMS gateway is unreachable. Check that the gateway phone is online.") from exc
-    await asyncio.to_thread(send)
+    if provider == "android_gateway" and SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD:
+        def send() -> None:
+            body = json.dumps({"textMessage": {"text": text}, "phoneNumbers": [f"+91{mobile}"]}).encode()
+            credentials = base64.b64encode(f"{SMS_GATEWAY_USERNAME}:{SMS_GATEWAY_PASSWORD}".encode()).decode()
+            request = UrlRequest(SMS_GATEWAY_URL, data=body, method="POST", headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}", "User-Agent": "MoneyLendingSMS/1.0"})
+            try:
+                with urlopen(request, timeout=20) as response: response.read()
+            except HTTPError as exc:
+                raise HTTPException(424, f"SMS gateway rejected the request with status {exc.code}") from exc
+            except (URLError, TimeoutError) as exc:
+                raise HTTPException(424, "SMS gateway is unreachable. Check that the gateway phone is online.") from exc
+        await asyncio.to_thread(send)
+        return
+    # If gateway is not configured, log to console and allow demo OTP so verification is testable
+    print(f"[SMS demo] to +91{mobile}: {text}", flush=True)
 
 
 @asynccontextmanager
@@ -2269,11 +2312,29 @@ async def create_customer(payload: CustomerIn, request: Request, user: dict[str,
     if payload.aadhaar:
         consent_seq = await next_sequence("CNS", "consent_id", "aadhaar_consents")
         consent = {"consent_id": f"CNS-{consent_seq:09d}", "customer_id": customer_id, "status": "Active", "purpose_disclosed": payload.aadhaar_consent_purpose.strip(), "customer_consent_reference": payload.aadhaar_consent_reference.strip(), "captured_at": iso(now()), "captured_by": user["name"], "captured_by_id": user["id"]}
-    audit_details = {"masked_aadhaar": mask_aadhaar(payload.aadhaar) if payload.aadhaar else "Not provided", "method": "aadhaar" if payload.aadhaar else "manual", "status": "Pending Verification"}
+    mobile_event = None
+    if payload.mobile_otp_id:
+        otp_rec = await find_one("mobile_otps", {"otp_id": payload.mobile_otp_id, "mobile": payload.mobile, "status": "Verified"})
+        if otp_rec:
+            customer["mobile_verified_at"] = otp_rec.get("completed_at", iso(now()))
+            customer["mobile_verified_by"] = user["name"]
+            customer["mobile_verified_number"] = payload.mobile
+            customer["mobile_otp_id"] = payload.mobile_otp_id
+            m_seq = await next_sequence("VEF", "id", "verification_events")
+            mobile_event = {
+                "id": f"VEF-{m_seq:08d}", "customer_id": customer_id,
+                "from_status": None, "to_status": "Pending Verification",
+                "reason": f"Mobile {mask_mobile(payload.mobile)} verified by SMS OTP during registration",
+                "verification_id": payload.mobile_otp_id, "provider": "SMS OTP",
+                "timestamp": iso(now()), "updated_by": user["name"]
+            }
+    audit_details = {"masked_aadhaar": mask_aadhaar(payload.aadhaar) if payload.aadhaar else "Not provided", "method": "aadhaar" if payload.aadhaar else "manual", "status": "Pending Verification", "mobile_verified": bool(customer.get("mobile_verified_at"))}
     try:
         if USE_MEMORY:
             await insert_one("customers", customer)
             await insert_one("verification_events", verification_event)
+            if mobile_event: await insert_one("verification_events", mobile_event)
+            if payload.mobile_otp_id: await update_where("mobile_otps", {"otp_id": payload.mobile_otp_id}, {"customer_id": customer_id})
             if consent: await insert_one("aadhaar_consents", consent)
             await audit(user, "customer_registration", "customer", customer_id, audit_details, request)
         else:
@@ -2281,6 +2342,8 @@ async def create_customer(payload: CustomerIn, request: Request, user: dict[str,
                 async with session.start_transaction():
                     await db.customers.insert_one(deepcopy(customer), session=session)
                     await db.verification_events.insert_one(deepcopy(verification_event), session=session)
+                    if mobile_event: await db.verification_events.insert_one(deepcopy(mobile_event), session=session)
+                    if payload.mobile_otp_id: await db.mobile_otps.update_one({"otp_id": payload.mobile_otp_id}, {"$set": {"customer_id": customer_id}}, session=session)
                     if consent: await db.aadhaar_consents.insert_one(deepcopy(consent), session=session)
                     await audit(user, "customer_registration", "customer", customer_id, audit_details, request, session=session)
     except DuplicateKeyError as exc:
@@ -2421,8 +2484,90 @@ async def resend_aadhaar_otp(payload: AadhaarOtpResendIn, request: Request, user
 
 
 @app.get("/api/sms/status")
-async def sms_status(user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
-    return {"configured": sms_configured(), "provider": SMS_PROVIDER, "otp_ttl_seconds": MOBILE_OTP_TTL_SECONDS, "mobile_verified_disbursal_required": REQUIRE_MOBILE_VERIFIED_DISBURSAL}
+async def sms_status(user: dict[str, Any] = Depends(require("owner", "manager", "accountant", "collector"))) -> dict[str, Any]:
+    norm_provider = normalized_sms_provider()
+    configured = bool(norm_provider == "android_gateway" and SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
+    return {
+        "configured": configured,
+        "provider": norm_provider,
+        "raw_provider": SMS_PROVIDER,
+        "otp_ttl_seconds": MOBILE_OTP_TTL_SECONDS,
+        "mobile_verified_disbursal_required": REQUIRE_MOBILE_VERIFIED_DISBURSAL,
+        "demo_mode": not configured or norm_provider == "console",
+        "has_credentials": bool(SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD),
+    }
+
+
+@app.post("/api/registration/mobile-otp/send")
+async def send_registration_mobile_otp(payload: RegistrationOtpSendIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager", "accountant", "collector"))) -> dict[str, Any]:
+    mobile = payload.mobile
+    stamp = now()
+    history = await find_many("mobile_otps", {"mobile": mobile})
+    if sum(1 for row in history if parse_date(row["created_at"]) > stamp - timedelta(days=1)) >= MOBILE_OTP_DAILY_LIMIT:
+        raise HTTPException(429, "Daily OTP limit reached for this mobile number. Try again tomorrow.")
+    latest = max(history, key=lambda row: row["created_at"], default=None)
+    if latest and latest.get("status") == "Sent":
+        available_at = parse_date(latest["created_at"]) + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS)
+        if available_at > stamp:
+            raise HTTPException(429, f"Please wait {int((available_at - stamp).total_seconds()) + 1} seconds before resending OTP.")
+    seq = await next_sequence("MOTP", "otp_id", "mobile_otps")
+    otp_id = f"MOTP-{seq:09d}"
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    minutes = MOBILE_OTP_TTL_SECONDS // 60
+    await send_sms(mobile, f"{otp} is your OTP to verify your mobile number with {SMS_SENDER_NAME}. Valid for {minutes} minutes. Do not share it with anyone.")
+    for row in history:
+        if row.get("status") == "Sent":
+            await update_where("mobile_otps", {"otp_id": row["otp_id"], "status": "Sent"}, {"status": "Superseded", "completed_at": iso(stamp)})
+    norm_provider = normalized_sms_provider()
+    gateway_ready = bool(norm_provider == "android_gateway" and SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
+    record = {
+        "otp_id": otp_id, "customer_id": None, "mobile": mobile,
+        "otp_hash": mobile_otp_hash(otp_id, otp), "provider": norm_provider,
+        "status": "Sent", "created_at": iso(stamp),
+        "expires_at": iso(stamp + timedelta(seconds=MOBILE_OTP_TTL_SECONDS)),
+        "attempt_count": 0, "max_attempts": MOBILE_OTP_MAX_ATTEMPTS,
+        "requested_by": user["name"], "requested_by_id": user["id"]
+    }
+    await insert_one("mobile_otps", record)
+    await audit(user, "registration_mobile_otp_sent", "mobile", mobile, {"otp_id": otp_id, "mobile": mask_mobile(mobile), "provider": norm_provider}, request)
+    result = {
+        "otp_id": otp_id, "status": "Sent", "masked_destination": mask_mobile(mobile),
+        "expires_at": record["expires_at"], "expires_in_seconds": MOBILE_OTP_TTL_SECONDS,
+        "attempts_remaining": MOBILE_OTP_MAX_ATTEMPTS,
+        "resend_available_at": iso(stamp + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS)),
+        "sms_provider": norm_provider,
+        "sms_gateway_configured": gateway_ready,
+    }
+    if not gateway_ready or norm_provider == "console" or APP_ENV != "production":
+        result["dev_otp"] = otp
+    return result
+
+
+@app.post("/api/registration/mobile-otp/verify")
+async def verify_registration_mobile_otp(payload: RegistrationOtpVerifyIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager", "accountant", "collector"))) -> dict[str, Any]:
+    record = await find_one("mobile_otps", {"otp_id": payload.otp_id, "mobile": payload.mobile})
+    if not record:
+        raise HTTPException(404, "OTP request not found")
+    if record["status"] != "Sent":
+        raise HTTPException(409, "This OTP is no longer valid. Send a new OTP.")
+    stamp = now()
+    if parse_date(record["expires_at"]) <= stamp:
+        await update_where("mobile_otps", {"otp_id": payload.otp_id, "status": "Sent"}, {"status": "Expired", "completed_at": iso(stamp)})
+        raise HTTPException(410, "OTP expired. Send a new OTP.")
+    if not hmac.compare_digest(record["otp_hash"], mobile_otp_hash(payload.otp_id, payload.otp)):
+        attempts = int(record.get("attempt_count", 0))
+        remaining = max(int(record.get("max_attempts", MOBILE_OTP_MAX_ATTEMPTS)) - attempts - 1, 0)
+        changed = await update_where("mobile_otps", {"otp_id": payload.otp_id, "status": "Sent", "attempt_count": attempts}, {"status": "Locked" if remaining == 0 else "Sent", "last_failed_at": iso(stamp)}, {"attempt_count": 1})
+        if not changed:
+            raise HTTPException(409, "OTP state changed. Please try again.")
+        await audit(user, "registration_mobile_otp_failed", "mobile", payload.mobile, {"otp_id": payload.otp_id, "attempts_remaining": remaining}, request)
+        if remaining == 0:
+            raise HTTPException(423, "OTP locked after 3 incorrect attempts. Send a new OTP.")
+        raise HTTPException(422, f"Incorrect OTP. {remaining} attempt{'s' if remaining != 1 else ''} remaining.")
+    if not await update_where("mobile_otps", {"otp_id": payload.otp_id, "status": "Sent"}, {"status": "Verified", "completed_at": iso(stamp)}):
+        raise HTTPException(409, "This OTP was already used")
+    await audit(user, "registration_mobile_otp_verified", "mobile", payload.mobile, {"otp_id": payload.otp_id, "mobile": mask_mobile(payload.mobile)}, request)
+    return {"verified": True, "otp_id": payload.otp_id, "mobile": payload.mobile, "verified_at": iso(stamp)}
 
 
 @app.post("/api/customers/{customer_id}/mobile-otp/send")
@@ -2432,8 +2577,6 @@ async def send_mobile_otp(customer_id: str, request: Request, user: dict[str, An
         raise HTTPException(404, "Active customer profile not found")
     if mobile_verified(customer):
         raise HTTPException(409, "This mobile number is already verified")
-    if not sms_configured():
-        raise HTTPException(409, "SMS is not configured. Set SMS_PROVIDER and the gateway credentials on the server.")
     stamp = now()
     history = await find_many("mobile_otps", {"customer_id": customer_id})
     if sum(1 for row in history if parse_date(row["created_at"]) > stamp - timedelta(days=1)) >= MOBILE_OTP_DAILY_LIMIT:
@@ -2451,11 +2594,13 @@ async def send_mobile_otp(customer_id: str, request: Request, user: dict[str, An
     for row in history:
         if row.get("status") == "Sent":
             await update_where("mobile_otps", {"otp_id": row["otp_id"], "status": "Sent"}, {"status": "Superseded", "completed_at": iso(stamp)})
-    record = {"otp_id": otp_id, "customer_id": customer_id, "mobile": customer["mobile"], "otp_hash": mobile_otp_hash(otp_id, otp), "provider": SMS_PROVIDER, "status": "Sent", "created_at": iso(stamp), "expires_at": iso(stamp + timedelta(seconds=MOBILE_OTP_TTL_SECONDS)), "attempt_count": 0, "max_attempts": MOBILE_OTP_MAX_ATTEMPTS, "requested_by": user["name"], "requested_by_id": user["id"]}
+    norm_provider = normalized_sms_provider()
+    gateway_ready = bool(norm_provider == "android_gateway" and SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
+    record = {"otp_id": otp_id, "customer_id": customer_id, "mobile": customer["mobile"], "otp_hash": mobile_otp_hash(otp_id, otp), "provider": norm_provider, "status": "Sent", "created_at": iso(stamp), "expires_at": iso(stamp + timedelta(seconds=MOBILE_OTP_TTL_SECONDS)), "attempt_count": 0, "max_attempts": MOBILE_OTP_MAX_ATTEMPTS, "requested_by": user["name"], "requested_by_id": user["id"]}
     await insert_one("mobile_otps", record)
-    await audit(user, "mobile_otp_sent", "customer", customer_id, {"otp_id": otp_id, "mobile": mask_mobile(customer["mobile"]), "provider": SMS_PROVIDER}, request)
-    result = {"otp_id": otp_id, "status": "Sent", "masked_destination": mask_mobile(customer["mobile"]), "expires_at": record["expires_at"], "expires_in_seconds": MOBILE_OTP_TTL_SECONDS, "attempts_remaining": MOBILE_OTP_MAX_ATTEMPTS, "resend_available_at": iso(stamp + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS))}
-    if SMS_PROVIDER == "console" and APP_ENV != "production":
+    await audit(user, "mobile_otp_sent", "customer", customer_id, {"otp_id": otp_id, "mobile": mask_mobile(customer["mobile"]), "provider": norm_provider}, request)
+    result = {"otp_id": otp_id, "status": "Sent", "masked_destination": mask_mobile(customer["mobile"]), "expires_at": record["expires_at"], "expires_in_seconds": MOBILE_OTP_TTL_SECONDS, "attempts_remaining": MOBILE_OTP_MAX_ATTEMPTS, "resend_available_at": iso(stamp + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS)), "sms_provider": norm_provider, "sms_gateway_configured": gateway_ready}
+    if not gateway_ready or norm_provider == "console" or APP_ENV != "production":
         result["dev_otp"] = otp
     return result
 

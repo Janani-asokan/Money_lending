@@ -1091,3 +1091,10 @@ td .action-row button { white-space: nowrap; }
   .loan-table td small { white-space: normal; }
 }
 .toast { cursor: pointer; }
+.registration-otp-box { grid-column: 1 / -1; margin: 4px 0 12px; }
+.registration-otp-box .otp-box { margin-top: 0; background: color-mix(in srgb, var(--panel, #fff) 96%, var(--accent)); border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent); border-radius: var(--radius, 10px); padding: 14px; }
+.verified-badge { background: #e4f6e9 !important; color: #14713a !important; font-weight: 600; display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-radius: 8px; border: 1px solid color-mix(in srgb, #14713a 30%, transparent); }
+:root[data-theme="dark"] .verified-badge { background: rgba(34,197,94,.16) !important; color: #bbf7d0 !important; border-color: rgba(34,197,94,.3); }
+.subtle-btn { margin-left: auto; text-decoration: underline; cursor: pointer; font-size: 12px; padding: 2px 8px; }
+.dev-otp-badge { background: #eff6ff !important; color: #1e40af !important; font-weight: 600; padding: 6px 10px; border-radius: 6px; margin: 6px 0; border: 1px dashed color-mix(in srgb, #1e40af 35%, transparent); }
+:root[data-theme="dark"] .dev-otp-badge { background: rgba(59,130,246,.16) !important; color: #93c5fd !important; border-color: rgba(59,130,246,.3); }
