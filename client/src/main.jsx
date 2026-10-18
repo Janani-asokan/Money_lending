@@ -155,6 +155,14 @@ function App() {
     localStorage.setItem('stf_lang', lang);
   }, [lang]);
 
+  // Messages disappear on their own (longer ones stay a little longer) and clear when the screen changes.
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(''), Math.min(9000, 3500 + toast.length * 40));
+    return () => clearTimeout(timer);
+  }, [toast]);
+  useEffect(() => { setToast(''); }, [view]);
+
   useEffect(() => {
     localStorage.setItem('stf_sidebar_collapsed', String(sidebarCollapsed));
   }, [sidebarCollapsed]);
@@ -180,6 +188,8 @@ function App() {
     return <Login t={t} setUser={setUser} api={api} theme={theme} setTheme={setTheme} lang={lang} setLang={setLang} />;
   }
 
+  const canOpenProfile = ['owner', 'manager', 'accountant'].includes(user.role);
+  const openCustomer = id => { if (!canOpenProfile) return; setSelectedCustomerId(id); setView('profile'); };
   const nav = [
     ['dashboard', t.dashboard, LayoutDashboard, true],
     ['customers', t.customers, Users, ['owner', 'manager', 'accountant'].includes(user.role)],
@@ -241,16 +251,16 @@ function App() {
           </div>
         </header>
 
-        {toast && <div className="toast">{toast}</div>}
+        {toast && <div className="toast" role="status" aria-live="polite" onClick={() => setToast('')} title="Click to dismiss">{toast}</div>}
         {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} onSelect={id => { setView(id); setPaletteOpen(false); }} />}
         {notificationsOpen && <NotificationCenter api={api} onClose={() => setNotificationsOpen(false)} />}
-        {view === 'dashboard' && <Dashboard api={api} onNavigate={setView} onOpenCustomer={id => { setSelectedCustomerId(id); setView('profile'); }} user={user} />}
+        {view === 'dashboard' && <Dashboard api={api} onNavigate={setView} onOpenCustomer={canOpenProfile ? openCustomer : null} user={user} notify={setToast} />}
         {view === 'customers' && <Customers api={api} user={user} notify={setToast} />}
-        {view === 'profile' && <Customer360 api={api} initialCustomerId={selectedCustomerId} user={user} notify={setToast} />}
+        {view === 'profile' && <Customer360 key={selectedCustomerId} api={api} initialCustomerId={selectedCustomerId} user={user} notify={setToast} />}
         {view === 'loans' && <Loans api={api} notify={setToast} user={user} />}
         {view === 'collections' && <Collections api={api} user={user} notify={setToast} />}
-        {view === 'planner' && <EmiPlanner />}
-        {view === 'search' && <SearchView api={api} />}
+        {view === 'planner' && <EmiPlanner api={api} />}
+        {view === 'search' && <SearchView api={api} user={user} notify={setToast} onOpenCustomer={canOpenProfile ? openCustomer : null} />}
         {view === 'reports' && <Reports api={api} />}
         {view === 'accounting' && <Accounting api={api} user={user} notify={setToast} />}
         {view === 'audit' && <Audit api={api} />}
@@ -342,10 +352,14 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
   );
 }
 
-function Dashboard({ api, onNavigate, onOpenCustomer, user }) {
+function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
   const [data, setData] = useState(null);
   const [dueFilter, setDueFilter] = useState('All');
-  useEffect(() => { api('/api/dashboard').then(setData); }, []);
+  const [loadError, setLoadError] = useState('');
+  const load = () => api('/api/dashboard').then(result => { setData(result); setLoadError(''); }).catch(err => setLoadError(err.message));
+  const viewer = useLoanViewer({ api, notify, user, onChanged: load });
+  useEffect(() => { load(); }, []);
+  if (!data && loadError) return <section className="panel"><div className="error" role="alert">{loadError}</div><button className="primary" onClick={load}>Retry</button></section>;
   if (!data) return <Skeleton />;
   const totals = data.totals;
   const expectedCollection = Math.round(totals.monthly_collection + totals.outstanding * 0.06);
@@ -388,12 +402,12 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user }) {
       </section>
       <section className="panel full">
         <div className="panel-head"><h2>Pending dues</h2><span>Nearest due first across every client plan</span></div>
-        <div className="segmented-control">{['All','Daily','Weekly','Monthly','Overdue'].map(option=><button key={option} className={dueFilter===option?'active':''} onClick={()=>setDueFilter(option)}>{option}</button>)}</div>
-        <div className="table-scroll"><table><thead><tr><th>Due date</th><th>Client</th><th>Plan</th><th>Installment</th><th>Amount due</th><th>Plan balance</th><th>Status</th></tr></thead><tbody>{visibleDues.map(d=><tr key={`${d.loan_id}-${d.installment_number}`}><td>{date(d.next_due_date)}</td><td>{d.customer_name}<small>{d.customer_id} · {d.mobile}</small></td><td>{d.frequency}<small>{d.loan_id}</small></td><td>#{d.installment_number}</td><td>{money(d.amount_due)}</td><td>{money(d.plan_balance)}</td><td><Status value={d.overdue ? `Overdue ${d.days_overdue}d` : 'Upcoming'} /></td></tr>)}</tbody></table></div>
+        <div className="segmented-control five">{['All','Daily','Weekly','Monthly','Overdue'].map(option=><button key={option} className={dueFilter===option?'active':''} onClick={()=>setDueFilter(option)}>{option}</button>)}</div>
+        <div className="table-scroll"><table><thead><tr><th>Due date</th><th>Client</th><th>Plan</th><th>Installment</th><th>Amount due</th><th>Plan balance</th><th>Status</th></tr></thead><tbody>{visibleDues.map(d=><tr key={`${d.loan_id}-${d.installment_number}`}><td>{day(d.next_due_date)}</td><td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(d.customer_id)}>{d.customer_name}</button> : d.customer_name}<small>{d.customer_id} · {d.mobile}</small></td><td>{d.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(d.loan_id)}>{d.loan_id}</button></small></td><td>#{d.installment_number}</td><td>{money(d.amount_due)}</td><td>{money(d.plan_balance)}</td><td><Status value={d.overdue ? `Overdue ${d.days_overdue}d` : 'Upcoming'} /></td></tr>)}</tbody></table></div>
       </section>
       <section className="panel wide area-performance">
         <div className="panel-head"><h2>Areas requiring collection</h2><span>Click an area, then click a customer for their complete profile</span></div>
-        {collectibleAreas.length ? <div className="area-drilldowns">{collectibleAreas.map(area => <details key={area.area}><summary>{area.name || area.area} — {area.customers_with_dues} customers to collect · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.map(item => <tr key={item.loan_id}><td><button className="table-link" onClick={() => onOpenCustomer(item.customer_id)}>{item.customer_name}</button><small>{item.customer_id}</small></td><td>{item.frequency}<small>{item.loan_id}</small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? date(item.next_due_date) : 'Completed'}</td></tr>)}</tbody></table></div></details>)}</div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No area requires collection</strong><span>All active balances are clear.</span></div>}
+        {collectibleAreas.length ? <div className="area-drilldowns">{collectibleAreas.map(area => <details key={area.area}><summary>{area.name || area.area} — {area.customers_with_dues} customers to collect · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.map(item => <tr key={item.loan_id}><td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(item.customer_id)}>{item.customer_name}</button> : item.customer_name}<small>{item.customer_id}</small></td><td>{item.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(item.loan_id)}>{item.loan_id}</button></small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? day(item.next_due_date) : 'Completed'}</td></tr>)}</tbody></table></div></details>)}</div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No area requires collection</strong><span>All active balances are clear.</span></div>}
       </section>
       <section className="panel">
         <div className="panel-head"><h2>Collector performance</h2><span>Collection volume and receipt count</span></div>
@@ -404,9 +418,10 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user }) {
       <section className="panel">
         <div className="panel-head"><h2>Needs attention</h2><span>Priority overdue follow-ups</span></div>
         <div className="alert-list">
-          {data.alerts.slice(0, 8).map(a => <div className="alert-item" key={a.id}><AlertTriangle size={16} /><div><strong>{a.urgency}</strong><span>{a.customer_name} · {a.loan_id} · {money(a.balance)}</span></div></div>)}
+          {data.alerts.slice(0, 8).map(a => <button type="button" className="alert-item" key={a.id} onClick={() => viewer.open(a.loan_id)}><AlertTriangle size={16} /><div><strong>{a.urgency}</strong><span>{a.customer_name} · {a.loan_id} · {money(a.balance)}</span></div></button>)}
         </div>
       </section>
+      {viewer.element}
     </div>
   );
 }
@@ -451,7 +466,7 @@ function CustomerPicker({ customers, value, onChange }) {
   );
 }
 
-function MobileOtpBox({ api, customer, notify, onVerified }) {
+function MobileOtpBox({ api, customer, notify, onVerified, onClose }) {
   const [smsStatus, setSmsStatus] = useState(null);
   const [session, setSession] = useState(null);
   const [code, setCode] = useState('');
@@ -487,8 +502,8 @@ function MobileOtpBox({ api, customer, notify, onVerified }) {
       setCode(''); setError(err.message);
     } finally { setBusy(false); }
   }
-  return <div className="servicing-box">
-    <h3>Mobile OTP verification</h3>
+  return <div className="servicing-box otp-box">
+    <div className="otp-box-head"><h3>Mobile OTP verification</h3>{onClose && <button type="button" className="icon-btn" aria-label="Close mobile OTP verification" onClick={onClose}><X size={16}/></button>}</div>
     <p>{customer.name} · {customer.customer_id} · {customer.mobile}</p>
     {session && !expired && session.attempts_remaining > 0 && <><label>6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" maxLength="6" pattern="[0-9]{6}" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} onKeyDown={e=>e.key==='Enter' && (e.preventDefault(), verify())}/></label>{session.dev_otp && <small>Demo mode (no real SMS): OTP is {session.dev_otp}</small>}</>}
     <div className="action-row">
@@ -584,7 +599,7 @@ function Customers({ api, user, notify }) {
     setOtpBusy(true); setFormError('');
     try {
       const result = await api('/api/aadhaar/otp/verify', {method:'POST',body:JSON.stringify({verification_id:onboardingOtp.verification_id,otp:onboardingOtp.otp})});
-      setOnboardingOtp(current=>({...current,otp:'',verified_at:result.verified_at}));
+      setOnboardingOtp({ customer_id:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, masked_destination:'', verified_at:'' });
       notify(`Aadhaar verified automatically at ${new Date(result.verified_at).toLocaleString('en-IN')}.`);
       await load();
     } catch(err) {
@@ -664,7 +679,7 @@ function Customers({ api, user, notify }) {
   return (
     <div className="split-layout">
       {['owner','manager'].includes(user.role) && <section className="panel full customer-editor"><div className="panel-head"><div><span className="section-kicker">Customer corrections</span><h2>Edit an existing customer</h2></div><select aria-label="Select customer to edit" value={editCandidate?.customer_id || ''} onChange={e=>setEditCandidate(rows.find(row=>row.customer_id===e.target.value) || null)}><option value="">Select customer</option>{rows.map(row=><option key={row.customer_id} value={row.customer_id}>{row.name} · {row.customer_id}</option>)}</select></div>{editCandidate && <form onSubmit={saveCustomerEdit}><div className="two-col"><label>Name<input required minLength="2" value={editCandidate.name} onChange={e=>setEditCandidate({...editCandidate,name:e.target.value})}/></label><label>Father's name<input required minLength="2" value={editCandidate.father_name} onChange={e=>setEditCandidate({...editCandidate,father_name:e.target.value})}/></label><label>Mobile<input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" value={editCandidate.mobile} onChange={e=>setEditCandidate({...editCandidate,mobile:e.target.value.replace(/\D/g,'').slice(0,10)})}/></label><label>Area<select value={editCandidate.area_code || editCandidate.area} onChange={e=>setEditCandidate({...editCandidate,area_code:e.target.value})}>{areas.map(a=><option key={a.code} value={a.code}>{a.name}</option>)}</select></label></div><label>Address<textarea required minLength="5" value={editCandidate.address} onChange={e=>setEditCandidate({...editCandidate,address:e.target.value})}/></label><label>Guarantor<input value={editCandidate.guarantor || ''} onChange={e=>setEditCandidate({...editCandidate,guarantor:e.target.value})}/></label><div className="locked-note">Customer ID and Aadhaar identity remain locked. Every correction is recorded in the audit trail.</div><div className="action-row"><button type="button" className="ghost" onClick={()=>setEditCandidate(null)}>Cancel</button><button className="primary" disabled={updatingCustomerId===editCandidate.customer_id}>{updatingCustomerId===editCandidate.customer_id?'Saving…':'Save customer changes'}</button></div></form>}</section>}
-      <form className="panel form-panel" onSubmit={submit}>
+      <form className="panel form-panel full onboarding-form" onSubmit={submit}>
         <div className="panel-head"><div><span className="section-kicker">Secure onboarding</span><h2>Register a customer</h2></div><ShieldCheck size={22} /></div>
         <div className="segmented-control"><button type="button" className={registrationMode === 'aadhaar' ? 'active' : ''} onClick={() => setRegistrationMode('aadhaar')}>Aadhaar registration</button><button type="button" className={registrationMode === 'manual' ? 'active' : ''} onClick={() => { setRegistrationMode('manual'); setForm({ ...form, aadhaar: '' }); }}>Manual registration</button></div>
         <p className="form-intro">{registrationMode === 'aadhaar' ? providerStatus.configured ? `Aadhaar is encrypted and ${providerStatus.provider} sends an OTP to the Aadhaar-linked mobile. The profile remains pending until that OTP succeeds.` : 'Automatic Aadhaar verification needs an authorised AUA/KUA provider. Until connected, Aadhaar remains pending; a normal SMS is not presented as UIDAI verification.' : 'Create the profile without Aadhaar. It remains Pending Verification until an Owner or Manager approves it.'}</p>
@@ -681,10 +696,10 @@ function Customers({ api, user, notify }) {
         <label>Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
         {formError && <div className="error" role="alert">{formError}</div>}
         <button className="primary" disabled={saving}><Plus size={18} /> {saving ? 'Saving securely…' : registrationMode === 'aadhaar' ? 'Register and send Aadhaar OTP' : 'Create pending profile'}</button>
-        {onboardingOtp.verification_id && <div className="servicing-box"><h3>Aadhaar OTP verification</h3><p>Customer {onboardingOtp.customer_id} · sent to {onboardingOtp.masked_destination || 'Aadhaar-linked mobile'}</p>{onboardingOtp.verified_at ? <div className="locked-note"><CheckCircle2 size={16}/> Verified at {new Date(onboardingOtp.verified_at).toLocaleString('en-IN')} · proof {onboardingOtp.verification_id}</div> : <><label>4 or 6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" value={onboardingOtp.otp} onChange={e=>setOnboardingOtp({...onboardingOtp,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/></label><div className="action-row"><button type="button" className="primary small" disabled={otpBusy || onboardingOtp.attempts_remaining===0 || ![4,6].includes(onboardingOtp.otp.length)} onClick={verifyOnboardingOtp}>Verify OTP</button><button type="button" className="ghost small" disabled={otpBusy || onboardingOtp.resends_remaining===0} onClick={resendOnboardingOtp}>Resend</button></div><small>{onboardingOtp.attempts_remaining > 0 ? `${onboardingOtp.attempts_remaining} attempts remaining` : 'OTP locked — resend or start a new verification'} · {onboardingOtp.resends_remaining} resends remaining</small></>}</div>}
-        {mobileOtpCustomer && <MobileOtpBox api={api} customer={mobileOtpCustomer} notify={notify} onVerified={async verified => { setMobileOtpCustomer(verified); await load(); }} />}
+        {onboardingOtp.verification_id && <div className="servicing-box otp-box"><div className="otp-box-head"><h3>Aadhaar OTP verification</h3><button type="button" className="icon-btn" aria-label="Close OTP verification" onClick={() => { setOnboardingOtp({ customer_id:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, masked_destination:'', verified_at:'' }); setFormError(''); }}><X size={16}/></button></div><p>Customer {onboardingOtp.customer_id} · sent to {onboardingOtp.masked_destination || 'Aadhaar-linked mobile'}</p>{onboardingOtp.verified_at ? <div className="locked-note"><CheckCircle2 size={16}/> Verified at {new Date(onboardingOtp.verified_at).toLocaleString('en-IN')} · proof {onboardingOtp.verification_id}</div> : <><label>4 or 6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" value={onboardingOtp.otp} onChange={e=>setOnboardingOtp({...onboardingOtp,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/></label><div className="action-row"><button type="button" className="primary small" disabled={otpBusy || onboardingOtp.attempts_remaining===0 || ![4,6].includes(onboardingOtp.otp.length)} onClick={verifyOnboardingOtp}>Verify OTP</button><button type="button" className="ghost small" disabled={otpBusy || onboardingOtp.resends_remaining===0} onClick={resendOnboardingOtp}>Resend</button></div><small>{onboardingOtp.attempts_remaining > 0 ? `${onboardingOtp.attempts_remaining} attempts remaining` : 'OTP locked — resend or start a new verification'} · {onboardingOtp.resends_remaining} resends remaining</small></>}</div>}
+        {mobileOtpCustomer && <MobileOtpBox api={api} customer={mobileOtpCustomer} notify={notify} onClose={() => setMobileOtpCustomer(null)} onVerified={async () => { setMobileOtpCustomer(null); await load(); }} />}
       </form>
-      <section className="panel">
+      <section className="panel full">
         <div className="panel-head"><h2>Customer registry</h2><span>{visibleRows.length} matching profiles</span></div>
         <div className="toolbar">
           <div className="searchbox">
@@ -744,6 +759,7 @@ function Customer360({ api, initialCustomerId = '', user, notify }) {
     setIdentityLogs(il);
     setSelectedId(current => initialCustomerId && cs.some(c => c.customer_id === initialCustomerId) ? initialCustomerId : cs.some(c => c.customer_id === current) ? current : cs[0]?.customer_id || '');
   }
+  const viewer = useLoanViewer({ api, notify, user, onChanged: load });
   useEffect(() => { load(); }, []);
 
   function requestDelete(customer) {
@@ -805,7 +821,7 @@ function Customer360({ api, initialCustomerId = '', user, notify }) {
           <Metric icon={CheckCircle2} label="Total repaid" value={money(totals.paid)} />
           <Metric icon={BadgeIndianRupee} label="Outstanding" value={money(totals.balance)} />
         </div>
-        <LoanTable rows={customerLoans} />
+        <LoanTable rows={customerLoans} onView={viewer.open} viewBusy={viewer.busy} />
         <div className="locked-note">Completed plans are marked Closed and retained as financial history. They are never deleted. The same customer profile may simultaneously hold daily, weekly, and monthly plans.</div>
       </section>
 
@@ -824,24 +840,33 @@ function Customer360({ api, initialCustomerId = '', user, notify }) {
         </div>
       </section>
       {deleteCandidate && <div className="modal-backdrop" onClick={()=>setDeleteCandidate(null)}><div className="modal confirm-delete" onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Double confirmation required</span><h2>Delete {deleteCandidate.name}?</h2></div><button className="icon-btn" onClick={()=>setDeleteCandidate(null)}><X size={18}/></button></div><div className="error-banner">The active profile and personal details will be removed. Loan, payment, receipt, ledger, and audit history will remain protected.</div><label>Type customer ID <strong>{deleteCandidate.customer_id}</strong><input autoFocus value={deleteForm.confirmation} onChange={e=>setDeleteForm({...deleteForm,confirmation:e.target.value})}/></label><label>Deletion reason<input minLength="5" value={deleteForm.reason} onChange={e=>setDeleteForm({...deleteForm,reason:e.target.value})} placeholder="Wrong entry or completed relationship"/></label><label className="check-row"><input type="checkbox" checked={deleteForm.understood} onChange={e=>setDeleteForm({...deleteForm,understood:e.target.checked})}/> I understand this profile will disappear from the active customer list.</label><div className="action-row"><button className="ghost" onClick={()=>setDeleteCandidate(null)}>Cancel</button><button className="primary danger" disabled={deleting || deleteForm.confirmation.trim().toUpperCase()!==deleteCandidate.customer_id.toUpperCase() || deleteForm.reason.trim().length<5 || !deleteForm.understood} onClick={confirmDelete}>{deleting?'Deleting safely…':'Confirm profile deletion'}</button></div></div></div>}
+      {viewer.element}
     </div>
   );
+}
+
+function calculatedCashInHand(form) {
+  const principal = Number(form.principal) || 0;
+  const periods = Number(form.repayment_period) || 0;
+  const months = form.loan_type === 'Daily 100-Day' ? periods / 30 : form.loan_type === 'Weekly' ? periods * 7 / 30 : periods;
+  const interest = Math.round(principal * (Number(form.interest_rate) || 0) / 100 * months * 100) / 100;
+  return Math.round((principal - interest - (Number(form.processing_fee) || 0)) * 100) / 100;
+}
+
+function loanRequestBody(form) {
+  return { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null, cash_handover: form.cash_handover === '' || form.cash_handover == null ? null : Number(form.cash_handover) };
 }
 
 function Loans({ api, notify, user }) {
   const [rows, setRows] = useState([]);
   const [boot, setBoot] = useState({ collectors: [], loan_types: [] });
   const [customers, setCustomers] = useState([]);
-  const [form, setForm] = useState({ customer_id: '', principal: 50000, interest_rate: 2.14, loan_type: 'Daily 100-Day', repayment_period: 100, collector_id: '', disbursement_mode: 'Cash', interest_method: 'Upfront Monthly Flat', processing_fee: 0, tax_rate: 0, first_due_date: '', moratorium_periods: 0, moratorium_interest_capitalized: true, preclosure_charge_rate: 0, late_fee: 0, kfs_acknowledgement_reference: '', identity_verification_id: null });
+  const [form, setForm] = useState({ customer_id: '', principal: 50000, interest_rate: 2.14, loan_type: 'Daily 100-Day', repayment_period: 100, collector_id: '', disbursement_mode: 'Cash', interest_method: 'Upfront Monthly Flat', processing_fee: 0, tax_rate: 0, first_due_date: '', moratorium_periods: 0, moratorium_interest_capitalized: true, preclosure_charge_rate: 0, late_fee: 0, kfs_acknowledgement_reference: '', identity_verification_id: null, cash_handover: '' });
   const [providerStatus, setProviderStatus] = useState({ configured:false, verified_disbursal_required:false });
   const [identity, setIdentity] = useState({ purpose:'Identity verification before loan disbursal', consent_reference:'', owner_notes:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, expires_at:'', resend_available_at:'' });
   const [identityError, setIdentityError] = useState('');
   const [identityBusy, setIdentityBusy] = useState(false);
   const [quote, setQuote] = useState(null);
-  const [loanDetails, setLoanDetails] = useState(null);
-  const [detailsBusy, setDetailsBusy] = useState(false);
-  const [closure, setClosure] = useState(null);
-  const [closureReceipt, setClosureReceipt] = useState(null);
   const [loanError, setLoanError] = useState('');
   const [savingLoan, setSavingLoan] = useState(false);
   const [service, setService] = useState({ loan_id: '', amount: '', strategy: 'Reduce EMI', effective_date: new Date().toISOString().slice(0,10), consent: '', annual_rate: 12, periods: 12, moratorium: 0, approval: '', reason: '' });
@@ -859,17 +884,21 @@ function Loans({ api, notify, user }) {
     setForm(f => ({ ...f, customer_id: f.customer_id, collector_id: f.collector_id || b.collectors[0]?.id || '' }));
     setService(s => ({ ...s, loan_id: s.loan_id || loanRows[0]?.loan_id || '' }));
   };
+  const viewer = useLoanViewer({ api, notify, user, onChanged: load });
+  const openLoanDetails = viewer.open;
   useEffect(() => { load(); }, []);
   useEffect(() => { setQuote(null); }, [form]);
   async function submit(e) {
     e.preventDefault();
     setLoanError('');
-    const body = { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null };
+    const body = loanRequestBody(form);
     setSavingLoan(true);
     try {
-      await api('/api/loans', { method: 'POST', body: JSON.stringify(body) });
-      notify('Loan disbursed and acknowledgement ready.');
+      const created = await api('/api/loans', { method: 'POST', body: JSON.stringify(body) });
+      notify(`Loan ${created.loan_id} created. Hand over ${money(created.net_disbursed)} in cash.`);
       setQuote(null);
+      setForm(f => ({ ...f, customer_id: '', kfs_acknowledgement_reference: '', identity_verification_id: null, cash_handover: '' }));
+      setIdentity(current => ({ ...current, consent_reference:'', owner_notes:'', verification_id:'', otp:'' }));
       await load();
     } catch (err) {
       setLoanError(err.message || 'Loan could not be created.');
@@ -877,29 +906,11 @@ function Loans({ api, notify, user }) {
   }
   async function preview() {
     setLoanError('');
-    const body = { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null };
+    const body = loanRequestBody(form);
     try { setQuote(await api('/api/loan-quotes', { method: 'POST', body: JSON.stringify(body) })); }
     catch (err) { setQuote(null); setLoanError(err.message || 'Loan preview could not be generated.'); }
   }
   async function servicePost(path, body, message) { await api(path, { method:'POST', body:JSON.stringify(body) }); notify(message); await load(); }
-  function openClosure(loanRow) {
-    if (!loanRow || Number(loanRow.balance) <= 0) return notify('This loan is already completed.');
-    setClosure({ loan: { loan_id: loanRow.loan_id, balance: loanRow.balance }, mode: 'Cash', payment_reference: '', reason: '', approval_reference: '', confirmation: '', confirmed: false, busy: false, error: '', request_id: crypto.randomUUID() });
-  }
-  async function submitClosure(e) {
-    e.preventDefault();
-    setClosure(current=>({...current,busy:true,error:''}));
-    try {
-      const result=await api(`/api/loans/${closure.loan.loan_id}/close`,{method:'POST',body:JSON.stringify({mode:closure.mode,payment_reference:closure.payment_reference || null,reason:closure.reason,approval_reference:closure.approval_reference,confirmation:closure.confirmation,confirmed:closure.confirmed,request_id:closure.request_id})});
-      setClosureReceipt(result.receipt); setClosure(null); notify(`${result.loan.loan_id} closed with final receipt ${result.receipt.receipt_no}.`); await load(); if (loanDetails) await openLoanDetails(result.loan.loan_id);
-    } catch(err) { setClosure(current=>({...current,busy:false,error:err.message})); }
-  }
-  async function openLoanDetails(loanId) {
-    setLoanError(''); setDetailsBusy(true);
-    try { setLoanDetails(await api(`/api/loans/${encodeURIComponent(loanId)}/details`)); }
-    catch(err) { setLoanError(err.message || 'Loan details could not be loaded.'); }
-    finally { setDetailsBusy(false); }
-  }
   async function postInterestRebate() {
     if (!adjustmentPreview?.permitted) return notify('Preview a valid interest adjustment first.');
     if (service.reason.trim().length < 5 || service.consent.trim().length < 3 || service.approval.trim().length < 3 || !adjustmentConfirmed) return notify('Reason, borrower acknowledgement, approval reference, and confirmation are required.');
@@ -928,15 +939,20 @@ function Loans({ api, notify, user }) {
       <form className="panel form-panel" onSubmit={submit}>
         <div className="panel-head"><h2>Loan disbursement</h2><span>Auto Loan ID, installment and completion date</span></div>
         <div className="locked-note">Automatic Aadhaar: {providerStatus.configured ? `${providerStatus.provider} connected` : 'Not configured — authorized AUA/KUA provider credentials required'}</div>
-        <CustomerPicker customers={customers} value={form.customer_id} onChange={id => setForm({ ...form, customer_id: id })} />
+        <CustomerPicker customers={customers} value={form.customer_id} onChange={id => { if (id !== form.customer_id) { setIdentity(current => ({ ...current, verification_id:'', otp:'' })); setIdentityError(''); } setForm({ ...form, customer_id: id, identity_verification_id: id === form.customer_id ? form.identity_verification_id : null }); }} />
         <div className="two-col">
           <label>Principal<input type="number" value={form.principal} onChange={e => setForm({ ...form, principal: e.target.value })} /></label>
-          <label>Monthly interest %<input type="number" required min="0.01" max="10" step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /><small>{Number(form.interest_rate) || 0}% per month, deducted before handover (default 2.14%)</small></label>
+          <label>Monthly interest %<input type="number" required min={boot.interest_rate?.min ?? 0.01} max={boot.interest_rate?.max ?? 10} step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /><small>{Number(form.interest_rate) || 0}% per month, deducted before handover (default 2.14%)</small></label>
           <label>Loan type<select value={form.loan_type} onChange={e => setForm({ ...form, loan_type: e.target.value, repayment_period: e.target.value.includes('Daily') ? 100 : e.target.value === 'Weekly' ? 52 : 12 })}>{boot.loan_types.map(x => <option key={x}>{x}</option>)}</select></label>
           <label>Period<input type="number" value={form.repayment_period} onChange={e => setForm({ ...form, repayment_period: e.target.value })} /></label>
           <label>Interest method<input value="Monthly upfront deduction" readOnly aria-readonly="true" /></label>
         </div>
         <details className="advanced-fields"><summary>Optional charges and schedule settings</summary><div className="two-col"><label>Processing fee<input type="number" min="0" step="0.01" value={form.processing_fee} onChange={e=>setForm({...form,processing_fee:e.target.value})}/></label><label>First due date<input type="date" value={form.first_due_date} onChange={e=>setForm({...form,first_due_date:e.target.value})}/></label><label>Late charge (defaulters only)<input type="number" min="0" step="0.01" value={form.late_fee} onChange={e=>setForm({...form,late_fee:e.target.value})}/></label></div></details>
+        {(() => { const exact = calculatedCashInHand(form); const typed = form.cash_handover === '' ? null : Number(form.cash_handover); const diff = typed == null ? 0 : Math.round((typed - exact) * 100) / 100; const limit = boot.max_cash_rounding ?? 100; return <div className="cash-handover">
+          <label>Cash in hand to give customer<input type="number" min="0.01" step="0.01" inputMode="decimal" placeholder={exact > 0 ? exact.toFixed(2) : ''} value={form.cash_handover} onChange={e => setForm({ ...form, cash_handover: e.target.value })} /></label>
+          <small>Calculated exactly: <b>{money(exact)}</b>. Leave blank to hand over the exact amount, or type the amount you round to by hand (up to ±{money(limit)}).{typed != null && diff !== 0 && Math.abs(diff) <= limit && ` Interest deducted changes by ${money(-diff)}.`}</small>
+          {typed != null && Math.abs(diff) > limit && <small className="form-error">Rounded amount must be within {money(limit)} of {money(exact)}.</small>}
+        </div>; })()}
         <label>Collector<select value={form.collector_id} onChange={e => setForm({ ...form, collector_id: e.target.value })}>{boot.collectors.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
         <label>Disbursement account<select value={form.disbursement_mode} onChange={e => setForm({ ...form, disbursement_mode: e.target.value })}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>
         <label>KFS borrower acknowledgement reference<input required value={form.kfs_acknowledgement_reference} onChange={e=>setForm({...form,kfs_acknowledgement_reference:e.target.value})} placeholder="Signed/OTP acknowledgement ID"/></label>
@@ -944,11 +960,11 @@ function Loans({ api, notify, user }) {
         <button type="button" className="ghost" disabled={!form.customer_id} onClick={preview}><FileText size={18}/> Preview APR, KFS and schedule</button>
         {loanError && <div className="error" role="alert">{loanError}</div>}
         <button className="primary" disabled={savingLoan || !form.customer_id || !form.collector_id}><FileText size={18} /> {savingLoan ? 'Creating loan…' : 'Create loan directly'}</button>
-        {quote && <div className="locked-note">Monthly rate {quote.monthly_interest_rate}% · Interest deducted {money(quote.total_interest)} · Cash handed over {money(quote.net_disbursed_amount)} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
+        {quote && <div className="locked-note">Monthly rate {quote.monthly_interest_rate}% · Interest deducted {money(quote.total_interest)} · Cash handed over {money(quote.net_disbursed_amount)}{quote.cash_rounding_adjustment ? ` (rounded from ${money(quote.calculated_net_disbursed)})` : ''} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
       </form>
       <section className="panel">
         <div className="panel-head"><h2>Loan book</h2><span>Multiple daily, weekly and monthly plans per customer</span></div>
-        <LoanTable rows={rows} onView={openLoanDetails} viewBusy={detailsBusy} />
+        <LoanBook rows={rows} areas={boot.areas || []} collectors={boot.collectors || []} onView={openLoanDetails} viewBusy={viewer.busy} />
         {rows.length > 0 && <div className="servicing-box">
           <h3>Controlled loan servicing</h3>
           <label>Loan<select value={service.loan_id} onChange={e=>{setService({...service,loan_id:e.target.value});setAdjustmentPreview(null);setAdjustmentConfirmed(false)}}>{rows.map(l=><option key={l.loan_id}>{l.loan_id}</option>)}</select></label>
@@ -961,11 +977,48 @@ function Loans({ api, notify, user }) {
           {user.role === 'owner' && <details><summary>Restructure or write-off</summary><div className="two-col"><label>New annual rate<input type="number" value={service.annual_rate} onChange={e=>setService({...service,annual_rate:e.target.value})}/></label><label>Remaining periods<input type="number" value={service.periods} onChange={e=>setService({...service,periods:e.target.value})}/></label><label>Moratorium periods<input type="number" value={service.moratorium} onChange={e=>setService({...service,moratorium:e.target.value})}/></label><label>Approval reference<input value={service.approval} onChange={e=>setService({...service,approval:e.target.value})}/></label></div><label>Reason<input value={service.reason} onChange={e=>setService({...service,reason:e.target.value})}/></label><div className="action-row"><button className="ghost" onClick={()=>servicePost(`/api/loans/${service.loan_id}/restructure`,{annual_rate:Number(service.annual_rate),remaining_periods:Number(service.periods),moratorium_periods:Number(service.moratorium),effective_date:service.effective_date,approval_reference:service.approval,borrower_consent_reference:service.consent},'Loan restructured with a new immutable schedule.')}>Restructure</button><button className="ghost danger" onClick={()=>servicePost(`/api/loans/${service.loan_id}/write-off`,{amount:Number(service.amount),reason:service.reason,approval_reference:service.approval},'Approved write-off posted to the ledger.')}>Write-off</button></div></details>}
         </div>}
       </section>
-      {loanDetails && <LoanDetailsModal data={loanDetails} api={api} notify={notify} user={user} onInstantClose={openClosure} onRefresh={async()=>{ await load(); await openLoanDetails(loanDetails.loan.loan_id); }} onClose={()=>setLoanDetails(null)} />}
-      {closure && <div className="modal-backdrop" onClick={()=>!closure.busy&&setClosure(null)}><form className="modal confirm-delete" onSubmit={submitClosure} onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Full and final settlement</span><h2>Close {closure.loan.loan_id}</h2></div><button type="button" className="icon-btn" disabled={closure.busy} onClick={()=>setClosure(null)}><X size={18}/></button></div><div className="finance-strip"><Metric icon={WalletCards} label="Outstanding" value={money(closure.loan.balance)}/><Metric icon={CheckCircle2} label="Final settlement" value={money(closure.loan.balance)}/></div><label>Payment mode<select value={closure.mode} onChange={e=>setClosure({...closure,mode:e.target.value,payment_reference:''})}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>{closure.mode!=='Cash'&&<label>{closure.mode} reference<input required minLength="3" value={closure.payment_reference} onChange={e=>setClosure({...closure,payment_reference:e.target.value})}/></label>}{user.role==='manager'&&<label>Owner approval reference<input required minLength="3" value={closure.approval_reference} onChange={e=>setClosure({...closure,approval_reference:e.target.value})}/></label>}<label>Mandatory closure reason<textarea required minLength="5" value={closure.reason} onChange={e=>setClosure({...closure,reason:e.target.value})} placeholder="Full repayment received and verified"/></label><div className="error-banner">Closing is permanent. The loan, payments, ledger entries, OTP evidence and receipts remain available in history.</div><label>Type loan ID <strong>{closure.loan.loan_id}</strong><input required value={closure.confirmation} onChange={e=>setClosure({...closure,confirmation:e.target.value})}/></label><label className="check-row"><input type="checkbox" checked={closure.confirmed} onChange={e=>setClosure({...closure,confirmed:e.target.checked})}/> I verified the settlement amount and payment source.</label>{closure.error&&<div className="error" role="alert">{closure.error}</div>}<div className="action-row"><button type="button" className="ghost" disabled={closure.busy} onClick={()=>setClosure(null)}>Cancel</button><button className="primary danger" disabled={closure.busy||closure.confirmation.trim().toUpperCase()!==closure.loan.loan_id.toUpperCase()||closure.reason.trim().length<5||!closure.confirmed}>{closure.busy?'Closing transaction…':'Confirm full closure'}</button></div></form></div>}
-      {closureReceipt && <ReceiptModal title="Final Loan Closure Receipt" data={closureReceipt} onClose={()=>setClosureReceipt(null)}/>}
+      {viewer.element}
     </div>
   );
+}
+
+// One loan viewer shared by every screen: opens the full loan record in place, with
+// collection, prepayment and full-closure actions, then refreshes the calling screen.
+function useLoanViewer({ api, notify, user, onChanged }) {
+  const [details, setDetails] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [closure, setClosure] = useState(null);
+  const [closureReceipt, setClosureReceipt] = useState(null);
+  async function open(loanId) {
+    if (!loanId) return;
+    setBusy(true);
+    try { setDetails(await api(`/api/loans/${encodeURIComponent(loanId)}/details`)); }
+    catch (err) { notify(err.message || 'Loan details could not be loaded.'); }
+    finally { setBusy(false); }
+  }
+  async function refresh(loanId) {
+    if (onChanged) await onChanged();
+    try { setDetails(await api(`/api/loans/${encodeURIComponent(loanId)}/details`)); } catch { setDetails(null); }
+  }
+  function openClosure(loanRow) {
+    if (!loanRow || Number(loanRow.balance) <= 0) return notify('This loan is already completed.');
+    setClosure({ loan: { loan_id: loanRow.loan_id, balance: loanRow.balance }, mode: 'Cash', payment_reference: '', reason: '', approval_reference: '', confirmation: '', confirmed: false, busy: false, error: '', request_id: crypto.randomUUID() });
+  }
+  async function submitClosure(e) {
+    e.preventDefault();
+    setClosure(current=>({...current,busy:true,error:''}));
+    try {
+      const result=await api(`/api/loans/${closure.loan.loan_id}/close`,{method:'POST',body:JSON.stringify({mode:closure.mode,payment_reference:closure.payment_reference || null,reason:closure.reason,approval_reference:closure.approval_reference,confirmation:closure.confirmation,confirmed:closure.confirmed,request_id:closure.request_id})});
+      setClosureReceipt(result.receipt); setClosure(null); notify(`${result.loan.loan_id} closed with final receipt ${result.receipt.receipt_no}.`);
+      if (details) await refresh(result.loan.loan_id); else if (onChanged) await onChanged();
+    } catch(err) { setClosure(current=>({...current,busy:false,error:err.message})); }
+  }
+  const element = <>
+    {details && <LoanDetailsModal data={details} api={api} notify={notify} user={user} onInstantClose={openClosure} onRefresh={() => refresh(details.loan.loan_id)} onClose={()=>setDetails(null)} />}
+    {closure && <div className="modal-backdrop" onClick={()=>!closure.busy&&setClosure(null)}><form className="modal confirm-delete" onSubmit={submitClosure} onClick={e=>e.stopPropagation()}><div className="panel-head"><div><span className="section-kicker">Full and final settlement</span><h2>Close {closure.loan.loan_id}</h2></div><button type="button" className="icon-btn" disabled={closure.busy} onClick={()=>setClosure(null)}><X size={18}/></button></div><div className="finance-strip"><Metric icon={WalletCards} label="Outstanding" value={money(closure.loan.balance)}/><Metric icon={CheckCircle2} label="Final settlement" value={money(closure.loan.balance)}/></div><label>Payment mode<select value={closure.mode} onChange={e=>setClosure({...closure,mode:e.target.value,payment_reference:''})}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>{closure.mode!=='Cash'&&<label>{closure.mode} reference<input required minLength="3" value={closure.payment_reference} onChange={e=>setClosure({...closure,payment_reference:e.target.value})}/></label>}{user.role==='manager'&&<label>Owner approval reference<input required minLength="3" value={closure.approval_reference} onChange={e=>setClosure({...closure,approval_reference:e.target.value})}/></label>}<label>Mandatory closure reason<textarea required minLength="5" value={closure.reason} onChange={e=>setClosure({...closure,reason:e.target.value})} placeholder="Full repayment received and verified"/></label><div className="error-banner">Closing is permanent. The loan, payments, ledger entries, OTP evidence and receipts remain available in history.</div><label>Type loan ID <strong>{closure.loan.loan_id}</strong><input required value={closure.confirmation} onChange={e=>setClosure({...closure,confirmation:e.target.value})}/></label><label className="check-row"><input type="checkbox" checked={closure.confirmed} onChange={e=>setClosure({...closure,confirmed:e.target.checked})}/> I verified the settlement amount and payment source.</label>{closure.error&&<div className="error" role="alert">{closure.error}</div>}<div className="action-row"><button type="button" className="ghost" disabled={closure.busy} onClick={()=>setClosure(null)}>Cancel</button><button className="primary danger" disabled={closure.busy||closure.confirmation.trim().toUpperCase()!==closure.loan.loan_id.toUpperCase()||closure.reason.trim().length<5||!closure.confirmed}>{closure.busy?'Closing transaction…':'Confirm full closure'}</button></div></form></div>}
+    {closureReceipt && <ReceiptModal title="Final Loan Closure Receipt" data={closureReceipt} onClose={()=>setClosureReceipt(null)}/>}
+  </>;
+  return { open, busy, element, openClosure };
 }
 
 function LoanDetailsModal({ data, api, notify, onRefresh, onInstantClose, user, onClose }) {
@@ -1036,11 +1089,11 @@ function LoanDetailsModal({ data, api, notify, onRefresh, onInstantClose, user, 
   const servicingHistory=[...adjustments,...events,...partPayments,...writeoffs].sort((a,b)=>new Date(b.timestamp || b.created_at)-new Date(a.timestamp || a.created_at));
   return <><div className="modal-backdrop" onClick={onClose}><div className="modal loan-details-modal" onClick={e=>e.stopPropagation()}>
     <div className="panel-head"><div><span className="section-kicker">Complete loan record</span><h2>{loan.loan_id} · {customer.name}</h2><span>{loan.frequency} plan · {customer.area_name || customer.area}</span></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>
-    <div className="finance-strip"><Metric icon={BadgeIndianRupee} label="Sanctioned" value={money(loan.principal)}/><Metric icon={WalletCards} label="Cash handed over" value={money(loan.net_disbursed)}/><Metric icon={CheckCircle2} label="Paid" value={money(loan.paid)}/><Metric icon={CalendarClock} label="Outstanding" value={money(loan.balance)}/></div>
-    <div className="loan-detail-grid"><div><span>Monthly interest</span><strong>{loan.interest_rate}%</strong></div><div><span>Interest deducted</span><strong>{money(loan.contract_interest)}</strong></div><div><span>Processing fee + tax</span><strong>{money(Number(loan.processing_fee||0)+Number(loan.tax_amount||0))}</strong></div><div><span>APR</span><strong>{loan.apr ? `${loan.apr}%` : 'Legacy contract'}</strong></div><div><span>Installment</span><strong>{money(loan.installment)}</strong></div><div><span>Remaining installments</span><strong>{loan.remaining_installments}</strong></div><div><span>Borrow date</span><strong>{date(loan.borrow_date)}</strong></div><div><span>Maturity</span><strong>{date(loan.maturity_date || loan.expected_completion)}</strong></div><div><span>Status</span><Status value={loan.status}/></div></div>
+    <div className="finance-strip"><Metric icon={BadgeIndianRupee} label="Sanctioned" value={money(loan.principal)}/><Metric icon={WalletCards} label="Cash handed over" value={money(loan.net_disbursed ?? loan.principal)}/><Metric icon={CheckCircle2} label="Paid" value={money(loan.paid)}/><Metric icon={CalendarClock} label="Outstanding" value={money(loan.balance)}/></div>
+    <div className="loan-detail-grid"><div><span>{loan.contract_version >= 2 ? 'Monthly interest' : 'Interest rate (legacy)'}</span><strong>{loan.interest_rate}%</strong></div><div><span>{loan.contract_version >= 2 ? 'Interest deducted' : 'Interest (collected in instalments)'}</span><strong>{money(loan.contract_version >= 2 ? loan.contract_interest : Math.max(Number(loan.total_payable || 0) - Number(loan.principal || 0), 0))}</strong>{loan.cash_rounding_adjustment ? <small>Cash rounded by hand from {money(loan.calculated_net_disbursed)}</small> : null}</div><div><span>Processing fee + tax</span><strong>{money(Number(loan.processing_fee||0)+Number(loan.tax_amount||0))}</strong></div><div><span>APR</span><strong>{loan.apr ? `${loan.apr}%` : 'Legacy contract'}</strong></div><div><span>Installment</span><strong>{money(loan.installment)}</strong></div><div><span>Remaining installments</span><strong>{loan.remaining_installments}</strong></div><div><span>Borrow date</span><strong>{day(loan.borrow_date)}</strong></div><div><span>Maturity</span><strong>{day(loan.maturity_date || loan.expected_completion)}</strong></div><div><span>Status</span><Status value={loan.status}/></div></div>
     <div className="locked-note"><ShieldCheck size={16}/>{verification ? `OTP verified ${date(verification.verified_at || verification.attempted_at)} · Proof ${verification.verification_id}` : 'No Aadhaar OTP proof was linked to this loan disbursement.'}</div>
     {closure?.closed && <div className="locked-note"><CheckCircle2 size={16}/>Closed {closure.closed_at ? date(closure.closed_at) : ''}{closure.final_receipt ? ` · Final receipt ${closure.final_receipt}` : ''}</div>}
-    {(canCollect || canClose) && <div className="servicing-box quick-actions"><h3>Quick actions</h3>
+    {(canCollect || canClose) && <div className="servicing-box loan-quick-actions"><h3>Quick actions</h3>
       <div className="action-row">
         {canCollect && <button type="button" className="primary small" onClick={() => openQuick('Collection')}><ReceiptIndianRupee size={16}/> Collect payment</button>}
         {canCollect && <button type="button" className="ghost" onClick={() => openQuick('Prepayment')}><WalletCards size={16}/> Prepayment</button>}
@@ -1085,7 +1138,11 @@ function Collections({ api, user, notify }) {
     const collectible = rows.filter(row => row.balance > 0 && row.status !== 'Closed');
     setLoans(collectible);
     setPayments(paymentRows);
-    setSelected(current => collectible.find(row => row.loan_id === current?.loan_id) || collectible[0] || null);
+    setSelected(current => {
+      const next = collectible.find(row => row.loan_id === current?.loan_id) || collectible[0] || null;
+      if (next && next.loan_id !== current?.loan_id) setAmount(String(Math.min(next.installment, next.balance)));
+      return next;
+    });
   };
   useEffect(() => { load(); }, []);
   const filtered = loans.filter(l => !query || `${l.loan_id} ${l.customer_id} ${l.customer_name}`.toLowerCase().includes(query.toLowerCase()));
@@ -1161,20 +1218,32 @@ function Collections({ api, user, notify }) {
   );
 }
 
-function SearchView({ api }) {
+function SearchView({ api, user, notify, onOpenCustomer }) {
   const [q, setQ] = useState('');
   const [result, setResult] = useState({ customers: [], loans: [] });
-  async function run() {
-    setResult(await api(`/api/search?q=${encodeURIComponent(q)}`));
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const latest = React.useRef(0);
+  async function run(text = q) {
+    const ticket = ++latest.current;
+    setLoading(true); setError('');
+    try { const data = await api(`/api/search?q=${encodeURIComponent(text.trim())}`); if (ticket === latest.current) setResult(data); }
+    catch (err) { if (ticket === latest.current) setError(err.message); }
+    finally { if (ticket === latest.current) setLoading(false); }
   }
-  useEffect(() => { run(); }, []);
+  const viewer = useLoanViewer({ api, notify, user, onChanged: () => run() });
+  useEffect(() => { const timer = setTimeout(() => run(q), 250); return () => clearTimeout(timer); }, [q]);
+  const openCustomer = onOpenCustomer || null;
   return (
     <section className="panel full">
-      <div className="panel-head"><h2>Universal search</h2><span>Customer ID, Loan ID, mobile, name, area, Aadhaar last 4</span></div>
-      <div className="toolbar"><div className="searchbox"><Search size={18} /><input value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => e.key === 'Enter' && run()} placeholder="Try KUN, mobile, customer name..." /></div><button className="primary small" onClick={run}>Search</button></div>
-      <h3>Loans</h3><LoanTable rows={result.loans} />
-      <h3>Customers</h3>
-      <table><thead><tr><th>ID</th><th>Name</th><th>Mobile</th><th>Aadhaar</th><th>Area</th><th>Risk</th></tr></thead><tbody>{result.customers.map(c => <tr key={c.customer_id}><td>{c.customer_id}</td><td>{c.name}</td><td>{c.mobile}</td><td>{c.aadhaar_masked}</td><td>{c.area_name || c.area}</td><td><Risk score={c.risk_score} /></td></tr>)}</tbody></table>
+      <div className="panel-head"><h2>Universal search</h2><span>Customer ID, Loan ID, mobile, name, area, Aadhaar last 4 · click a name to open the profile, or a loan to see its full record</span></div>
+      <div className="toolbar"><div className="searchbox"><Search size={18} /><input autoFocus value={q} onChange={e => setQ(e.target.value)} onKeyDown={e => e.key === 'Enter' && run()} placeholder="Try KUN, mobile, customer name..." aria-label="Search customers and loans" />{q && <button type="button" className="icon-btn" aria-label="Clear search" onClick={() => setQ('')}><X size={16} /></button>}</div><button className="primary small" disabled={loading} onClick={() => run()}>{loading ? 'Searching…' : 'Search'}</button></div>
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      <h3>Loans <small>({result.loans.length})</small></h3>
+      {result.loans.length ? <LoanTable rows={result.loans} onView={viewer.open} viewBusy={viewer.busy} onOpenCustomer={openCustomer} /> : <div className="locked-note">{loading ? 'Searching…' : 'No loans match this search.'}</div>}
+      <h3>Customers <small>({result.customers.length})</small></h3>
+      {result.customers.length ? <div className="table-scroll"><table><thead><tr><th>ID</th><th>Name</th><th>Mobile</th><th>Aadhaar</th><th>Area</th><th>Status</th><th>Risk</th>{openCustomer && <th>Action</th>}</tr></thead><tbody>{result.customers.map(c => <tr key={c.customer_id}><td>{c.customer_id}</td><td>{openCustomer ? <button className="table-link" onClick={() => openCustomer(c.customer_id)}>{c.name}</button> : c.name}<small>{c.loan_count || 0} loan{c.loan_count === 1 ? '' : 's'}</small></td><td>{c.mobile}</td><td>{c.aadhaar_masked}</td><td>{c.area_name || c.area}</td><td><Status value={c.status} /></td><td><Risk score={c.risk_score} /></td>{openCustomer && <td><button className="ghost small" onClick={() => openCustomer(c.customer_id)}><ContactRound size={15} />Open profile</button></td>}</tr>)}</tbody></table></div> : <div className="locked-note">{loading ? 'Searching…' : 'No customers match this search.'}</div>}
+      {viewer.element}
     </section>
   );
 }
@@ -1223,11 +1292,23 @@ function Reports({ api }) {
   );
 }
 
+const MONEY_COLUMN = /(amount|total|balance|principal|paid|collect|disburs|outstanding|interest|installment|instalment|emi|profit|value|fee|due|debt|cash)/i;
+const HIDDEN_REPORT_COLUMNS = new Set(['allocation', 'journal_entry_id', 'request_id', 'lines', 'entry_hash', 'previous_hash', 'aadhaar_encrypted', 'aadhaar_hash', '_customer_seq', 'id']);
+function reportCell(key, value) {
+  if (value == null || value === '') return '—';
+  if (typeof value === 'number' && MONEY_COLUMN.test(key) && !/(count|rate|percent|days|number|installments_paid|remaining)/i.test(key)) return money(value);
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) return date(value);
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (typeof value === 'object') return Array.isArray(value) ? `${value.length} item${value.length === 1 ? '' : 's'}` : Object.entries(value).map(([k, v]) => `${k.replaceAll('_', ' ')}: ${typeof v === 'number' && MONEY_COLUMN.test(k) ? money(v) : v}`).join(' · ');
+  return String(value);
+}
 function ReportTable({ report }) {
   const rows = reportRows(report);
   if (!rows.length) return <div className="locked-note">No records matched this report period.</div>;
-  const headers = [...new Set(rows.flatMap(row => Object.keys(row)))];
-  return <div className="table-wrap"><table><thead><tr>{headers.map(h=><th key={h}>{h.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{rows.map((row,index)=><tr key={index}>{headers.map(h=><td key={h}>{typeof row[h] === 'object' ? JSON.stringify(row[h]) : String(row[h] ?? '')}</td>)}</tr>)}</tbody></table></div>;
+  const sections = new Set(rows.map(row => row.section));
+  const headers = [...new Set(rows.flatMap(row => Object.keys(row)))].filter(h => !HIDDEN_REPORT_COLUMNS.has(h) && !(h === 'section' && sections.size <= 1));
+  const totals = Object.entries(report).filter(([key, value]) => typeof value === 'number');
+  return <>{totals.length > 0 && <div className="report-totals">{totals.map(([key, value]) => <span key={key}>{key.replaceAll('_', ' ')} <b>{reportCell(key, value)}</b></span>)}</div>}<div className="table-wrap"><table><thead><tr>{headers.map(h=><th key={h}>{h.replaceAll('_',' ')}</th>)}</tr></thead><tbody>{rows.map((row,index)=><tr key={index}>{headers.map(h=><td key={h}>{reportCell(h, row[h])}</td>)}</tr>)}</tbody></table></div></>;
 }
 
 function Accounting({ api, user, notify }) {
@@ -1327,7 +1408,7 @@ function Accounting({ api, user, notify }) {
         <form noValidate onSubmit={e => submitChecked(e, `/api/loans/${encodeURIComponent(adjustment.loan_id)}/adjustments`, !adjustment.loan_id.trim() ? 'Enter an existing Loan ID.' : Number(adjustment.amount)<=0 ? 'Enter an adjustment amount greater than ₹0.' : adjustment.reason.trim().length<5 ? 'Enter a mandatory reason of at least 5 characters.' : '', { kind: adjustment.kind, amount: Number(adjustment.amount), reason: adjustment.reason, request_id: crypto.randomUUID() }, 'Loan penalty or waiver posted.')}><h3>Penalty or waiver</h3><input placeholder="Loan ID" value={adjustment.loan_id} onChange={e=>setAdjustment({...adjustment,loan_id:e.target.value})}/><select value={adjustment.kind} onChange={e=>setAdjustment({...adjustment,kind:e.target.value})}><option>Penalty</option><option>Interest Waiver</option><option>Penalty Waiver</option></select><input type="number" min="0.01" step="0.01" placeholder="Amount" value={adjustment.amount} onChange={e=>setAdjustment({...adjustment,amount:e.target.value})}/><input minLength="5" placeholder="Mandatory reason" value={adjustment.reason} onChange={e=>setAdjustment({...adjustment,reason:e.target.value})}/><button className="primary small" disabled={Boolean(posting)}>{posting.includes('/adjustments')?'Posting…':'Post adjustment'}</button>{actionError?.path.includes('/adjustments') && <small className="form-error">{actionError.message}</small>}</form>
       </section>}
       {user.role === 'owner' && <section className="panel accounting-actions">
-        <form noValidate onSubmit={e => submitChecked(e, '/api/accounting/daily-close', closing.actual_cash==='' || Number(closing.actual_cash)<0 ? 'Enter the actual physical cash counted, including ₹0 when no cash exists.' : '', { ...closing, actual_cash: Number(closing.actual_cash) }, 'Business day closed and variance recorded.')}><h3>Daily cash closing</h3><input type="date" value={closing.business_date} onChange={e=>setClosing({...closing,business_date:e.target.value})}/><input type="number" min="0" step="0.01" placeholder="Actual counted cash" value={closing.actual_cash} onChange={e=>setClosing({...closing,actual_cash:e.target.value})}/><input placeholder="Closing notes" value={closing.notes} onChange={e=>setClosing({...closing,notes:e.target.value})}/><button className="primary small" disabled={Boolean(posting)}>{posting==='/api/accounting/daily-close'?'Closing…':'Close business day'}</button>{actionError?.path==='/api/accounting/daily-close' && <small className="form-error">{actionError.message}</small>}</form>
+        <form noValidate onSubmit={e => submitChecked(e, '/api/accounting/daily-close', closing.actual_cash==='' || Number(closing.actual_cash)<0 ? 'Enter the actual physical cash counted, including ₹0 when no cash exists.' : '', { ...closing, actual_cash: Number(closing.actual_cash) }, 'Business day closed and variance recorded.')}><h3>Daily cash closing</h3><small>Ledger cash on hand: <b>{money(summary.cash_on_hand)}</b>. Count the physical cash and enter it exactly — any paise or rounding difference is recorded as the variance; nothing is rounded automatically.</small><input type="date" value={closing.business_date} onChange={e=>setClosing({...closing,business_date:e.target.value})}/><input type="number" min="0" step="0.01" placeholder="Actual counted cash" value={closing.actual_cash} onChange={e=>setClosing({...closing,actual_cash:e.target.value})}/>{closing.actual_cash !== '' && <small>Difference to record: <b>{money(Math.round((Number(closing.actual_cash) - Number(summary.cash_on_hand)) * 100) / 100)}</b>{Math.abs(Number(closing.actual_cash) - Number(summary.cash_on_hand)) < 1 && Number(closing.actual_cash) !== Number(summary.cash_on_hand) ? ' (round-off)' : ''}</small>}<input placeholder="Closing notes" value={closing.notes} onChange={e=>setClosing({...closing,notes:e.target.value})}/><button className="primary small" disabled={Boolean(posting)}>{posting==='/api/accounting/daily-close'?'Closing…':'Close business day'}</button>{actionError?.path==='/api/accounting/daily-close' && <small className="form-error">{actionError.message}</small>}</form>
         <form noValidate onSubmit={e => { const path=`/api/payments/${encodeURIComponent(reversal.receipt_no)}/reversal-requests`; submitChecked(e, path, !reversal.receipt_no.trim() ? 'Enter an existing receipt number.' : reversal.reason.trim().length<5 ? 'Enter a correction reason of at least 5 characters.' : '', { reason: reversal.reason }, 'Reversal request submitted. A different manager must approve it.'); }}><h3>Request receipt reversal</h3><input placeholder="Receipt number" value={reversal.receipt_no} onChange={e=>setReversal({...reversal,receipt_no:e.target.value})}/><input minLength="5" placeholder="Mandatory correction reason" value={reversal.reason} onChange={e=>setReversal({...reversal,reason:e.target.value})}/><button className="ghost danger" disabled={Boolean(posting)}>{posting.includes('/reversal-requests')?'Submitting…':'Submit for approval'}</button>{actionError?.path.includes('/reversal-requests') && <small className="form-error">{actionError.message}</small>}</form>
       </section>}
       <section className="panel full">
@@ -1346,7 +1427,7 @@ function Audit({ api }) {
   const [rows, setRows] = useState([]);
   const [integrity, setIntegrity] = useState(null);
   useEffect(() => { Promise.all([api('/api/audit'),api('/api/audit/integrity')]).then(([log,check])=>{setRows(log);setIntegrity(check);}); }, []);
-  return <section className="panel full"><div className="panel-head"><h2>Tamper-evident audit log</h2><span>{integrity?.current_epoch_valid ? `Current chain epoch verified: ${integrity.verified_entries} retained entries` : 'Current chain integrity failure'} · {integrity?.historical_integrity_incident ? 'Historical deletion incident preserved' : 'No historical incident'} · {integrity?.external_archive_configured ? 'External archive configured' : 'External WORM archive not configured'}</span></div><table><thead><tr><th>Sequence</th><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>IP</th></tr></thead><tbody>{rows.map(r => <tr key={r.id}><td>{r.chain_sequence || 'Legacy'}<small>{r.entry_hash?.slice(0,12)}</small></td><td>{date(r.timestamp)}</td><td>{r.user}<small>{r.role}</small></td><td>{r.action}</td><td>{r.entity}: {r.entity_id}</td><td>{r.ip}</td></tr>)}</tbody></table></section>;
+  return <section className="panel full"><div className="panel-head"><h2>Tamper-evident audit log</h2><span>{integrity?.current_epoch_valid ? `Current chain epoch verified: ${integrity.verified_entries} retained entries` : 'Current chain integrity failure'} · {integrity?.historical_integrity_incident ? 'Historical deletion incident preserved' : 'No historical incident'} · {integrity?.external_archive_configured ? 'External archive configured' : 'External WORM archive not configured'}</span></div><table><thead><tr><th>Sequence</th><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>IP</th></tr></thead><tbody>{rows.map(r => <tr key={r.id}><td>{r.chain_sequence || 'Legacy'}<small>{r.entry_hash?.slice(0,12)}</small></td><td>{date(r.timestamp)}</td><td>{r.user}<small>{r.role}</small></td><td>{String(r.action || '').replaceAll('_', ' ')}</td><td>{r.entity}: {r.entity_id}</td><td>{r.ip}</td></tr>)}</tbody></table></section>;
 }
 
 function SettingsView({ api, notify }) {
@@ -1417,29 +1498,42 @@ function SettingsView({ api, notify }) {
   );
 }
 
-function EmiPlanner() {
+function EmiPlanner({ api }) {
+  const [limits, setLimits] = useState({ default: 2.14, min: 0.01, max: 10 });
   const [principal, setPrincipal] = useState(250000);
-  const rate = 2.14;
-  const [months, setMonths] = useState(24);
-  const interest = principal * rate * months / 100;
-  const cashHandover = principal - interest;
-  const invalidPlan = cashHandover <= 0;
-  const maximumTenure = Math.floor(100 / rate);
-  const emi = principal / months;
-  const total = principal;
+  const [rate, setRate] = useState(2.14);
+  const [planType, setPlanType] = useState('Monthly EMI');
+  const [periods, setPeriods] = useState(24);
+  useEffect(() => { api('/api/bootstrap').then(boot => { if (boot.interest_rate) { setLimits(boot.interest_rate); setRate(boot.interest_rate.default); } }).catch(() => {}); }, []);
+  const plan = { 'Daily 100-Day': { unit: 'day', max: 365, min: 10, step: 1 }, 'Weekly': { unit: 'week', max: 104, min: 4, step: 1 }, 'Monthly EMI': { unit: 'month', max: 60, min: 1, step: 1 } }[planType];
+  const safeRate = Math.min(Math.max(Number(rate) || 0, 0), limits.max);
+  const safePrincipal = Math.max(Number(principal) || 0, 0);
+  const safePeriods = Math.max(Number(periods) || 1, 1);
+  const months = planType === 'Daily 100-Day' ? safePeriods / 30 : planType === 'Weekly' ? safePeriods * 7 / 30 : safePeriods;
+  const interest = Math.round(safePrincipal * safeRate / 100 * months * 100) / 100;
+  const cashHandover = Math.round((safePrincipal - interest) * 100) / 100;
+  const rateInvalid = !(Number(rate) >= limits.min && Number(rate) <= limits.max);
+  const invalidPlan = cashHandover <= 0 || safePrincipal <= 0 || rateInvalid;
+  const emi = Math.round(safePrincipal / safePeriods * 100) / 100;
+  const interestShare = safePrincipal > 0 ? Math.min(interest / safePrincipal * 100, 100) : 0;
+  function changePlan(next) {
+    setPlanType(next);
+    setPeriods(next === 'Daily 100-Day' ? 100 : next === 'Weekly' ? 52 : 12);
+  }
   return (
     <div className="planner-layout">
       <section className="panel planner-controls">
         <div className="panel-head"><div><span className="section-kicker">Instant estimate</span><h2>Build a comfortable repayment plan</h2></div><Calculator size={24} /></div>
-        <label>Loan amount <strong>{money(principal)}</strong><input type="range" min="10000" max="2000000" step="10000" value={principal} onChange={e => setPrincipal(Number(e.target.value))} /></label>
-        <label>Monthly interest <strong>{rate}%</strong><input type="range" min="2.14" max="2.14" step="0.01" value={rate} readOnly aria-label="Approved monthly interest rate 2.14 percent" /><small>Fixed at 2.14% per month</small></label>
-        <label>Repayment tenure <strong>{months} months</strong><input type="range" min="3" max="60" value={months} onChange={e => setMonths(Number(e.target.value))} /></label>
-        <div className="planner-note"><ShieldCheck size={18} /><span>Interest = sanctioned amount × 2.14% × months. It is deducted before cash handover; the sanctioned amount is repaid across the selected months.</span></div>
+        <label>Plan type<select value={planType} onChange={e => changePlan(e.target.value)}><option>Daily 100-Day</option><option>Weekly</option><option>Monthly EMI</option></select></label>
+        <label>Loan amount <strong>{money(safePrincipal)}</strong><input type="range" min="10000" max="2000000" step="5000" value={Math.min(Math.max(safePrincipal, 10000), 2000000)} onChange={e => setPrincipal(Number(e.target.value))} /><input type="number" min="1" step="1" inputMode="numeric" aria-label="Loan amount" value={principal} onChange={e => setPrincipal(e.target.value)} /></label>
+        <label>Monthly interest <strong>{Number(rate) || 0}%</strong><input type="range" min={limits.min} max={limits.max} step="0.01" value={Math.min(Math.max(Number(rate) || limits.min, limits.min), limits.max)} onChange={e => setRate(Number(e.target.value))} aria-label="Monthly interest rate" /><input type="number" min={limits.min} max={limits.max} step="0.01" inputMode="decimal" aria-label="Monthly interest rate in percent" value={rate} onChange={e => setRate(e.target.value)} /><small>Any rate from {limits.min}% to {limits.max}% per month · default {limits.default}% · <button type="button" className="table-link" onClick={() => setRate(limits.default)}>Reset to {limits.default}%</button></small>{rateInvalid && <small className="form-error">Enter a monthly rate between {limits.min}% and {limits.max}%.</small>}</label>
+        <label>Repayment tenure <strong>{safePeriods} {plan.unit}{safePeriods === 1 ? '' : 's'}</strong><input type="range" min={plan.min} max={plan.max} step={plan.step} value={Math.min(Math.max(safePeriods, plan.min), plan.max)} onChange={e => setPeriods(Number(e.target.value))} /><input type="number" min="1" max={plan.max} step="1" inputMode="numeric" aria-label={`Number of ${plan.unit}s`} value={periods} onChange={e => setPeriods(e.target.value)} /></label>
+        <div className="planner-note"><ShieldCheck size={18} /><span>Interest = loan amount × {Number(rate) || 0}% × {months.toFixed(2).replace(/\.00$/, '')} month{months === 1 ? '' : 's'}. It is deducted before cash handover; the loan amount is repaid in {safePeriods} {plan.unit}ly instalments. This is the same formula used when a loan is created.</span></div>
       </section>
       <section className="planner-result">
-        <span>{invalidPlan ? 'Loan estimate unavailable' : 'Your estimated monthly payment'}</span><strong>{invalidPlan ? 'Invalid plan' : money(emi)}</strong><small>{invalidPlan ? `Select ${maximumTenure} months or fewer` : `for ${months} months`}</small>
-        {invalidPlan ? <div className="error-banner" role="alert">Upfront interest equals or exceeds the sanctioned amount. Reduce the tenure before creating this loan.</div> : <><div className="result-grid"><div><span>Sanctioned amount</span><b>{money(principal)}</b></div><div><span>Interest deducted upfront</span><b>{money(interest)}</b></div><div><span>Cash handed over</span><b>{money(cashHandover)}</b></div><div><span>Total repayment</span><b>{money(total)}</b></div></div><div className="repayment-bar"><i style={{ width: `${principal / total * 100}%` }} /></div></>}
-        <div className="legend repayment-legend"><span><i className="dot success" />Principal</span><span><i className="dot accent" />Interest</span></div>
+        <span>{invalidPlan ? 'Loan estimate unavailable' : `Your estimated ${plan.unit}ly payment`}</span><strong>{invalidPlan ? 'Invalid plan' : money(emi)}</strong><small>{invalidPlan ? (rateInvalid ? 'Check the interest rate' : 'Reduce the tenure or the interest rate') : `for ${safePeriods} ${plan.unit}s`}</small>
+        {invalidPlan ? <div className="error-banner" role="alert">{rateInvalid ? `Monthly interest must be between ${limits.min}% and ${limits.max}%.` : 'Upfront interest equals or exceeds the loan amount. Reduce the tenure or the interest rate.'}</div> : <><div className="result-grid"><div><span>Sanctioned amount</span><b>{money(safePrincipal)}</b></div><div><span>Interest deducted upfront</span><b>{money(interest)}</b></div><div><span>Cash handed over</span><b>{money(cashHandover)}</b></div><div><span>Total repayment</span><b>{money(safePrincipal)}</b></div></div><div className="repayment-bar"><i style={{ width: `${100 - interestShare}%` }} /></div></>}
+        <div className="legend repayment-legend"><span><i className="dot" style={{ background: '#72d595' }} />Cash handed over</span><span><i className="dot" style={{ background: '#d4af37' }} />Interest deducted</span></div>
       </section>
     </div>
   );
@@ -1543,8 +1637,69 @@ function CommandPalette({ onSelect, onClose }) {
   );
 }
 
-function LoanTable({ rows, onView, viewBusy = false }) {
-  return <div className="table-scroll"><table><thead><tr><th>Loan</th><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th><th>Status</th>{onView&&<th>Action</th>}</tr></thead><tbody>{rows.map(l => <tr key={l.loan_id}><td>{l.loan_id}<small>{date(l.borrow_date)}</small></td><td>{l.customer_name || l.customer_id}<small>{l.area_name || l.area}</small></td><td>{l.frequency || l.loan_type}</td><td>{money(l.installment)}</td><td>{money(l.paid)}</td><td>{money(l.balance)}</td><td>{l.remaining_installments ?? '—'}<small>{l.frequency ? `${l.frequency} installments` : ''}</small></td><td>{l.next_due_date ? date(l.next_due_date) : 'Completed'}</td><td><Status value={l.status} /></td>{onView&&<td><button className="ghost small" disabled={viewBusy} onClick={()=>onView(l.loan_id)}><FileText size={15}/>View loan</button></td>}</tr>)}</tbody></table></div>;
+const EMPTY_LOAN_FILTERS = { q: '', month: '', area: '', plan: '', status: '', collector: '', min: '', max: '', sort: 'newest' };
+
+function LoanBook({ rows, areas, collectors, onView, viewBusy }) {
+  const [filters, setFilters] = useState(EMPTY_LOAN_FILTERS);
+  const [limit, setLimit] = useState(25);
+  const set = (key, value) => { setFilters(current => ({ ...current, [key]: value })); setLimit(25); };
+  const months = useMemo(() => [...new Set(rows.map(row => String(row.borrow_date || '').slice(0, 7)).filter(Boolean))].sort().reverse(), [rows]);
+  const statuses = useMemo(() => [...new Set(rows.map(row => row.status).filter(Boolean))].sort(), [rows]);
+  const filtered = useMemo(() => {
+    const q = filters.q.trim().toLowerCase();
+    const min = filters.min === '' ? null : Number(filters.min);
+    const max = filters.max === '' ? null : Number(filters.max);
+    const list = rows.filter(row =>
+      (!q || `${row.loan_id} ${row.customer_id} ${row.customer_name} ${row.mobile || ''}`.toLowerCase().includes(q)) &&
+      (!filters.month || String(row.borrow_date || '').startsWith(filters.month)) &&
+      (!filters.area || (row.area_code || row.area) === filters.area) &&
+      (!filters.plan || row.loan_type === filters.plan) &&
+      (!filters.status || row.status === filters.status) &&
+      (!filters.collector || row.collector_id === filters.collector) &&
+      (min == null || Number(row.principal) >= min) &&
+      (max == null || Number(row.principal) <= max));
+    const sorters = {
+      newest: (a, b) => String(b.borrow_date).localeCompare(String(a.borrow_date)),
+      oldest: (a, b) => String(a.borrow_date).localeCompare(String(b.borrow_date)),
+      amount_desc: (a, b) => Number(b.principal) - Number(a.principal),
+      amount_asc: (a, b) => Number(a.principal) - Number(b.principal),
+      balance_desc: (a, b) => Number(b.balance) - Number(a.balance),
+      due: (a, b) => String(a.next_due_date || '9999').localeCompare(String(b.next_due_date || '9999')),
+    };
+    return [...list].sort(sorters[filters.sort] || sorters.newest);
+  }, [rows, filters]);
+  const totals = useMemo(() => filtered.reduce((acc, row) => ({ principal: acc.principal + Number(row.principal || 0), paid: acc.paid + Number(row.paid || 0), balance: acc.balance + Number(row.balance || 0) }), { principal: 0, paid: 0, balance: 0 }), [filtered]);
+  const active = Object.entries(filters).filter(([key, value]) => key !== 'sort' && value !== '').length;
+  const monthLabel = key => new Date(`${key}-01T00:00:00`).toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+  return <>
+    <div className="loan-filters">
+      <div className="searchbox"><Search size={16} /><input value={filters.q} onChange={e => set('q', e.target.value)} placeholder="Loan ID, customer, mobile…" aria-label="Search loan book" /></div>
+      <select aria-label="Filter by month" value={filters.month} onChange={e => set('month', e.target.value)}><option value="">All months</option>{months.map(m => <option key={m} value={m}>{monthLabel(m)}</option>)}</select>
+      <select aria-label="Filter by area" value={filters.area} onChange={e => set('area', e.target.value)}><option value="">All areas</option>{areas.map(a => <option key={a.code} value={a.code}>{a.name} ({a.code})</option>)}</select>
+      <select aria-label="Filter by plan" value={filters.plan} onChange={e => set('plan', e.target.value)}><option value="">All plans</option><option value="Daily 100-Day">Daily</option><option value="Weekly">Weekly</option><option value="Monthly EMI">Monthly</option></select>
+      <select aria-label="Filter by status" value={filters.status} onChange={e => set('status', e.target.value)}><option value="">All statuses</option>{statuses.map(x => <option key={x}>{x}</option>)}</select>
+      {collectors.length > 1 && <select aria-label="Filter by collector" value={filters.collector} onChange={e => set('collector', e.target.value)}><option value="">All collectors</option>{collectors.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select>}
+      <input type="number" min="0" inputMode="numeric" aria-label="Minimum loan amount" placeholder="Min amount ₹" value={filters.min} onChange={e => set('min', e.target.value)} />
+      <input type="number" min="0" inputMode="numeric" aria-label="Maximum loan amount" placeholder="Max amount ₹" value={filters.max} onChange={e => set('max', e.target.value)} />
+      <select aria-label="Sort loans" value={filters.sort} onChange={e => set('sort', e.target.value)}><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="amount_desc">Amount: high to low</option><option value="amount_asc">Amount: low to high</option><option value="balance_desc">Outstanding: high to low</option><option value="due">Next due first</option></select>
+      {active > 0 && <button type="button" className="ghost small" onClick={() => { setFilters(EMPTY_LOAN_FILTERS); setLimit(25); }}><X size={15} />Clear {active} filter{active === 1 ? '' : 's'}</button>}
+    </div>
+    <div className="loan-filter-summary"><span><b>{filtered.length}</b> of {rows.length} loans</span><span>Sanctioned <b>{money(totals.principal)}</b></span><span>Paid <b>{money(totals.paid)}</b></span><span>Outstanding <b>{money(totals.balance)}</b></span></div>
+    {filtered.length ? <LoanTable rows={filtered.slice(0, limit)} onView={onView} viewBusy={viewBusy} /> : <div className="locked-note">No loans match these filters.</div>}
+    {filtered.length > limit && <button type="button" className="ghost show-more" onClick={() => setLimit(limit + 50)}>Show more ({filtered.length - limit} remaining)</button>}
+  </>;
+}
+
+function LoanTable({ rows, onView, viewBusy = false, onOpenCustomer = null }) {
+  return <div className="table-scroll loan-table"><table><thead><tr><th>Loan</th><th>Plan</th><th>Paid / Yet to pay</th><th>Next due</th><th>Status</th></tr></thead><tbody>{rows.map(l => <tr key={l.loan_id} className={onView ? 'clickable-row' : ''} onClick={onView ? e => { if (!e.target.closest('button') && !viewBusy) onView(l.loan_id); } : undefined}>
+    <td>{onView ? <button className="table-link" disabled={viewBusy} onClick={()=>onView(l.loan_id)} title="Open the complete loan record">{l.loan_id}</button> : <strong>{l.loan_id}</strong>}
+      <small>{onOpenCustomer ? <button className="table-link subtle" onClick={()=>onOpenCustomer(l.customer_id)} title="Open customer profile">{l.customer_name || l.customer_id}</button> : (l.customer_name || l.customer_id)}{(l.area_name || l.area) ? ` · ${l.area_name || l.area}` : ''}</small>
+      <small>{day(l.borrow_date)} · {money(l.principal)}</small></td>
+    <td>{l.frequency || l.loan_type}<small>{money(l.installment)} each</small></td>
+    <td>{money(l.paid)}<small>{money(l.balance)} to pay</small></td>
+    <td>{l.next_due_date ? day(l.next_due_date) : 'Completed'}<small>{l.remaining_installments ?? 0} left</small></td>
+    <td><Status value={l.status} /></td>
+  </tr>)}</tbody></table></div>;
 }
 
 function PaymentConfirmModal({ payment, saving, error, onCancel, onConfirm }) {
@@ -1597,7 +1752,7 @@ function ReceiptModal({ title, data, onClose }) {
 }
 
 function Kpi({ icon: Icon, label, value, tone = 'violet' }) {
-  return <div className={`kpi ${tone}`}><Icon size={22} /><span>{label}</span><strong>{value}</strong></div>;
+  return <div className={`kpi ${tone}`}><Icon size={22} /><span>{label}</span><strong className={String(value).length > 10 ? 'long-value' : ''} title={String(value)}>{value}</strong></div>;
 }
 
 function Metric({ icon: Icon, label, value }) {
@@ -1634,24 +1789,35 @@ function Risk({ score }) {
 }
 
 function Status({ value }) {
-  return <span className={`status ${String(value).toLowerCase().replaceAll(' ', '-')}`}>{value}</span>;
+  const key = String(value || '').toLowerCase();
+  const tone = key.startsWith('overdue') ? 'overdue' : key === 'upcoming' ? 'upcoming' : key.replaceAll(' ', '-');
+  return <span className={`status ${tone}`}>{value}</span>;
 }
 
 function Skeleton() {
   return <div className="skeleton"><div /><div /><div /></div>;
 }
 
+const MONEY_FORMAT = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', minimumFractionDigits: 0, maximumFractionDigits: 2 });
 function money(value) {
-  return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(value || 0);
+  return MONEY_FORMAT.format(Number(value) || 0);
 }
 
 function indiaDayKey(value) {
   return new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Kolkata', year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date(value));
 }
 
+const DATE_TIME_FORMAT = new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+const DAY_FORMAT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 function date(value) {
   if (!value) return '';
-  return new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? '' : DATE_TIME_FORMAT.format(parsed);
+}
+function day(value) {
+  if (!value) return '';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? '' : DAY_FORMAT.format(parsed);
 }
 
 function reportRows(report) {

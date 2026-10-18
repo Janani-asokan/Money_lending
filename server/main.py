@@ -15,6 +15,8 @@ import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request as UrlRequest, urlopen
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -136,12 +138,35 @@ LOAN_TYPES = ["Daily 100-Day", "Weekly", "Monthly EMI"]
 DEFAULT_MONTHLY_INTEREST_RATE = float(os.getenv("DEFAULT_MONTHLY_INTEREST_RATE", "2.14"))
 MIN_MONTHLY_INTEREST_RATE = float(os.getenv("MIN_MONTHLY_INTEREST_RATE", "0.01"))
 MAX_MONTHLY_INTEREST_RATE = float(os.getenv("MAX_MONTHLY_INTEREST_RATE", "10"))
+# Cash handed to the borrower may be rounded by hand (e.g. 46,433.33 -> 46,430) by up to
+# this many rupees either way. The difference is absorbed in the upfront interest.
+MAX_CASH_ROUNDING_RUPEES = float(os.getenv("MAX_CASH_ROUNDING_RUPEES", "100"))
 
 
 # Late charge rule - the ONLY place that decides who is a "defaulter".
 # A loan is a defaulter when its oldest unpaid instalment is at least this many days past its due date.
 # Change the number here (or set the LATE_CHARGE_DEFAULTER_DAYS environment variable).
 LATE_CHARGE_DEFAULTER_DAYS = int(os.getenv("LATE_CHARGE_DEFAULTER_DAYS", "30"))
+
+
+def apply_cash_rounding(schedule: dict[str, Any], cash_handover: Optional[float]) -> dict[str, Any]:
+    """Use the cash amount the owner rounded by hand; the difference adjusts the upfront interest."""
+    calculated = Decimal(str(schedule["net_disbursed"]))
+    schedule = {**schedule, "calculated_net_disbursed": float(calculated), "cash_rounding_adjustment": 0.0}
+    if cash_handover is None:
+        return schedule
+    cash = Decimal(str(cash_handover)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    difference = cash - calculated
+    if abs(difference) > Decimal(str(MAX_CASH_ROUNDING_RUPEES)):
+        raise HTTPException(422, f"Cash handed over can be rounded by at most ₹{MAX_CASH_ROUNDING_RUPEES:g} from the calculated ₹{calculated:,.2f}")
+    interest = Decimal(str(schedule["interest_total"])) - difference
+    if interest < 0:
+        raise HTTPException(422, "Rounded cash cannot be more than the sanctioned amount minus charges")
+    cashflows = [-cash] + [Decimal(str(row["payment"])) for row in schedule["rows"] if float(row["payment"]) > 0]
+    periods_per_year = Decimal(365 if schedule.get("loan_type") == "Daily 100-Day" else 52 if schedule.get("loan_type") == "Weekly" else 12)
+    apr = ((Decimal(1) + periodic_irr(cashflows)) ** int(periods_per_year) - 1) * 100
+    schedule.update({"net_disbursed": float(cash), "interest_total": float(interest), "cash_rounding_adjustment": float(difference), "apr": float(apr.quantize(Decimal("0.0001")))})
+    return schedule
 
 
 def validate_new_loan_rate(rate: float) -> None:
@@ -329,6 +354,7 @@ class LoanIn(BaseModel):
     late_fee: float = Field(default=0, ge=0, le=1000000)
     kfs_acknowledgement_reference: str = Field(min_length=3, max_length=120)
     identity_verification_id: Optional[str] = Field(default=None, max_length=120)
+    cash_handover: Optional[float] = Field(default=None, gt=0, le=100000000)
 
     @field_validator("disbursement_mode")
     @classmethod
@@ -760,6 +786,7 @@ def build_amortization(payload: LoanIn, borrow: datetime) -> dict[str, Any]:
             "total_repayment": float(principal), "monthly_interest_rate": float(payload.interest_rate),
             "tenure_months": float(tenure_months.quantize(Decimal("0.0001"))),
             "interest_deduction_basis": "Deducted upfront from sanctioned principal",
+            "loan_type": payload.loan_type,
         }
     annual_rate = Decimal(str(payload.interest_rate)) / 100
     periods = payload.repayment_period
@@ -1133,6 +1160,31 @@ async def send_sms(mobile: str, text: str) -> None:
     await asyncio.to_thread(send)
 
 
+@asynccontextmanager
+async def atomic():
+    """MongoDB transaction in production; plain sequential writes in demo (in-memory) mode."""
+    if USE_MEMORY:
+        yield None
+        return
+    async with await mongo_client.start_session() as session:
+        async with session.start_transaction():
+            yield session
+
+
+async def tx_insert(collection: str, doc: dict[str, Any], session: Any) -> None:
+    if USE_MEMORY:
+        await insert_one(collection, doc)
+    else:
+        await db[collection].insert_one(deepcopy(doc), session=session)
+
+
+async def tx_set(collection: str, query: dict[str, Any], fields: dict[str, Any], session: Any) -> None:
+    if USE_MEMORY:
+        await update_where(collection, query, fields)
+    else:
+        await db[collection].update_one(query, {"$set": fields}, session=session)
+
+
 async def update_where(collection: str, query: dict[str, Any], fields: dict[str, Any], inc: Optional[dict[str, int]] = None) -> bool:
     """Conditionally update one document; returns False when nothing matched (state changed)."""
     if USE_MEMORY:
@@ -1211,6 +1263,87 @@ def loan_schedule(loan: dict[str, Any]) -> dict[str, Any]:
     return {"installment": installment, "total_payable": total_payable, "expected_completion": iso(expected)}
 
 
+# Bulk-read cache used while enriching many loans/customers in one request, so list
+# screens make a handful of database queries instead of several per loan.
+_PREFETCH: ContextVar[Optional[dict[str, Any]]] = ContextVar("_prefetch", default=None)
+LOAN_CHILD_COLLECTIONS = ("payments", "loan_adjustments", "part_payments", "writeoffs")
+
+
+def prefetched_rows(collection: str, loan_id: str) -> Optional[list[dict[str, Any]]]:
+    cache = _PREFETCH.get()
+    if cache is None or collection not in cache:
+        return None
+    return cache[collection].get(loan_id, [])
+
+
+async def area_lookup(code: str) -> Optional[dict[str, Any]]:
+    cache = _PREFETCH.get()
+    if cache is not None and "areas" in cache:
+        return cache["areas"].get(code)
+    return await find_one("areas", {"code": code})
+
+
+async def schedule_lookup(loan: dict[str, Any]) -> Optional[dict[str, Any]]:
+    key = (loan["loan_id"], int(loan.get("schedule_version", 1)))
+    cache = _PREFETCH.get()
+    if cache is not None and "loan_schedules" in cache:
+        return cache["loan_schedules"].get(key)
+    return await find_one("loan_schedules", {"loan_id": key[0], "version": key[1]})
+
+
+async def build_prefetch() -> dict[str, Any]:
+    cache: dict[str, Any] = {}
+    for collection in LOAN_CHILD_COLLECTIONS:
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        rows = await find_many(collection)
+        rows.sort(key=lambda row: str(row.get("timestamp", "")))
+        for row in rows:
+            grouped[row.get("loan_id")].append(row)
+        cache[collection] = grouped
+    cache["loan_schedules"] = {(row.get("loan_id"), int(row.get("version", 1))): row for row in await find_many("loan_schedules")}
+    cache["areas"] = {row.get("code"): row for row in await find_many("areas")}
+    return cache
+
+
+async def enrich_loans(loans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    token = _PREFETCH.set(await build_prefetch()) if _PREFETCH.get() is None else None
+    try:
+        return [await enrich_loan(loan) for loan in loans]
+    finally:
+        if token is not None:
+            _PREFETCH.reset(token)
+
+
+async def customer_views(customers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    token = _PREFETCH.set({"areas": {row.get("code"): row for row in await find_many("areas")}}) if _PREFETCH.get() is None else None
+    try:
+        return [await customer_view(customer) for customer in customers]
+    finally:
+        if token is not None:
+            _PREFETCH.reset(token)
+
+
+def repayment_rows(loan: dict[str, Any], schedule_doc: Optional[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Instalment rows for a loan. Older (pre-versioned) loans have no stored schedule,
+    so one is derived from their contract terms instead of showing 0 instalments."""
+    if schedule_doc:
+        return [row for row in schedule_doc.get("rows", []) if not row.get("moratorium") and float(row.get("payment", 0)) > 0]
+    terms = loan_schedule(loan)
+    count = 100 if loan["loan_type"] == "Daily 100-Day" else max(int(loan.get("repayment_period") or (52 if loan["loan_type"] == "Weekly" else 12)), 1)
+    remaining = to_paise(terms["total_payable"])
+    step = to_paise(terms["installment"])
+    borrow = parse_date(loan["borrow_date"])
+    rows = []
+    for number in range(1, count + 1):
+        if remaining <= 0:
+            break
+        payment = remaining if number == count else min(step, remaining)
+        remaining -= payment
+        due = borrow + timedelta(days=number) if loan["loan_type"] == "Daily 100-Day" else borrow + timedelta(days=7 * number) if loan["loan_type"] == "Weekly" else add_months(borrow, number)
+        rows.append({"number": number, "due_date": iso(due), "payment": from_paise(payment)})
+    return rows
+
+
 async def enrich_loan(loan: dict[str, Any]) -> dict[str, Any]:
     balances = await loan_component_balances(loan)
     paid = from_paise(balances["paid_paise"])
@@ -1219,18 +1352,23 @@ async def enrich_loan(loan: dict[str, Any]) -> dict[str, Any]:
     borrow = parse_date(loan["borrow_date"])
     elapsed = max((now() - borrow).days, 0)
     schedule = loan_schedule(loan)
-    schedule_doc = await find_one("loan_schedules", {"loan_id": loan["loan_id"], "version": int(loan.get("schedule_version", 1))})
-    repayment_rows = [row for row in (schedule_doc or {}).get("rows", []) if not row.get("moratorium") and float(row.get("payment", 0)) > 0]
+    rows = repayment_rows(loan, await schedule_lookup(loan))
     paid_remaining = Decimal(str(paid))
     installments_paid = 0
     next_due_date = None
-    for row in repayment_rows:
+    for row in rows:
         due = Decimal(str(row.get("payment", 0)))
         if paid_remaining >= due:
             installments_paid += 1; paid_remaining -= due
         elif next_due_date is None:
             next_due_date = row.get("due_date")
-    remaining_installments = max(len(repayment_rows) - installments_paid, 0)
+    remaining_installments = max(len(rows) - installments_paid, 0)
+    if balance <= 0:
+        remaining_installments, next_due_date = 0, None
+    elif remaining_installments == 0:
+        # Every instalment is paid but charges (e.g. a penalty) are still outstanding.
+        remaining_installments = 1
+        next_due_date = rows[-1]["due_date"] if rows else iso(now())
     frequency = "Daily" if loan["loan_type"] == "Daily 100-Day" else "Weekly" if loan["loan_type"] == "Weekly" else "Monthly"
     status_value = loan.get("status", "Active")
     if balance <= 0:
@@ -1253,16 +1391,16 @@ async def enrich_loan(loan: dict[str, Any]) -> dict[str, Any]:
 
 
 async def loan_component_balances(loan: dict[str, Any], session: Any = None) -> dict[str, int]:
-    if USE_MEMORY:
-        payments = [p for p in await find_many("payments", {"loan_id": loan["loan_id"]}) if p.get("status", "Posted") != "Reversed"]
-        adjustments = [a for a in await find_many("loan_adjustments", {"loan_id": loan["loan_id"]}) if a.get("status", "Posted") != "Reversed"]
+    def live(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [row for row in rows if row.get("status", "Posted") != "Reversed"]
+    if session is None and prefetched_rows("payments", loan["loan_id"]) is not None:
+        payments, adjustments, part_payments, writeoffs = (live(prefetched_rows(name, loan["loan_id"])) for name in LOAN_CHILD_COLLECTIONS)
+    elif USE_MEMORY:
+        payments, adjustments, part_payments, writeoffs = [live(await find_many(name, {"loan_id": loan["loan_id"]})) for name in LOAN_CHILD_COLLECTIONS]
+        payments.sort(key=lambda row: str(row.get("timestamp", "")))
     else:
         payments = await db.payments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).sort("timestamp", 1).to_list(length=None)
         adjustments = await db.loan_adjustments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
-    if USE_MEMORY:
-        part_payments = [p for p in await find_many("part_payments", {"loan_id": loan["loan_id"]}) if p.get("status", "Posted") != "Reversed"]
-        writeoffs = [p for p in await find_many("writeoffs", {"loan_id": loan["loan_id"]}) if p.get("status", "Posted") != "Reversed"]
-    else:
         part_payments = await db.part_payments.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
         writeoffs = await db.writeoffs.find({"loan_id": loan["loan_id"], "status": {"$ne": "Reversed"}}, session=session).to_list(length=None)
     principal = to_paise(loan["principal"])
@@ -1307,7 +1445,7 @@ async def customer_view(customer: dict[str, Any]) -> dict[str, Any]:
     visible["aadhaar_masked"] = f"XXXX XXXX {customer['aadhaar_last4']}" if customer.get("aadhaar_last4") else ("Stored securely" if customer.get("aadhaar_encrypted") else "Not provided")
     visible["has_aadhaar"] = bool(customer.get("aadhaar_encrypted"))
     visible["mobile_verified"] = mobile_verified(customer)
-    area = await find_one("areas", {"code": customer.get("area")})
+    area = await area_lookup(customer.get("area"))
     visible["area_code"] = customer.get("area", "")
     visible["area_name"] = area.get("name", customer.get("area", "")) if area else customer.get("area", "")
     visible["area"] = visible["area_name"]
@@ -1440,17 +1578,27 @@ async def seed_data() -> None:
             "created_at": iso(borrow),
         }
         await insert_one("loans", loan)
-        installment = loan_schedule(loan)["installment"]
-        paid_count = random.randint(4, min(80, max(6, (now() - borrow).days)))
-        for p in range(1, paid_count + 1):
+        terms = loan_schedule(loan)
+        installment = terms["installment"]
+        # Demo payments: never dated in the future and never more than the amount payable.
+        remaining = to_paise(terms["total_payable"])
+        step_days = 1 if loan_type == "Daily 100-Day" else 30
+        due_so_far = max((now() - borrow).days // step_days, 0)
+        for p in range(1, due_so_far + 1):
+            if remaining <= 0:
+                break
             if random.random() < 0.18:
                 continue
-            pay_dt = borrow + timedelta(days=p if loan_type == "Daily 100-Day" else p * 30)
+            pay_dt = borrow + timedelta(days=p * step_days, hours=random.randint(9, 18))
+            if pay_dt >= now():
+                break
+            amount_paise = min(to_paise(installment), remaining)
+            remaining -= amount_paise
             await insert_one("payments", {
-                "receipt_no": f"RCP-{pay_dt.strftime('%Y%m%d')}-{p:03d}",
+                "receipt_no": f"RCP-{pay_dt.strftime('%Y%m%d')}-{i:02d}{p:04d}",
                 "loan_id": loan_id,
                 "customer_id": customer["customer_id"],
-                "amount": installment,
+                "amount": from_paise(amount_paise),
                 "mode": random.choice(PAYMENT_MODES),
                 "collector_id": loan["collector_id"],
                 "timestamp": iso(pay_dt),
@@ -1463,7 +1611,7 @@ async def refresh_overdue_alerts() -> None:
     if USE_MEMORY:
         STORE["overdue_alerts"] = []
         STORE["notifications"] = []
-    loans = [await enrich_loan(x) for x in await find_many("loans")]
+    loans = await enrich_loans(await find_many("loans"))
     for loan in loans:
         if loan["status"] == "Closed":
             continue
@@ -1859,14 +2007,24 @@ async def bootstrap(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
         "collectors": collectors,
         "payment_modes": PAYMENT_MODES,
         "loan_types": LOAN_TYPES,
+        "interest_rate": {"default": DEFAULT_MONTHLY_INTEREST_RATE, "min": MIN_MONTHLY_INTEREST_RATE, "max": MAX_MONTHLY_INTEREST_RATE},
+        "max_cash_rounding": MAX_CASH_ROUNDING_RUPEES,
     }
 
 
 @app.get("/api/dashboard")
 async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    customers = [await customer_view(x) for x in await find_many("customers") if not x.get("profile_deleted_at")]
-    loans = [await enrich_loan(x) for x in await find_many("loans")]
-    payments = await find_many("payments")
+    token = _PREFETCH.set(await build_prefetch())
+    try:
+        return await build_dashboard()
+    finally:
+        _PREFETCH.reset(token)
+
+
+async def build_dashboard() -> dict[str, Any]:
+    customers = await customer_views([x for x in await find_many("customers") if not x.get("profile_deleted_at")])
+    loans = await enrich_loans(await find_many("loans"))
+    payments = [p for p in await find_many("payments") if p.get("status", "Posted") != "Reversed"]
     today_key = business_now().date().isoformat()
     month_key = business_now().strftime("%Y-%m")
     today_payments = [p for p in payments if business_date_key(p["timestamp"]) == today_key]
@@ -1874,7 +2032,7 @@ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
     area_summary = []
     for area in await find_many("areas"):
         code = area["code"]
-        area_customers = [c for c in customers if c["area"] == code]
+        area_customers = [c for c in customers if c.get("area_code") == code]
         area_loans = [l for l in loans if l["customer_id"] in {c["customer_id"] for c in area_customers}]
         area_today = [p for p in today_payments if p["customer_id"] in {c["customer_id"] for c in area_customers}]
         area_month = [p for p in month_payments if p["customer_id"] in {c["customer_id"] for c in area_customers}]
@@ -1910,10 +2068,9 @@ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
     pending_dues = []
     for loan in loans:
         if loan["status"] in {"Closed", "Written Off"} or loan["balance"] <= 0: continue
-        schedule_doc = await find_one("loan_schedules", {"loan_id": loan["loan_id"], "version": int(loan.get("schedule_version", 1))})
         paid_remaining = Decimal(str(loan.get("paid", 0)))
         next_row = None
-        for installment_row in (schedule_doc or {}).get("rows", []):
+        for installment_row in repayment_rows(loan, await schedule_lookup(loan)):
             installment_due = Decimal(str(installment_row.get("payment", 0)))
             applied = min(paid_remaining, installment_due); paid_remaining -= applied
             remaining_due = installment_due - applied
@@ -1936,7 +2093,7 @@ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
             "overdue_loans": len([l for l in loans if l["status"] == "Overdue"]),
             "today_collection": round(sum(p["amount"] for p in today_payments), 2),
             "monthly_collection": round(sum(p["amount"] for p in month_payments), 2),
-            "outstanding": round(sum(l["balance"] for l in loans if l["status"] != "Closed"), 2),
+            "outstanding": round(sum(l["balance"] for l in loans if l["status"] not in {"Closed", "Written Off"}), 2),
         },
         "split": {
             "daily": len([l for l in loans if l["loan_type"] == "Daily 100-Day"]),
@@ -1962,7 +2119,7 @@ def build_cashflow(payments: list[dict[str, Any]]) -> list[dict[str, Any]]:
 @app.get("/api/customers")
 async def customers(q: str = "", area: str = "", status_filter: str = "", user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
     customer_records = [x for x in await find_many("customers") if not x.get("profile_deleted_at")]
-    rows = [await customer_view(x) for x in customer_records]
+    rows = await customer_views(customer_records)
     loan_rows = await find_many("loans")
     loans_by_customer: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for loan in loan_rows:
@@ -2051,7 +2208,7 @@ async def update_customer(customer_id: str, payload: CustomerUpdateIn, request: 
     else:
         async with await mongo_client.start_session() as session:
             async with session.start_transaction():
-                result = await db.customers.replace_one({"_id": customer["_id"]}, updated, session=session)
+                result = await db.customers.replace_one({"customer_id": customer_id, "profile_deleted_at": {"$exists": False}}, updated, session=session)
                 if result.modified_count != 1:
                     raise HTTPException(409, "Customer changed concurrently; reload and retry")
                 await audit(user, "customer_details_updated", "customer", customer_id, details, request, session=session)
@@ -2437,8 +2594,8 @@ def risk_score(data: dict[str, Any]) -> int:
 
 @app.get("/api/loans")
 async def loans(q: str = "", status_filter: str = "", loan_type: str = "", area: str = "", collector_id: str = "", user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
-    rows = [await enrich_loan(x) for x in await find_many("loans")]
-    customers_map = {c["customer_id"]: await customer_view(c) for c in await find_many("customers")}
+    rows = await enrich_loans(await find_many("loans"))
+    customers_map = {c["customer_id"]: c for c in await customer_views(await find_many("customers"))}
     out = []
     for loan in rows:
         c = customers_map.get(loan["customer_id"], {})
@@ -2473,8 +2630,9 @@ async def loan_quote(payload: LoanIn, user: dict[str, Any] = Depends(require("ow
     # Tax on fee, moratorium and pre-closure charge were removed from disbursement: new loans always carry 0 for them.
     payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat", "tax_rate": 0, "moratorium_periods": 0, "preclosure_charge_rate": 0})
     borrow = parse_date(payload.borrow_date)
-    schedule = build_amortization(payload, borrow)
+    schedule = apply_cash_rounding(build_amortization(payload, borrow), payload.cash_handover)
     return {
+        "calculated_net_disbursed": schedule["calculated_net_disbursed"], "cash_rounding_adjustment": schedule["cash_rounding_adjustment"],
         "quote_id": f"QTE-{uuid.uuid4().hex[:12].upper()}", "generated_at": iso(now()),
         "sanctioned_amount": payload.principal, "net_disbursed_amount": schedule["net_disbursed"],
         "monthly_interest_rate": payload.interest_rate, "interest_method": payload.interest_method,
@@ -2733,12 +2891,11 @@ async def part_payment(loan_id: str, payload: PartPaymentIn, request: Request, u
         lines.extend([ledger_line("4000", debit_paise=-interest_difference, loan_id=loan_id), ledger_line("1200", credit_paise=-interest_difference, loan_id=loan_id)])
     loan_updates = {"schedule_version": version, "emi": schedule["emi"], "maturity_date": schedule["maturity_date"], "contract_interest": from_paise(interest_paid + new_interest_paise), "total_repayment": schedule["total_repayment"]}
     schedule_doc = {"loan_id": loan_id, "version": version, "reason": payload.strategy, "consent_reference": payload.borrower_consent_reference, "created_at": iso(now()), **schedule}
-    async with await mongo_client.start_session() as session:
-        async with session.start_transaction():
-            await db.part_payments.insert_one(deepcopy(record), session=session)
-            await db.loan_schedules.insert_one(deepcopy(schedule_doc), session=session)
-            await db.loans.update_one({"loan_id": loan_id}, {"$set": loan_updates, "$inc": {"ledger_version": 1}}, session=session)
-            await post_journal(entry_id, "part_payment", part_id, f"Part-payment: {payload.strategy}", lines, user, session=session)
+    async with atomic() as session:
+        await tx_insert("part_payments", record, session)
+        await tx_insert("loan_schedules", schedule_doc, session)
+        await tx_set("loans", {"loan_id": loan_id}, loan_updates, session)
+        await post_journal(entry_id, "part_payment", part_id, f"Part-payment: {payload.strategy}", lines, user, session=session)
     await audit(user, "part_payment_recalculation", "loan", loan_id, record, request)
     return {"part_payment": record, "schedule": schedule_doc, "loan": await enrich_loan(await find_one("loans", {"loan_id": loan_id}))}
 
@@ -2769,13 +2926,12 @@ async def restructure_loan(loan_id: str, payload: RestructureIn, request: Reques
         journal_id = f"JRN-{await next_sequence('JRN', 'entry_id', 'journal_entries'):09d}"
     event = {"event_id": event_id, "loan_id": loan_id, "type": "Restructure", **payload.model_dump(), "old_rate": loan["interest_rate"], "old_schedule_version": loan["schedule_version"], "new_schedule_version": version, "timestamp": iso(now()), "approved_by": user["name"], "journal_entry_id": journal_id}
     schedule_doc = {"loan_id": loan_id, "version": version, "reason": "Restructure", "approval_reference": payload.approval_reference, "consent_reference": payload.borrower_consent_reference, "created_at": iso(now()), **schedule}
-    async with await mongo_client.start_session() as session:
-        async with session.start_transaction():
-            await db.loan_events.insert_one(deepcopy(event), session=session)
-            await db.loan_schedules.insert_one(deepcopy(schedule_doc), session=session)
-            await db.loans.update_one({"loan_id": loan_id}, {"$set": {"interest_rate": payload.annual_rate, "repayment_period": payload.remaining_periods, "moratorium_periods": payload.moratorium_periods, "schedule_version": version, "emi": schedule["emi"], "maturity_date": schedule["maturity_date"], "contract_interest": from_paise(interest_paid + new_interest), "total_repayment": schedule["total_repayment"], "status": "Restructured"}}, session=session)
-            if lines:
-                await post_journal(journal_id, "loan_restructure", event_id, f"Restructure {payload.approval_reference}", lines, user, session=session)
+    async with atomic() as session:
+        await tx_insert("loan_events", event, session)
+        await tx_insert("loan_schedules", schedule_doc, session)
+        await tx_set("loans", {"loan_id": loan_id}, {"interest_rate": payload.annual_rate, "repayment_period": payload.remaining_periods, "moratorium_periods": payload.moratorium_periods, "schedule_version": version, "emi": schedule["emi"], "maturity_date": schedule["maturity_date"], "contract_interest": from_paise(interest_paid + new_interest), "total_repayment": schedule["total_repayment"], "status": "Restructured"}, session)
+        if lines:
+            await post_journal(journal_id, "loan_restructure", event_id, f"Restructure {payload.approval_reference}", lines, user, session=session)
     await audit(user, "loan_restructure", "loan", loan_id, event, request)
     return {"event": event, "schedule": schedule_doc, "loan": await enrich_loan(await find_one("loans", {"loan_id": loan_id}))}
 
@@ -2800,11 +2956,10 @@ async def write_off_loan(loan_id: str, payload: WriteOffIn, request: Request, us
     if penalty: lines.append(ledger_line("1300", credit_paise=penalty, loan_id=loan_id))
     if interest: lines.append(ledger_line("1200", credit_paise=interest, loan_id=loan_id))
     if principal: lines.append(ledger_line("1100", credit_paise=principal, loan_id=loan_id))
-    async with await mongo_client.start_session() as session:
-        async with session.start_transaction():
-            await db.writeoffs.insert_one(deepcopy(record), session=session)
-            await db.loans.update_one({"loan_id": loan_id}, {"$set": {"status": "Written Off" if amount == balances["balance_paise"] else loan.get("status", "Active")}}, session=session)
-            await post_journal(entry_id, "loan_writeoff", writeoff_id, f"Write-off {payload.approval_reference}", lines, user, session=session)
+    async with atomic() as session:
+        await tx_insert("writeoffs", record, session)
+        await tx_set("loans", {"loan_id": loan_id}, {"status": "Written Off" if amount == balances["balance_paise"] else loan.get("status", "Active")}, session)
+        await post_journal(entry_id, "loan_writeoff", writeoff_id, f"Write-off {payload.approval_reference}", lines, user, session=session)
     await audit(user, "loan_writeoff", "loan", loan_id, record, request)
     return {"writeoff": record, "loan": await enrich_loan(await find_one("loans", {"loan_id": loan_id}))}
 
@@ -2832,7 +2987,7 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
     if not collector or collector.get("role") not in {"collector", "owner", "manager"} or not collector.get("active", True):
         raise HTTPException(422, "Select an active collector or the self-managed owner")
     borrow = parse_date(payload.borrow_date)
-    schedule = build_amortization(payload, borrow)
+    schedule = apply_cash_rounding(build_amortization(payload, borrow), payload.cash_handover)
     loan_seq = await next_sequence("LN", "loan_id", "loans")
     loan_id = f"LN-{loan_seq:09d}"
     loan = {
@@ -2853,6 +3008,7 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
         "interest_method": payload.interest_method,
         "processing_fee": schedule["processing_fee"], "tax_rate": payload.tax_rate, "tax_amount": schedule["tax"],
         "net_disbursed": schedule["net_disbursed"], "apr": schedule["apr"],
+        "calculated_net_disbursed": schedule["calculated_net_disbursed"], "cash_rounding_adjustment": schedule["cash_rounding_adjustment"],
         "first_due_date": schedule["first_due_date"], "maturity_date": schedule["maturity_date"],
         "moratorium_periods": payload.moratorium_periods, "moratorium_interest_capitalized": payload.moratorium_interest_capitalized,
         "preclosure_charge_rate": payload.preclosure_charge_rate, "late_fee": payload.late_fee,
@@ -3229,7 +3385,7 @@ async def adjustment_preview(loan_id: str, amount: float, user: dict[str, Any] =
     loan = await find_one("loans", {"loan_id": loan_id})
     if not loan:
         raise HTTPException(404, "Loan not found")
-    if loan.get("status") not in {"Active", "Overdue"}:
+    if loan.get("status") not in {"Active", "Overdue", "Restructured"}:
         raise HTTPException(409, "Interest can be adjusted only on an active loan")
     proposed = to_paise(amount)
     if proposed <= 0:
@@ -3240,8 +3396,8 @@ async def adjustment_preview(loan_id: str, amount: float, user: dict[str, Any] =
         "loan_id": loan_id, "original_interest": from_paise(original_interest),
         "previous_rebates": from_paise(already_rebated),
         "maximum_rebate": from_paise(maximum), "proposed_rebate": from_paise(proposed),
-        "balance_before": from_paise(balances["total_balance_paise"]),
-        "balance_after": from_paise(max(balances["total_balance_paise"] - proposed, 0)),
+        "balance_before": from_paise(balances["balance_paise"]),
+        "balance_after": from_paise(max(balances["balance_paise"] - proposed, 0)),
         "permitted": proposed <= maximum,
         "message": "Adjustment is within the remaining contract interest" if proposed <= maximum else "Rebate exceeds the remaining adjustable contract interest",
     }
@@ -3252,7 +3408,7 @@ async def loan_adjustment(loan_id: str, payload: LoanAdjustmentIn, request: Requ
     loan = await find_one("loans", {"loan_id": loan_id})
     if not loan:
         raise HTTPException(404, "Loan not found")
-    if loan.get("status") not in {"Active", "Overdue"}:
+    if loan.get("status") not in {"Active", "Overdue", "Restructured"}:
         raise HTTPException(409, "Adjustments can be posted only to an active loan")
     balances = await loan_component_balances(loan)
     amount = to_paise(payload.amount)
@@ -3266,7 +3422,7 @@ async def loan_adjustment(loan_id: str, payload: LoanAdjustmentIn, request: Requ
         raise HTTPException(409, "Waiver exceeds outstanding penalty")
     adjustment_id = f"ADJ-{await next_sequence('ADJ', 'adjustment_id', 'loan_adjustments'):08d}"
     entry_id = f"JRN-{await next_sequence('JRN', 'entry_id', 'journal_entries'):09d}"
-    adjustment = {"adjustment_id": adjustment_id, "loan_id": loan_id, **payload.model_dump(), "amount": from_paise(amount), "balance_before": from_paise(balances["total_balance_paise"]), "balance_after": from_paise(max(balances["total_balance_paise"] - amount, 0)), "timestamp": iso(now()), "status": "Posted", "journal_entry_id": entry_id, "posted_by": user["name"]}
+    adjustment = {"adjustment_id": adjustment_id, "loan_id": loan_id, **payload.model_dump(), "amount": from_paise(amount), "balance_before": from_paise(balances["balance_paise"]), "balance_after": from_paise(max(balances["balance_paise"] - amount, 0)), "timestamp": iso(now()), "status": "Posted", "journal_entry_id": entry_id, "posted_by": user["name"]}
     if payload.kind == "Penalty":
         lines = [ledger_line("1300", debit_paise=amount, loan_id=loan_id), ledger_line("4100", credit_paise=amount, loan_id=loan_id)]
     elif payload.kind == "Interest Rebate":
@@ -3504,9 +3660,9 @@ async def reports(payload: ReportRequest, request: Request, user: dict[str, Any]
 
 
 async def build_report(payload: ReportRequest) -> dict[str, Any]:
-    loans_rows = [await enrich_loan(x) for x in await find_many("loans")]
+    loans_rows = await enrich_loans(await find_many("loans"))
     payment_rows = await find_many("payments")
-    customers_rows = [await customer_view(x) for x in await find_many("customers")]
+    customers_rows = await customer_views(await find_many("customers"))
     if payload.report_type == "customer-ledger":
         cid = payload.customer_id or (customers_rows[0]["customer_id"] if customers_rows else "")
         return {
@@ -3683,7 +3839,7 @@ async def update_area(code: str, payload: AreaUpdateIn, request: Request, user: 
     else:
         async with await mongo_client.start_session() as session:
             async with session.start_transaction():
-                result = await db.areas.replace_one({"_id": area["_id"], "code": old_code}, deepcopy(updated), session=session)
+                result = await db.areas.replace_one({"code": old_code}, deepcopy(updated), session=session)
                 if result.modified_count != 1:
                     raise HTTPException(409, "Area changed concurrently; reload and retry")
                 customer_result = await db.customers.update_many(

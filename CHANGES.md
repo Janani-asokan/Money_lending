@@ -78,3 +78,40 @@ Files changed in this round: server/main.py, client/src/main.jsx, client/src/sty
 - main.py: PaymentIn.payment_type (Collection or Prepayment). A prepayment must be less than the outstanding balance
   (full settlement uses Close account). Prepayment = extra payment ahead of schedule: balance drops immediately and the
   remaining instalments are cleared in order (earliest first); instalment amounts do not change.
+
+## Round 3 - client feedback items + full application audit - DONE
+Files: server/main.py, client/src/main.jsx, client/src/styles.css
+
+### Requested items
+1. **Loans close at zero** - loans already closed automatically when the balance reached 0, but older (pre-versioned)
+   loans had no stored schedule, so they showed "0 instalments remaining / Completed" while money was still due. Their
+   schedule is now derived from the contract terms (`repayment_rows()`), so remaining instalments and next due date are
+   correct, and a loan only shows 0 remaining when its balance is actually 0 (and is then Closed).
+2. **Search opens the record** - customer names open Customer 360; a loan ID (or the whole row) opens the full loan
+   record in place with Collect / Prepayment / Close account. Search runs as you type and shows counts.
+3. **Customer 360** - its loans open the same loan record in place (shared `useLoanViewer`). The Dashboard's pending
+   dues, area drill-down and "Needs attention" alerts open loans the same way.
+4. **EMI planner** - interest rate is adjustable (slider + typed value, limits from the server: 0.01%-10%, default
+   2.14%), loan amount and tenure can be typed, and Daily / Weekly / Monthly plans use the same formula as loan creation.
+5. **Manual rounding of cash in hand** - nothing is rounded automatically any more (amounts show paise when present).
+   At disbursement the owner can type the cash actually handed over (within +/- MAX_CASH_ROUNDING_RUPEES, default 100);
+   the difference is absorbed in the upfront interest, the ledger stays balanced, and the loan record shows
+   "Cash rounded by hand from Rs X". Daily cash closing shows the exact ledger cash and the live difference.
+6. **OTP areas clear** - the Aadhaar and mobile OTP boxes close once verified and have a close (X) button; choosing a
+   different customer on the loan form clears any OTP proof that belonged to the previous customer.
+7. **Loan book filters** - month, area, plan, status, collector, min/max amount, text search and sorting, with live
+   totals (sanctioned / paid / outstanding) and paging (25 rows, "Show more").
+
+### Faults found and fixed during the audit
+- Live (MongoDB) crashes: editing a customer, renaming an area, posting a penalty/waiver and previewing an interest
+  rebate all returned "Internal Server Error".
+- Demo (in-memory) crashes: part-payment, restructure and write-off only worked with MongoDB (new `atomic()` helper).
+- Dashboard "Areas requiring collection" matched customers by area name instead of code; older loans were missing from
+  "Pending dues"; reversed payments were counted in collection totals.
+- Speed: list screens made several database queries per loan; they now bulk-load once per request
+  (dashboard 185 ms -> 40 ms, loans 130 ms -> 25 ms on a local MongoDB; the gap grows with the loan book).
+- Demo data: payments were dated in the future, overpaid loans, and duplicate receipt numbers crashed a fresh MongoDB start.
+- Layout: full-width panels did not span the page (customer registry was squeezed into a narrow column with very tall
+  rows); loan tables hid Status / View off-screen; loan-record quick-action buttons were nearly invisible; "Paid today"
+  badges were unreadable; KPI tiles overflowed; messages never disappeared; consent checkbox and OTP boxes were cramped;
+  loan tables become cards on phones; reports show Rs amounts and readable dates.
