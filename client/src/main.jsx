@@ -794,6 +794,8 @@ function Customers({ api, user, notify }) {
               setRegistrationOtp(cur => ({ ...cur, verified: false, otp_id: '', verifiedMobile: '' }));
             }
           }} /></label>
+          {registrationMode === 'aadhaar' && <label>Aadhaar<input required inputMode="numeric" minLength="12" maxLength="12" pattern="[0-9]{12}" value={form.aadhaar} onChange={e => setForm({ ...form, aadhaar: e.target.value.replace(/\D/g, '') })} /></label>}
+          <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code} value={a.code}>{a.name}</option>)}</select></label>
           {form.mobile.length === 10 && (
             <div className="registration-otp-box">
               {registrationOtp.verified && registrationOtp.verifiedMobile === form.mobile ? (
@@ -855,8 +857,6 @@ function Customers({ api, user, notify }) {
               )}
             </div>
           )}
-          {registrationMode === 'aadhaar' && <label>Aadhaar<input required inputMode="numeric" minLength="12" maxLength="12" pattern="[0-9]{12}" value={form.aadhaar} onChange={e => setForm({ ...form, aadhaar: e.target.value.replace(/\D/g, '') })} /></label>}
-          <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code} value={a.code}>{a.name}</option>)}</select></label>
           <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
         </div>
         <CustomerSuggestions matches={previousMatches} onSelect={usePreviousCustomer} />
