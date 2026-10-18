@@ -5,6 +5,7 @@ import asyncio
 import gzip
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import random
@@ -13,6 +14,7 @@ import shutil
 import time
 import uuid
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request as UrlRequest, urlopen
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -87,6 +89,10 @@ SMS_GATEWAY_URL = os.getenv("SMS_GATEWAY_URL", "https://api.sms-gate.app/3rdpart
 SMS_GATEWAY_USERNAME = os.getenv("SMS_GATEWAY_USERNAME", "")
 SMS_GATEWAY_PASSWORD = os.getenv("SMS_GATEWAY_PASSWORD", "")
 SMS_SENDER_NAME = os.getenv("SMS_SENDER_NAME", "Sri Sakthi Thirumurugan Finance")
+# When no SMS gateway is connected, show the OTP on screen instead of sending it. Handy on a
+# laptop; on the live (production) server it is off unless explicitly enabled, because an OTP
+# shown on screen proves nothing about the customer's phone.
+SMS_ALLOW_DEMO_OTP = os.getenv("SMS_ALLOW_DEMO_OTP", "false" if APP_ENV == "production" else "true").strip().lower() == "true"
 MOBILE_OTP_TTL_SECONDS = max(60, min(int(os.getenv("MOBILE_OTP_TTL_SECONDS", "300")), 900))
 MOBILE_OTP_MAX_ATTEMPTS = 3
 MOBILE_OTP_RESEND_SECONDS = 30
@@ -256,11 +262,10 @@ def validate_production_config() -> None:
         problems.append("COOKIE_SECURE must be true")
     if len(BACKUP_ENCRYPTION_KEY) != 32:
         problems.append("BACKUP_ENCRYPTION_KEY must be exactly 32 UTF-8 bytes")
-    norm_sms = normalized_sms_provider()
-    if norm_sms not in {"disabled", "android_gateway", "console"}:
-        problems.append("SMS_PROVIDER must be android_gateway, console, or disabled")
-    if norm_sms == "android_gateway" and not (SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD):
-        problems.append("SMS_GATEWAY_URL, SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD are required for android_gateway")
+    # SMS problems never stop the site from starting; they are reported in the log and in
+    # Settings -> SMS OTP setup, and OTP sending explains what is missing.
+    if not sms_gateway_ready():
+        print("[sms] Real SMS is not set up: " + " ".join(sms_setup_problems()), flush=True)
     if problems:
         raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
 
@@ -1164,13 +1169,107 @@ async def aadhaar_provider_call(path: str, payload: dict[str, Any]) -> dict[str,
     return await asyncio.to_thread(send)
 
 
+def sms_gateway_ready() -> bool:
+    return normalized_sms_provider() == "android_gateway" and bool(SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
+
+
+def sms_demo_mode() -> bool:
+    """True when OTPs are shown on screen instead of being sent by SMS."""
+    return normalized_sms_provider() == "console" or (not sms_gateway_ready() and SMS_ALLOW_DEMO_OTP)
+
+
 def sms_configured() -> bool:
+    return sms_gateway_ready() or sms_demo_mode()
+
+
+def sms_gateway_base() -> str:
+    url = SMS_GATEWAY_URL.rstrip("/")
+    return url[: -len("/message")] if url.endswith("/message") else url
+
+
+def sms_gateway_url_kind() -> str:
+    host = (urlparse(SMS_GATEWAY_URL).hostname or "").lower()
+    if not host:
+        return "missing"
+    if host.endswith("sms-gate.app"):
+        return "cloud"
+    if host == "localhost":
+        return "local-network"
+    try:
+        address = ipaddress.ip_address(host)
+        return "local-network" if (address.is_private or address.is_loopback or address.is_link_local) else "custom"
+    except ValueError:
+        return "custom"
+
+
+def sms_setup_problems() -> list[str]:
+    """Plain-language reasons why real SMS cannot be sent from this server."""
     provider = normalized_sms_provider()
+    problems = []
     if provider == "console":
-        return True
-    if provider == "android_gateway":
-        return bool(SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
-    return False
+        problems.append("SMS_PROVIDER is set to console/demo, so OTPs are only shown on screen. Set SMS_PROVIDER=android_gateway on this server.")
+        return problems
+    if provider != "android_gateway":
+        problems.append(f"SMS_PROVIDER is '{SMS_PROVIDER or 'not set'}' on this server. Set SMS_PROVIDER=android_gateway.")
+    if not SMS_GATEWAY_USERNAME:
+        problems.append("SMS_GATEWAY_USERNAME is not set on this server (it is only in your local server/.env, which is never uploaded).")
+    if not SMS_GATEWAY_PASSWORD:
+        problems.append("SMS_GATEWAY_PASSWORD is not set on this server.")
+    if sms_gateway_url_kind() == "local-network":
+        problems.append(f"SMS_GATEWAY_URL points to a home/office network address ({urlparse(SMS_GATEWAY_URL).hostname}). An online server cannot reach your phone there. Use https://api.sms-gate.app/3rdparty/v1/message with the app's Cloud server username and password.")
+    return problems
+
+
+def gateway_request(method: str, path: str, body: Optional[dict[str, Any]] = None, timeout: int = 20) -> tuple[int, Any]:
+    """Call the SMS Gateway API. Returns (status, parsed JSON or text). Network errors raise URLError/TimeoutError."""
+    credentials = base64.b64encode(f"{SMS_GATEWAY_USERNAME}:{SMS_GATEWAY_PASSWORD}".encode()).decode()
+    request = UrlRequest(
+        f"{sms_gateway_base()}{path}", data=json.dumps(body).encode() if body is not None else None, method=method,
+        headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}", "User-Agent": "MoneyLendingSMS/1.0"},
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            status = response.status
+    except HTTPError as exc:
+        raw, status = exc.read(), exc.code
+    try:
+        return status, json.loads(raw) if raw else {}
+    except ValueError:
+        return status, raw.decode(errors="replace")[:300]
+
+
+def gateway_error_message(status: int) -> str:
+    if status == 401:
+        return "SMS gateway rejected the username/password (401). Use the Cloud server username and password shown in the SMS Gateway app, and update them on this server."
+    if status == 403:
+        return "SMS gateway refused the request (403). Check the account in the SMS Gateway app is active."
+    if status == 404:
+        return "SMS gateway address not found (404). SMS_GATEWAY_URL should be https://api.sms-gate.app/3rdparty/v1/message."
+    if status == 429:
+        return "SMS gateway is rate-limiting this account (429). Wait a minute and try again."
+    return f"SMS gateway returned an error ({status}). Try again, or run the SMS check in Settings."
+
+
+async def send_sms(mobile: str, text: str) -> dict[str, Any]:
+    """Send one SMS. Returns {"demo": bool, "gateway_message_id", "gateway_state"}; raises a clear HTTP error otherwise."""
+    if sms_gateway_ready():
+        def send() -> dict[str, Any]:
+            try:
+                status, reply = gateway_request("POST", "/message", {"textMessage": {"text": text}, "phoneNumbers": [f"+91{mobile}"]})
+            except (URLError, TimeoutError, OSError) as exc:
+                if sms_gateway_url_kind() == "local-network":
+                    raise HTTPException(424, "This server cannot reach the phone's local network address. Use the cloud gateway URL https://api.sms-gate.app/3rdparty/v1/message.") from exc
+                raise HTTPException(424, "SMS gateway could not be reached from this server. Check its internet access, or run the SMS check in Settings.") from exc
+            if status >= 400:
+                raise HTTPException(424, gateway_error_message(status))
+            reply = reply if isinstance(reply, dict) else {}
+            return {"demo": False, "gateway_message_id": reply.get("id"), "gateway_state": reply.get("state", "Pending")}
+        return await asyncio.to_thread(send)
+    if sms_demo_mode():
+        print(f"[SMS demo] to +91{mobile}: {text}", flush=True)
+        return {"demo": True, "gateway_message_id": None, "gateway_state": "Demo"}
+    raise HTTPException(409, "SMS is not set up on this server: " + " ".join(sms_setup_problems()))
 
 
 def mask_mobile(mobile: str) -> str:
@@ -1179,28 +1278,6 @@ def mask_mobile(mobile: str) -> str:
 
 def mobile_otp_hash(otp_id: str, otp: str) -> str:
     return hmac.new(APP_SECRET_KEY.encode(), f"mobile-otp:{otp_id}:{otp}".encode(), hashlib.sha256).hexdigest()
-
-
-async def send_sms(mobile: str, text: str) -> None:
-    provider = normalized_sms_provider()
-    if provider == "console":
-        print(f"[SMS console] to +91{mobile}: {text}", flush=True)
-        return
-    if provider == "android_gateway" and SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD:
-        def send() -> None:
-            body = json.dumps({"textMessage": {"text": text}, "phoneNumbers": [f"+91{mobile}"]}).encode()
-            credentials = base64.b64encode(f"{SMS_GATEWAY_USERNAME}:{SMS_GATEWAY_PASSWORD}".encode()).decode()
-            request = UrlRequest(SMS_GATEWAY_URL, data=body, method="POST", headers={"Content-Type": "application/json", "Authorization": f"Basic {credentials}", "User-Agent": "MoneyLendingSMS/1.0"})
-            try:
-                with urlopen(request, timeout=20) as response: response.read()
-            except HTTPError as exc:
-                raise HTTPException(424, f"SMS gateway rejected the request with status {exc.code}") from exc
-            except (URLError, TimeoutError) as exc:
-                raise HTTPException(424, "SMS gateway is unreachable. Check that the gateway phone is online.") from exc
-        await asyncio.to_thread(send)
-        return
-    # If gateway is not configured, log to console and allow demo OTP so verification is testable
-    print(f"[SMS demo] to +91{mobile}: {text}", flush=True)
 
 
 @asynccontextmanager
@@ -2485,17 +2562,105 @@ async def resend_aadhaar_otp(payload: AadhaarOtpResendIn, request: Request, user
 
 @app.get("/api/sms/status")
 async def sms_status(user: dict[str, Any] = Depends(require("owner", "manager", "accountant", "collector"))) -> dict[str, Any]:
-    norm_provider = normalized_sms_provider()
-    configured = bool(norm_provider == "android_gateway" and SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
+    configured = sms_gateway_ready()
     return {
         "configured": configured,
-        "provider": norm_provider,
+        "provider": normalized_sms_provider(),
         "raw_provider": SMS_PROVIDER,
         "otp_ttl_seconds": MOBILE_OTP_TTL_SECONDS,
         "mobile_verified_disbursal_required": REQUIRE_MOBILE_VERIFIED_DISBURSAL,
-        "demo_mode": not configured or norm_provider == "console",
+        "demo_mode": sms_demo_mode(),
+        "available": configured or sms_demo_mode(),
         "has_credentials": bool(SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD),
+        "problems": [] if configured else sms_setup_problems(),
     }
+
+
+class SmsTestIn(BaseModel):
+    mobile: str = Field(min_length=10, max_length=15)
+
+    @field_validator("mobile")
+    @classmethod
+    def valid_mobile(cls, value: str) -> str:
+        digits = "".join(ch for ch in value if ch.isdigit())[-10:]
+        if len(digits) != 10 or digits[0] not in "6789":
+            raise ValueError("Mobile must be a valid 10-digit Indian number")
+        return digits
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return "not set"
+    return value[:2] + "•" * max(len(value) - 4, 2) + value[-2:] if len(value) > 4 else "•" * len(value)
+
+
+@app.get("/api/sms/diagnostics")
+async def sms_diagnostics(user: dict[str, Any] = Depends(require("owner"))) -> dict[str, Any]:
+    """Step-by-step check of the SMS setup on THIS server, in plain language."""
+    checks: list[dict[str, Any]] = []
+    provider = normalized_sms_provider()
+    checks.append({"name": "SMS provider", "ok": provider == "android_gateway", "detail": f"SMS_PROVIDER = '{SMS_PROVIDER or 'not set'}'" + ("" if provider == "android_gateway" else " — set it to android_gateway")})
+    checks.append({"name": "Gateway username", "ok": bool(SMS_GATEWAY_USERNAME), "detail": f"SMS_GATEWAY_USERNAME = {_mask_secret(SMS_GATEWAY_USERNAME)}"})
+    checks.append({"name": "Gateway password", "ok": bool(SMS_GATEWAY_PASSWORD), "detail": "SMS_GATEWAY_PASSWORD is set" if SMS_GATEWAY_PASSWORD else "SMS_GATEWAY_PASSWORD is not set"})
+    kind = sms_gateway_url_kind()
+    checks.append({"name": "Gateway address", "ok": kind in {"cloud", "custom"}, "detail": f"{SMS_GATEWAY_URL or 'not set'}" + (" — a local network address cannot be reached from an online server" if kind == "local-network" else "")})
+    devices: list[dict[str, Any]] = []
+    if SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD and kind != "missing":
+        def probe() -> dict[str, Any]:
+            try:
+                status, reply = gateway_request("GET", "/devices" if kind == "cloud" else "/health", timeout=10)
+                return {"status": status, "reply": reply}
+            except (URLError, TimeoutError, OSError) as exc:
+                return {"status": 0, "reply": str(getattr(exc, "reason", exc))[:200]}
+        result = await asyncio.to_thread(probe)
+        if result["status"] == 0:
+            checks.append({"name": "Reach the gateway", "ok": False, "detail": f"This server could not connect: {result['reply']}"})
+        elif result["status"] >= 400:
+            checks.append({"name": "Gateway login", "ok": False, "detail": gateway_error_message(result["status"])})
+        else:
+            checks.append({"name": "Gateway login", "ok": True, "detail": "Username and password accepted"})
+            if kind == "cloud":
+                for device in result["reply"] if isinstance(result["reply"], list) else []:
+                    last_seen = device.get("lastSeen")
+                    minutes = None
+                    if last_seen:
+                        try: minutes = int((now() - parse_date(last_seen)).total_seconds() // 60)
+                        except Exception: minutes = None
+                    devices.append({"name": device.get("name") or device.get("id"), "last_seen": last_seen, "minutes_ago": minutes})
+                recent = [d for d in devices if d["minutes_ago"] is not None and d["minutes_ago"] <= 30]
+                checks.append({"name": "Gateway phone", "ok": bool(recent), "detail": (f"{len(devices)} phone(s) registered; last seen {min(d['minutes_ago'] for d in devices if d['minutes_ago'] is not None)} min ago" if any(d["minutes_ago"] is not None for d in devices) else "No phone is registered to this account — open the app, enable Cloud server and tap Online") if devices else "No phone is registered to this account — open the SMS Gateway app, enable Cloud server and tap Online"})
+    ready = all(check["ok"] for check in checks)
+    return {
+        "environment": APP_ENV, "ready": ready, "demo_mode": sms_demo_mode(), "checks": checks, "devices": devices,
+        "problems": sms_setup_problems(),
+        "summary": "Real SMS can be sent from this server." if ready else ("OTPs are shown on screen (demo mode) because real SMS is not set up on this server." if sms_demo_mode() else "OTP sending is blocked until the problems below are fixed."),
+    }
+
+
+@app.post("/api/sms/test")
+async def sms_test(payload: SmsTestIn, request: Request, user: dict[str, Any] = Depends(require("owner"))) -> dict[str, Any]:
+    if not sms_gateway_ready():
+        raise HTTPException(409, "Real SMS is not set up on this server: " + " ".join(sms_setup_problems()))
+    delivery = await send_sms(payload.mobile, f"Test message from {SMS_SENDER_NAME}: SMS OTP is working on the live server ({business_now().strftime('%d %b %Y %I:%M %p')}).")
+    await audit(user, "sms_test_sent", "mobile", mask_mobile(payload.mobile), {"gateway_message_id": delivery["gateway_message_id"]}, request)
+    return {"sent": True, "mobile": mask_mobile(payload.mobile), "message_id": delivery["gateway_message_id"], "state": delivery["gateway_state"]}
+
+
+@app.get("/api/sms/test/{message_id}")
+async def sms_test_status(message_id: str, user: dict[str, Any] = Depends(require("owner"))) -> dict[str, Any]:
+    if not sms_gateway_ready():
+        raise HTTPException(409, "Real SMS is not set up on this server.")
+    safe_id = "".join(ch for ch in message_id if ch.isalnum() or ch in "-_")[:80]
+    try:
+        status, reply = await asyncio.to_thread(gateway_request, "GET", f"/message/{safe_id}", None, 10)
+    except (URLError, TimeoutError, OSError) as exc:
+        raise HTTPException(424, "SMS gateway could not be reached from this server.") from exc
+    if status >= 400:
+        raise HTTPException(424, gateway_error_message(status))
+    reply = reply if isinstance(reply, dict) else {}
+    recipients = reply.get("recipients") or []
+    error = next((r.get("error") for r in recipients if isinstance(r, dict) and r.get("error")), None)
+    return {"message_id": safe_id, "state": reply.get("state", "Unknown"), "error": error}
 
 
 @app.post("/api/registration/mobile-otp/send")
@@ -2514,14 +2679,14 @@ async def send_registration_mobile_otp(payload: RegistrationOtpSendIn, request: 
     otp_id = f"MOTP-{seq:09d}"
     otp = f"{secrets.randbelow(1_000_000):06d}"
     minutes = MOBILE_OTP_TTL_SECONDS // 60
-    await send_sms(mobile, f"{otp} is your OTP to verify your mobile number with {SMS_SENDER_NAME}. Valid for {minutes} minutes. Do not share it with anyone.")
+    delivery = await send_sms(mobile, f"{otp} is your OTP to verify your mobile number with {SMS_SENDER_NAME}. Valid for {minutes} minutes. Do not share it with anyone.")
     for row in history:
         if row.get("status") == "Sent":
             await update_where("mobile_otps", {"otp_id": row["otp_id"], "status": "Sent"}, {"status": "Superseded", "completed_at": iso(stamp)})
-    norm_provider = normalized_sms_provider()
-    gateway_ready = bool(norm_provider == "android_gateway" and SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
+    norm_provider = "demo" if delivery["demo"] else normalized_sms_provider()
+    gateway_ready = not delivery["demo"]
     record = {
-        "otp_id": otp_id, "customer_id": None, "mobile": mobile,
+        "otp_id": otp_id, "customer_id": None, "mobile": mobile, "gateway_message_id": delivery["gateway_message_id"],
         "otp_hash": mobile_otp_hash(otp_id, otp), "provider": norm_provider,
         "status": "Sent", "created_at": iso(stamp),
         "expires_at": iso(stamp + timedelta(seconds=MOBILE_OTP_TTL_SECONDS)),
@@ -2538,7 +2703,7 @@ async def send_registration_mobile_otp(payload: RegistrationOtpSendIn, request: 
         "sms_provider": norm_provider,
         "sms_gateway_configured": gateway_ready,
     }
-    if not gateway_ready or norm_provider == "console" or APP_ENV != "production":
+    if delivery["demo"] or APP_ENV != "production":
         result["dev_otp"] = otp
     return result
 
@@ -2590,17 +2755,17 @@ async def send_mobile_otp(customer_id: str, request: Request, user: dict[str, An
     otp_id = f"MOTP-{seq:09d}"
     otp = f"{secrets.randbelow(1_000_000):06d}"
     minutes = MOBILE_OTP_TTL_SECONDS // 60
-    await send_sms(customer["mobile"], f"{otp} is your OTP to verify your mobile number with {SMS_SENDER_NAME}. Valid for {minutes} minutes. Do not share it with anyone.")
+    delivery = await send_sms(customer["mobile"], f"{otp} is your OTP to verify your mobile number with {SMS_SENDER_NAME}. Valid for {minutes} minutes. Do not share it with anyone.")
     for row in history:
         if row.get("status") == "Sent":
             await update_where("mobile_otps", {"otp_id": row["otp_id"], "status": "Sent"}, {"status": "Superseded", "completed_at": iso(stamp)})
-    norm_provider = normalized_sms_provider()
-    gateway_ready = bool(norm_provider == "android_gateway" and SMS_GATEWAY_URL and SMS_GATEWAY_USERNAME and SMS_GATEWAY_PASSWORD)
-    record = {"otp_id": otp_id, "customer_id": customer_id, "mobile": customer["mobile"], "otp_hash": mobile_otp_hash(otp_id, otp), "provider": norm_provider, "status": "Sent", "created_at": iso(stamp), "expires_at": iso(stamp + timedelta(seconds=MOBILE_OTP_TTL_SECONDS)), "attempt_count": 0, "max_attempts": MOBILE_OTP_MAX_ATTEMPTS, "requested_by": user["name"], "requested_by_id": user["id"]}
+    norm_provider = "demo" if delivery["demo"] else normalized_sms_provider()
+    gateway_ready = not delivery["demo"]
+    record = {"otp_id": otp_id, "customer_id": customer_id, "mobile": customer["mobile"], "gateway_message_id": delivery["gateway_message_id"], "otp_hash": mobile_otp_hash(otp_id, otp), "provider": norm_provider, "status": "Sent", "created_at": iso(stamp), "expires_at": iso(stamp + timedelta(seconds=MOBILE_OTP_TTL_SECONDS)), "attempt_count": 0, "max_attempts": MOBILE_OTP_MAX_ATTEMPTS, "requested_by": user["name"], "requested_by_id": user["id"]}
     await insert_one("mobile_otps", record)
     await audit(user, "mobile_otp_sent", "customer", customer_id, {"otp_id": otp_id, "mobile": mask_mobile(customer["mobile"]), "provider": norm_provider}, request)
     result = {"otp_id": otp_id, "status": "Sent", "masked_destination": mask_mobile(customer["mobile"]), "expires_at": record["expires_at"], "expires_in_seconds": MOBILE_OTP_TTL_SECONDS, "attempts_remaining": MOBILE_OTP_MAX_ATTEMPTS, "resend_available_at": iso(stamp + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS)), "sms_provider": norm_provider, "sms_gateway_configured": gateway_ready}
-    if not gateway_ready or norm_provider == "console" or APP_ENV != "production":
+    if delivery["demo"] or APP_ENV != "production":
         result["dev_otp"] = otp
     return result
 

@@ -111,6 +111,22 @@ SMS_GATEWAY_PASSWORD=<from the app>
 
 4. Restart the backend. Keep the phone charged and connected.
 
+### Live server (Render or any host)
+
+`server/.env` is **never uploaded** with your code (git ignores it because it holds secrets). That is why SMS can work on your PC but not on the live site. Add the same values in your hosting dashboard (Render: backend service → **Environment**):
+
+```text
+SMS_PROVIDER=android_gateway
+SMS_GATEWAY_URL=https://api.sms-gate.app/3rdparty/v1/message
+SMS_GATEWAY_USERNAME=<Cloud server username from the app>
+SMS_GATEWAY_PASSWORD=<Cloud server password from the app>
+```
+
+- Use the app's **Cloud server** credentials and the `api.sms-gate.app` URL. A **Local server** address such as `http://192.168.x.x:8080` only works from your own Wi-Fi; an online server can never reach it.
+- With Docker (`compose.production.yml`) put these in `server/.env` on the server; do not add them to the compose `environment:` list (that replaces them with blanks).
+- Then open **Settings → SMS OTP setup** on the live site. It checks every setting, logs in to the gateway, shows whether your phone is online, and has a **Send test SMS** button with delivery status.
+- On the live (production) server OTPs are never shown on screen. If SMS is not set up, sending an OTP shows what is missing instead. To deliberately allow on-screen demo OTPs there, set `SMS_ALLOW_DEMO_OTP=true`.
+
 For local testing without any phone, leave `SMS_PROVIDER=console` (the default outside production): the OTP is printed in the server log and shown on screen as "Demo mode OTP". Console mode is refused in production.
 
 Security: OTPs are random 6-digit codes stored only as HMAC hashes, expire after 5 minutes, lock after 3 wrong attempts, can be resent after 30 seconds, and are limited to 10 per customer per day. Every send/verify is written to the audit log. Set `REQUIRE_MOBILE_VERIFIED_DISBURSAL=true` to block loan disbursal until the mobile is verified.

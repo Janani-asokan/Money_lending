@@ -88,11 +88,9 @@ services:
       MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?Set MONGO_APP_PASSWORD in .env.production}
       BACKUP_DIR: /var/lib/money-lending/backups
       AUDIT_ARCHIVE_DIR: /var/lib/money-lending/audit-archive
-      SMS_PROVIDER: ${SMS_PROVIDER:-android_gateway}
-      SMS_GATEWAY_URL: ${SMS_GATEWAY_URL:-https://api.sms-gate.app/3rdparty/v1/message}
-      SMS_GATEWAY_USERNAME: ${SMS_GATEWAY_USERNAME:-}
-      SMS_GATEWAY_PASSWORD: ${SMS_GATEWAY_PASSWORD:-}
-      REQUIRE_MOBILE_VERIFIED_DISBURSAL: ${REQUIRE_MOBILE_VERIFIED_DISBURSAL:-false}
+      # SMS settings (SMS_PROVIDER, SMS_GATEWAY_URL, SMS_GATEWAY_USERNAME, SMS_GATEWAY_PASSWORD)
+      # come from server/.env via env_file above. Do not repeat them here: a value listed
+      # here replaces the one in server/.env, and an unset one becomes blank.
     depends_on:
       mongodb:
         condition: service_healthy

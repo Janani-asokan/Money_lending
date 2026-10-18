@@ -466,6 +466,14 @@ function CustomerPicker({ customers, value, onChange }) {
   );
 }
 
+// Explains, in plain words, whether OTPs go out as real SMS on this server and why not.
+function SmsModeNote({ status }) {
+  if (!status || status.configured) return null;
+  const reason = (status.problems || [])[0];
+  if (status.demo_mode) return <div className="locked-note sms-mode-note" title={reason || ''}><AlertTriangle size={15}/><span>Real SMS is not connected on this server, so the OTP is shown on screen (demo).</span></div>;
+  return <div className="error-banner sms-mode-note" role="alert" title={(status.problems || []).join(' ')}><strong>SMS OTP is not set up on this server.</strong> The owner can see why and fix it under Settings → SMS OTP setup.</div>;
+}
+
 function MobileOtpBox({ api, customer, notify, onVerified, onClose }) {
   const [smsStatus, setSmsStatus] = useState(null);
   const [session, setSession] = useState(null);
@@ -503,15 +511,15 @@ function MobileOtpBox({ api, customer, notify, onVerified, onClose }) {
   return <div className="servicing-box otp-box">
     <div className="otp-box-head">
       <h3>Mobile OTP verification</h3>
-      <span className="pill">{smsStatus?.configured ? 'Live SMS' : 'Demo OTP'}</span>
+      <span className={`pill ${smsStatus?.configured ? 'pill-ok' : smsStatus?.demo_mode ? 'pill-warn' : 'pill-bad'}`}>{smsStatus?.configured ? 'Live SMS' : smsStatus?.demo_mode ? 'Demo OTP' : 'SMS not set up'}</span>
       {onClose && <button type="button" className="icon-btn" aria-label="Close mobile OTP verification" onClick={onClose}><X size={16}/></button>}
     </div>
     <p>{customer.name} · {customer.customer_id} · {customer.mobile}</p>
-    {!smsStatus?.configured && <div className="locked-note"><AlertTriangle size={15}/> SMS Gateway not connected on this server · Demo mode active</div>}
+    <SmsModeNote status={smsStatus} />
     {session && !expired && session.attempts_remaining > 0 && <><label>6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" maxLength="6" pattern="[0-9]{6}" value={code} onChange={e=>setCode(e.target.value.replace(/\D/g,'').slice(0,6))} onKeyDown={e=>e.key==='Enter' && (e.preventDefault(), verify())}/></label>{session.dev_otp && <div className="locked-note dev-otp-badge">Demo mode OTP: <strong>{session.dev_otp}</strong></div>}</>}
     <div className="action-row">
       {session && !expired && session.attempts_remaining > 0 && <button type="button" className="primary small" disabled={busy || code.length !== 6} onClick={verify}>Verify OTP</button>}
-      <button type="button" className={session ? 'ghost small' : 'primary small'} disabled={busy || resendIn > 0} onClick={send}>{busy && !session ? 'Sending…' : session ? (resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend OTP') : (smsStatus?.configured ? 'Send OTP by SMS' : 'Send Demo OTP')}</button>
+      <button type="button" className={session ? 'ghost small' : 'primary small'} disabled={busy || resendIn > 0 || smsStatus?.available === false} onClick={send}>{busy && !session ? 'Sending…' : session ? (resendIn > 0 ? `Resend in ${resendIn}s` : 'Resend OTP') : (smsStatus?.demo_mode && !smsStatus?.configured ? 'Send Demo OTP' : 'Send OTP by SMS')}</button>
     </div>
     {session && <small>{expired ? 'OTP expired — send a new one.' : session.attempts_remaining > 0 ? `Sent to ${session.masked_destination} · ${session.attempts_remaining} attempts remaining · expires ${new Date(session.expires_at).toLocaleTimeString('en-IN')}` : 'OTP locked — send a new one.'}</small>}
     {error && <div className="error-banner" role="alert">{error}</div>}
@@ -769,10 +777,10 @@ function Customers({ api, user, notify }) {
                 <div className="servicing-box otp-box">
                   <div className="otp-box-head">
                     <span className="section-kicker" style={{margin:0}}>Mobile OTP verification</span>
-                    <span className="pill">{smsStatus?.configured ? 'Live SMS' : 'Demo OTP'}</span>
+                    <span className={`pill ${smsStatus?.configured ? 'pill-ok' : smsStatus?.demo_mode ? 'pill-warn' : 'pill-bad'}`}>{smsStatus?.configured ? 'Live SMS' : smsStatus?.demo_mode ? 'Demo OTP' : 'SMS not set up'}</span>
                   </div>
                   <p style={{margin:'4px 0 8px', fontSize:13}}>Send an OTP to verify <strong>+91 {form.mobile}</strong> before onboarding.</p>
-                  {!smsStatus?.configured && <div className="locked-note" style={{marginBottom:8, fontSize:12}}><AlertTriangle size={14}/> SMS Gateway not connected on this server · Demo OTP will be displayed</div>}
+                  <SmsModeNote status={smsStatus} />
                   {registrationOtp.session && (
                     <>
                       <label style={{marginTop: 6}}>
@@ -808,10 +816,10 @@ function Customers({ api, user, notify }) {
                     <button
                       type="button"
                       className={registrationOtp.session ? 'ghost small' : 'primary small'}
-                      disabled={registrationOtp.busy || registrationResendIn > 0}
+                      disabled={registrationOtp.busy || registrationResendIn > 0 || smsStatus?.available === false}
                       onClick={sendRegistrationOtp}
                     >
-                      {registrationOtp.busy && !registrationOtp.session ? 'Sending…' : registrationOtp.session ? (registrationResendIn > 0 ? `Resend in ${registrationResendIn}s` : 'Resend OTP') : (smsStatus?.configured ? 'Send OTP by SMS' : 'Send Demo OTP')}
+                      {registrationOtp.busy && !registrationOtp.session ? 'Sending…' : registrationOtp.session ? (registrationResendIn > 0 ? `Resend in ${registrationResendIn}s` : 'Resend OTP') : (smsStatus?.demo_mode && !smsStatus?.configured ? 'Send Demo OTP' : 'Send OTP by SMS')}
                     </button>
                   </div>
                   {registrationOtp.error && <div className="form-error" role="alert" style={{marginTop: 6}}>{registrationOtp.error}</div>}
@@ -1562,6 +1570,49 @@ function Audit({ api }) {
   return <section className="panel full"><div className="panel-head"><h2>Tamper-evident audit log</h2><span>{integrity?.current_epoch_valid ? `Current chain epoch verified: ${integrity.verified_entries} retained entries` : 'Current chain integrity failure'} · {integrity?.historical_integrity_incident ? 'Historical deletion incident preserved' : 'No historical incident'} · {integrity?.external_archive_configured ? 'External archive configured' : 'External WORM archive not configured'}</span></div><table><thead><tr><th>Sequence</th><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>IP</th></tr></thead><tbody>{rows.map(r => <tr key={r.id}><td>{r.chain_sequence || 'Legacy'}<small>{r.entry_hash?.slice(0,12)}</small></td><td>{date(r.timestamp)}</td><td>{r.user}<small>{r.role}</small></td><td>{String(r.action || '').replaceAll('_', ' ')}</td><td>{r.entity}: {r.entity_id}</td><td>{r.ip}</td></tr>)}</tbody></table></section>;
 }
 
+function SmsSetupPanel({ api, notify }) {
+  const [report, setReport] = useState(null);
+  const [checking, setChecking] = useState(false);
+  const [mobile, setMobile] = useState('');
+  const [test, setTest] = useState(null);
+  const [error, setError] = useState('');
+  async function check() {
+    setChecking(true); setError('');
+    try { setReport(await api('/api/sms/diagnostics')); } catch (err) { setError(err.message); } finally { setChecking(false); }
+  }
+  useEffect(() => { check(); }, []);
+  async function sendTest(e) {
+    e.preventDefault();
+    if (!/^[6-9]\d{9}$/.test(mobile)) return setError('Enter a valid 10-digit mobile number to receive the test SMS.');
+    setError(''); setTest({ state: 'Sending…' });
+    try {
+      const sent = await api('/api/sms/test', { method: 'POST', body: JSON.stringify({ mobile }) });
+      setTest({ ...sent, state: sent.state || 'Pending' });
+      notify(`Test SMS handed to the gateway for ${sent.mobile}.`);
+      for (let i = 0; i < 8 && sent.message_id; i++) {
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        const status = await api(`/api/sms/test/${encodeURIComponent(sent.message_id)}`);
+        setTest(current => ({ ...current, ...status }));
+        if (['Sent', 'Delivered', 'Failed'].includes(status.state)) break;
+      }
+    } catch (err) { setTest(null); setError(err.message); }
+  }
+  const stateHelp = { Pending: 'Waiting for the gateway phone to pick it up. If it stays Pending, the phone is offline or the app is asleep (turn off battery saver for the app).', Processed: 'The phone accepted it and is sending.', Sent: 'The phone sent the SMS.', Delivered: 'The SMS reached the customer phone.', Failed: 'The phone could not send it — check SIM balance / SMS pack and the app\'s SMS permission.' };
+  return <section className="panel full sms-setup">
+    <div className="panel-head"><div><span className="section-kicker">This server</span><h2>SMS OTP setup</h2></div><button type="button" className="ghost small" disabled={checking} onClick={check}>{checking ? 'Checking…' : 'Run check again'}</button></div>
+    {report && <div className={report.ready ? 'locked-note paid-state' : 'error-banner'}><strong>{report.summary}</strong>{report.environment ? ` (environment: ${report.environment})` : ''}</div>}
+    {report && <ul className="sms-checks">{report.checks.map(c => <li key={c.name} className={c.ok ? 'ok' : 'bad'}>{c.ok ? <CheckCircle2 size={16}/> : <AlertTriangle size={16}/>}<div><strong>{c.name}</strong><span>{c.detail}</span></div></li>)}</ul>}
+    {report && !report.ready && <details className="sms-fix" open><summary>How to fix on the live server</summary><ol>
+      <li>In the SMS Gateway app on your phone, turn on <b>Cloud server</b>, tap <b>Online</b>, and note the <b>Cloud</b> username and password (not the Local server ones).</li>
+      <li>In your hosting dashboard (for Render: the backend service → <b>Environment</b>), add <code>SMS_PROVIDER=android_gateway</code>, <code>SMS_GATEWAY_URL=https://api.sms-gate.app/3rdparty/v1/message</code>, <code>SMS_GATEWAY_USERNAME</code> and <code>SMS_GATEWAY_PASSWORD</code>. Your local <code>server/.env</code> is never uploaded, so these must be added there by hand.</li>
+      <li>Save, let the service restart, then press <b>Run check again</b> and send a test SMS below.</li>
+    </ol></details>}
+    <form className="sms-test" onSubmit={sendTest}><label>Send a test SMS to<input inputMode="numeric" maxLength="10" placeholder="10-digit mobile" value={mobile} onChange={e => setMobile(e.target.value.replace(/\D/g, '').slice(0, 10))} /></label><button className="primary small" disabled={!report?.ready || test?.state === 'Sending…'}>Send test SMS</button></form>
+    {test && <div className={test.state === 'Failed' ? 'error-banner' : 'locked-note'}>Test SMS status: <strong>{test.state}</strong>{test.error ? ` — ${test.error}` : ''}{stateHelp[test.state] ? <small> {stateHelp[test.state]}</small> : null}</div>}
+    {error && <div className="error-banner" role="alert">{error}</div>}
+  </section>;
+}
+
 function SettingsView({ api, notify }) {
   const [areas, setAreas] = useState([]);
   const [backups, setBackups] = useState([]);
@@ -1618,6 +1669,7 @@ function SettingsView({ api, notify }) {
         <button className="primary" onClick={backup}><DatabaseBackup size={18} /> Run manual backup</button>
         <table><thead><tr><th>ID</th><th>Timestamp</th><th>Status</th></tr></thead><tbody>{backups.map(b => <tr key={b.id}><td>{b.id}</td><td>{date(b.timestamp)}</td><td><CheckCircle2 size={16} /> {b.status}</td></tr>)}</tbody></table>
       </section>
+      <SmsSetupPanel api={api} notify={notify} />
       <form className="panel form-panel" onSubmit={changePassword}>
         <div className="panel-head"><h2>Change owner password</h2><span>Revokes every other active session</span></div>
         <label>Current password<input required type="password" autoComplete="current-password" value={passwords.current_password} onChange={e=>setPasswords({...passwords,current_password:e.target.value})}/></label>
