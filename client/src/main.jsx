@@ -82,10 +82,31 @@ const TEXT = {
   }
 };
 
+// The hosted backend sleeps after a quiet period and needs up to a minute to wake.
+// Ping it as soon as the app opens so it is usually awake by the time someone signs in.
+let serverWake = null;
+function wakeServer() {
+  if (!serverWake) {
+    serverWake = (async () => {
+      for (let attempt = 0; attempt < 12; attempt++) {
+        try {
+          const res = await fetch(`${API}/api/health`, { credentials: 'include', cache: 'no-store' });
+          if (res.ok) return true;
+        } catch { /* still starting */ }
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+      serverWake = null;
+      return false;
+    })();
+  }
+  return serverWake;
+}
+wakeServer();
+
 function useApi(setUser) {
   return async (path, options = {}) => {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 20000);
+    const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs || 30000);
     let res;
     try {
       res = await fetch(`${API}${path}`, {
@@ -99,7 +120,7 @@ function useApi(setUser) {
         }
       });
     } catch (error) {
-      if (error.name === 'AbortError') throw new Error('The server took too long to respond. Please try again.');
+      if (error.name === 'AbortError') throw new Error('The server took too long to respond. If it was idle it may still be waking up — wait a few seconds and try again.');
       throw new Error('Cannot reach the server. Check your connection and try again.');
     } finally {
       window.clearTimeout(timeout);
@@ -168,7 +189,7 @@ function App() {
   }, [sidebarCollapsed]);
 
   useEffect(() => {
-    api('/api/me').then(async userData => { await api('/api/auth/csrf'); setUser(userData); }).catch(() => setUser(null)).finally(() => setAuthChecked(true));
+    wakeServer().then(() => api('/api/me')).then(async userData => { await api('/api/auth/csrf'); setUser(userData); }).catch(() => setUser(null)).finally(() => setAuthChecked(true));
   }, []);
 
   useEffect(() => {
@@ -183,7 +204,7 @@ function App() {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
-  if (!authChecked) return <Skeleton />;
+  if (!authChecked) return <ConnectingScreen />;
   if (!user) {
     return <Login t={t} setUser={setUser} api={api} theme={theme} setTheme={setTheme} lang={lang} setLang={setLang} />;
   }
@@ -272,6 +293,12 @@ function App() {
   );
 }
 
+function ConnectingScreen() {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => { const timer = setTimeout(() => setSlow(true), 3000); return () => clearTimeout(timer); }, []);
+  return <div className="connecting-screen"><Skeleton />{slow && <p role="status">Connecting to the server… If it was idle, waking it up can take up to a minute.</p>}</div>;
+}
+
 function viewTitle(view, t) {
   return {
     dashboard: 'Today at a glance',
@@ -293,6 +320,8 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
   const [password, setPassword] = useState(IS_DEMO ? 'owner123' : '');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
+  const [signingIn, setSigningIn] = useState(false);
+  const [waking, setWaking] = useState(false);
   const accounts = [
     ['owner', 'owner123', 'Owner full access'],
     ['manager', 'manager123', 'Customers, loans, reports'],
@@ -301,12 +330,17 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
   ];
   async function submit(e) {
     e.preventDefault();
-    setError('');
+    if (signingIn) return;
+    setError(''); setSigningIn(true);
+    const slow = setTimeout(() => setWaking(true), 3000);
     try {
-      const data = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) });
+      if (!(await wakeServer())) throw new Error('The server is not responding right now. Please try again in a minute. (Owner: check the backend service logs on Render.)');
+      const data = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }), timeoutMs: 60000 });
       setUser(data.user);
     } catch (err) {
       setError(err.message);
+    } finally {
+      clearTimeout(slow); setWaking(false); setSigningIn(false);
     }
   }
   return (
@@ -338,8 +372,9 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
         </div>
         <label>Username<input required autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} /></label>
         <label>Password<div className="password-field"><input required autoComplete="current-password" type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} /><button type="button" className="password-toggle" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword(value => !value)}>{showPassword ? <EyeOff size={19}/> : <Eye size={19}/>}</button></div></label>
-        {error && <div className="error">{error}</div>}
-        <button className="primary">Enter secure workspace <ChevronRight size={18} /></button>
+        {waking && !error && <div className="locked-note" role="status">Waking up the server… After a quiet period the first sign-in can take up to a minute. Please keep this page open.</div>}
+        {error && <div className="error" role="alert">{error}</div>}
+        <button className="primary" disabled={signingIn}>{signingIn ? (waking ? 'Waking up server…' : 'Signing in…') : 'Enter secure workspace'} <ChevronRight size={18} /></button>
         {IS_DEMO && <div className="demo-accounts">
           {accounts.map(([u, p, desc]) => (
             <button type="button" key={u} onClick={() => { setUsername(u); setPassword(p); }}>
