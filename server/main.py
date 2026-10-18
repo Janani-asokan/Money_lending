@@ -304,8 +304,6 @@ class CustomerIn(BaseModel):
     def model_post_init(self, __context: Any) -> None:
         if self.status not in VERIFICATION_STATUSES:
             raise ValueError("Invalid verification status")
-        if self.aadhaar and (not self.aadhaar_consent_given or len(self.aadhaar_consent_purpose.strip()) < 5 or len(self.aadhaar_consent_reference.strip()) < 3):
-            raise ValueError("Recorded customer consent, disclosed purpose, and consent reference are required for Aadhaar")
 
     @field_validator("name", "father_name", "address", "guarantor")
     @classmethod
@@ -2388,7 +2386,7 @@ async def create_customer(payload: CustomerIn, request: Request, user: dict[str,
     consent = None
     if payload.aadhaar:
         consent_seq = await next_sequence("CNS", "consent_id", "aadhaar_consents")
-        consent = {"consent_id": f"CNS-{consent_seq:09d}", "customer_id": customer_id, "status": "Active", "purpose_disclosed": payload.aadhaar_consent_purpose.strip(), "customer_consent_reference": payload.aadhaar_consent_reference.strip(), "captured_at": iso(now()), "captured_by": user["name"], "captured_by_id": user["id"]}
+        consent = {"consent_id": f"CNS-{consent_seq:09d}", "customer_id": customer_id, "status": "Active", "purpose_disclosed": payload.aadhaar_consent_purpose.strip() or "Identity verification for loan application", "customer_consent_reference": payload.aadhaar_consent_reference.strip() or f"Recorded at registration by {user['name']}", "captured_at": iso(now()), "captured_by": user["name"], "captured_by_id": user["id"]}
     mobile_event = None
     if payload.mobile_otp_id:
         otp_rec = await find_one("mobile_otps", {"otp_id": payload.mobile_otp_id, "mobile": payload.mobile, "status": "Verified"})

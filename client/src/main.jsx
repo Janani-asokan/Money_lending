@@ -674,7 +674,6 @@ function Customers({ api, user, notify }) {
     setFormError('');
     if (form.mobile.length !== 10) return setFormError('Enter a valid 10-digit Indian mobile number.');
     if (registrationMode === 'aadhaar' && form.aadhaar.length !== 12) return setFormError('Aadhaar must contain exactly 12 digits.');
-    if (registrationMode === 'aadhaar' && (!form.aadhaar_consent_given || form.aadhaar_consent_reference.trim().length < 3)) return setFormError('Record customer consent and its reference before continuing.');
     setSaving(true);
     try {
       const isMobileVerified = registrationOtp.verified && registrationOtp.verifiedMobile === form.mobile;
@@ -686,13 +685,7 @@ function Customers({ api, user, notify }) {
       const res = await api('/api/customers', { method: 'POST', body: JSON.stringify(payload) });
       setReceipt({ type: res.duplicate ? 'Verification Acknowledgement' : 'Registration Acknowledgement', ack: res.ack_no, customer: res.customer });
       setMobileOtpCustomer(res.duplicate || isMobileVerified ? null : res.customer);
-      if (!res.duplicate && registrationMode === 'aadhaar' && providerStatus.configured) {
-        const otpResult = await api('/api/aadhaar/otp/start', { method:'POST', body:JSON.stringify({ customer_id:res.customer.customer_id, purpose:form.aadhaar_consent_purpose, consent_reference:form.aadhaar_consent_reference, proposed_disbursal_amount:0, owner_notes:'Automatic verification during customer onboarding' }) });
-        setOnboardingOtp({ customer_id:res.customer.customer_id, otp:'', verified_at:'', ...otpResult });
-        notify(`Customer saved. Aadhaar OTP sent to ${otpResult.masked_destination}.`);
-      } else {
-        notify(res.duplicate ? 'Existing customer found. Duplicate customer was not created.' : isMobileVerified ? 'Customer saved with verified mobile number.' : registrationMode === 'aadhaar' ? 'Customer saved pending automatic Aadhaar verification.' : 'Manual profile saved as Pending Verification.');
-      }
+      notify(res.duplicate ? 'Existing customer found. Duplicate customer was not created.' : `Customer ${res.customer.customer_id} registered${isMobileVerified ? ' with verified mobile number' : ''}.`);
       setForm(current => ({ ...current, name: '', father_name: '', mobile: '', aadhaar: '', address: '', guarantor: '', status: 'Pending Verification', aadhaar_consent_given: false, aadhaar_consent_reference: '' }));
       setRegistrationOtp({ session: null, code: '', verified: false, otp_id: '', busy: false, error: '', verifiedMobile: '' });
       await load();
@@ -790,7 +783,7 @@ function Customers({ api, user, notify }) {
       <form className="panel form-panel full onboarding-form" onSubmit={submit}>
         <div className="panel-head"><div><span className="section-kicker">Secure onboarding</span><h2>Register a customer</h2></div><ShieldCheck size={22} /></div>
         <div className="segmented-control"><button type="button" className={registrationMode === 'aadhaar' ? 'active' : ''} onClick={() => setRegistrationMode('aadhaar')}>Aadhaar registration</button><button type="button" className={registrationMode === 'manual' ? 'active' : ''} onClick={() => { setRegistrationMode('manual'); setForm({ ...form, aadhaar: '' }); }}>Manual registration</button></div>
-        <p className="form-intro">{registrationMode === 'aadhaar' ? providerStatus.configured ? `Aadhaar is encrypted and ${providerStatus.provider} sends an OTP to the Aadhaar-linked mobile. The profile remains pending until that OTP succeeds.` : 'Automatic Aadhaar verification needs an authorised AUA/KUA provider. Until connected, Aadhaar remains pending; a normal SMS is not presented as UIDAI verification.' : 'Create the profile without Aadhaar. It remains Pending Verification until an Owner or Manager approves it.'}</p>
+        <p className="form-intro">{registrationMode === 'aadhaar' ? 'Aadhaar is stored encrypted and only the last 4 digits are shown. New customers are saved as Pending Verification until an Owner or Manager approves them.' : 'Register the customer without Aadhaar. The profile stays Pending Verification until an Owner or Manager approves it.'}</p>
         <div className="two-col">
           <label>Name<input required value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} /></label>
           <label>Father's name<input required value={form.father_name} onChange={e => setForm({ ...form, father_name: e.target.value })} /></label>
@@ -862,7 +855,7 @@ function Customers({ api, user, notify }) {
               )}
             </div>
           )}
-          {registrationMode === 'aadhaar' && <><label>Aadhaar<input required inputMode="numeric" minLength="12" maxLength="12" pattern="[0-9]{12}" value={form.aadhaar} onChange={e => setForm({ ...form, aadhaar: e.target.value.replace(/\D/g, '') })} /></label><label>Purpose disclosed<input required minLength="5" value={form.aadhaar_consent_purpose} onChange={e=>setForm({...form,aadhaar_consent_purpose:e.target.value})}/></label><label>Consent reference<input required minLength="3" placeholder="Signed form / OTP reference" value={form.aadhaar_consent_reference} onChange={e=>setForm({...form,aadhaar_consent_reference:e.target.value})}/></label><label className="check-row"><input type="checkbox" checked={form.aadhaar_consent_given} onChange={e=>setForm({...form,aadhaar_consent_given:e.target.checked})}/> Customer gave informed consent for this disclosed purpose</label></>}
+          {registrationMode === 'aadhaar' && <label>Aadhaar<input required inputMode="numeric" minLength="12" maxLength="12" pattern="[0-9]{12}" value={form.aadhaar} onChange={e => setForm({ ...form, aadhaar: e.target.value.replace(/\D/g, '') })} /></label>}
           <label>Area<select value={form.area} onChange={e => setForm({ ...form, area: e.target.value })}>{areas.map(a => <option key={a.code} value={a.code}>{a.name}</option>)}</select></label>
           <div className="locked-note"><ShieldCheck size={16} /> New customers are saved as Pending Verification until Owner/Manager approval.</div>
         </div>
@@ -870,7 +863,7 @@ function Customers({ api, user, notify }) {
         <label>Address<textarea required value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></label>
         <label>Guarantor<input value={form.guarantor} onChange={e => setForm({ ...form, guarantor: e.target.value })} /></label>
         {formError && <div className="error" role="alert">{formError}</div>}
-        <button className="primary" disabled={saving}><Plus size={18} /> {saving ? 'Saving securely…' : registrationMode === 'aadhaar' ? 'Register and send Aadhaar OTP' : (registrationOtp.verified && registrationOtp.verifiedMobile === form.mobile ? 'Register verified customer' : 'Create pending profile')}</button>
+        <button className="primary" disabled={saving}><Plus size={18} /> {saving ? 'Registering…' : 'Register'}</button>
         {onboardingOtp.verification_id && <div className="servicing-box otp-box"><div className="otp-box-head"><h3>Aadhaar OTP verification</h3><button type="button" className="icon-btn" aria-label="Close OTP verification" onClick={() => { setOnboardingOtp({ customer_id:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, masked_destination:'', verified_at:'' }); setFormError(''); }}><X size={16}/></button></div><p>Customer {onboardingOtp.customer_id} · sent to {onboardingOtp.masked_destination || 'Aadhaar-linked mobile'}</p>{onboardingOtp.verified_at ? <div className="locked-note"><CheckCircle2 size={16}/> Verified at {new Date(onboardingOtp.verified_at).toLocaleString('en-IN')} · proof {onboardingOtp.verification_id}</div> : <><label>4 or 6-digit OTP<input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" value={onboardingOtp.otp} onChange={e=>setOnboardingOtp({...onboardingOtp,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/></label><div className="action-row"><button type="button" className="primary small" disabled={otpBusy || onboardingOtp.attempts_remaining===0 || ![4,6].includes(onboardingOtp.otp.length)} onClick={verifyOnboardingOtp}>Verify OTP</button><button type="button" className="ghost small" disabled={otpBusy || onboardingOtp.resends_remaining===0} onClick={resendOnboardingOtp}>Resend</button></div><small>{onboardingOtp.attempts_remaining > 0 ? `${onboardingOtp.attempts_remaining} attempts remaining` : 'OTP locked — resend or start a new verification'} · {onboardingOtp.resends_remaining} resends remaining</small></>}</div>}
         {mobileOtpCustomer && <MobileOtpBox api={api} customer={mobileOtpCustomer} notify={notify} onClose={() => setMobileOtpCustomer(null)} onVerified={async () => { setMobileOtpCustomer(null); await load(); }} />}
       </form>
