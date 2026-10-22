@@ -133,6 +133,12 @@ Security: OTPs are random 6-digit codes stored only as HMAC hashes, expire after
 
 API: `GET /api/sms/status`, `POST /api/customers/{customer_id}/mobile-otp/send`, `POST /api/customers/{customer_id}/mobile-otp/verify` (`{"otp_id": "...", "otp": "123456"}`).
 
+## Loan date, existing loans and borrower acknowledgement
+
+- **Loan date**: new loans can be dated today or up to 7 days back (`NEW_LOAN_BACKDATE_DAYS`).
+- **Existing loans**: tick *Existing loan*, pick the original date, enter the amount already repaid. No cash is moved today and no OTP is needed.
+- **Borrower acknowledgement**: before handing over money, press *Send acknowledgement OTP*. The customer receives an SMS with the loan amount, cash given, instalments and an OTP, and gives the OTP to staff only if they agree and received the cash. The acknowledgement number (ACK-…) is printed on the loan acknowledgement and KFS. Set `LOAN_ACK_OTP=off` to fall back to a typed reference if SMS is unavailable.
+
 ## Go-live gate
 
 - Deploy the frontend and API behind HTTPS, preferably on one trusted domain.

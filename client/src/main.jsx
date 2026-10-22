@@ -482,6 +482,11 @@ function CustomerPicker({ customers, value, onChange }) {
   const [mobile, setMobile] = useState('');
   const matches = useMemo(() => findCustomerMatches(customers, name, mobile), [customers, name, mobile]);
   const selected = customers.find(c => c.customer_id === value);
+  // Cleared from outside (e.g. after a loan is saved): empty the search boxes too.
+  useEffect(() => { if (!value) { setName(''); setMobile(''); } }, [value]);
+  // Typing a new search drops the previous selection so an old name/mobile can't match.
+  function typeName(text) { setName(text); if (selected) { setMobile(''); onChange(''); } }
+  function typeMobile(text) { setMobile(text); if (selected) { setName(''); onChange(''); } }
   function pick(customer) {
     setName(customer.name || '');
     setMobile(customer.mobile || '');
@@ -490,8 +495,8 @@ function CustomerPicker({ customers, value, onChange }) {
   return (
     <div className="customer-picker">
       <div className="two-col">
-        <label>Customer name<input value={name} onChange={e => setName(e.target.value)} placeholder="Type 3+ letters" /></label>
-        <label>Mobile<input inputMode="numeric" maxLength="10" value={mobile} onChange={e => setMobile(e.target.value.replace(/\D/g, ''))} placeholder="Type 4+ digits" /></label>
+        <label>Customer name<input value={name} onChange={e => typeName(e.target.value)} placeholder="Type 3+ letters" /></label>
+        <label>Mobile<input inputMode="numeric" maxLength="10" value={mobile} onChange={e => typeMobile(e.target.value.replace(/\D/g, ''))} placeholder="Type 4+ digits" /></label>
       </div>
       <CustomerSuggestions matches={matches} onSelect={pick} />
       {selected
@@ -1021,15 +1026,28 @@ function calculatedCashInHand(form) {
   return Math.round((principal - interest - (Number(form.processing_fee) || 0)) * 100) / 100;
 }
 
+function localDay(offsetDays = 0) {
+  const d = new Date(); d.setDate(d.getDate() + offsetDays);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 function loanRequestBody(form) {
-  return { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null, cash_handover: form.cash_handover === '' || form.cash_handover == null ? null : Number(form.cash_handover) };
+  return { ...form, principal: Number(form.principal), interest_rate: Number(form.interest_rate), repayment_period: Number(form.repayment_period), processing_fee: Number(form.processing_fee), tax_rate: Number(form.tax_rate), moratorium_periods: Number(form.moratorium_periods), preclosure_charge_rate: Number(form.preclosure_charge_rate), late_fee: Number(form.late_fee), first_due_date: form.first_due_date || null, cash_handover: form.cash_handover === '' || form.cash_handover == null ? null : Number(form.cash_handover), borrow_date: form.borrow_date || null, existing_loan: Boolean(form.existing_loan), already_repaid: form.existing_loan ? Number(form.already_repaid) || 0 : 0, repaid_up_to: form.existing_loan && Number(form.already_repaid) > 0 ? (form.repaid_up_to || null) : null, acknowledgement_no: form.existing_loan ? null : (form.acknowledgement_no || null) };
+}
+
+// Terms the customer confirms by OTP; any change after confirmation needs a fresh OTP.
+function ackTermsKey(form) {
+  return JSON.stringify([form.customer_id, form.principal, form.interest_rate, form.loan_type, form.repayment_period, form.processing_fee, form.cash_handover, form.borrow_date, form.existing_loan]);
 }
 
 function Loans({ api, notify, user }) {
   const [rows, setRows] = useState([]);
   const [boot, setBoot] = useState({ collectors: [], loan_types: [] });
   const [customers, setCustomers] = useState([]);
-  const [form, setForm] = useState({ customer_id: '', principal: 50000, interest_rate: 2.14, loan_type: 'Daily 100-Day', repayment_period: 100, collector_id: '', disbursement_mode: 'Cash', interest_method: 'Upfront Monthly Flat', processing_fee: 0, tax_rate: 0, first_due_date: '', moratorium_periods: 0, moratorium_interest_capitalized: true, preclosure_charge_rate: 0, late_fee: 0, kfs_acknowledgement_reference: '', identity_verification_id: null, cash_handover: '' });
+  const [form, setForm] = useState({ customer_id: '', principal: 50000, interest_rate: 2.14, loan_type: 'Daily 100-Day', repayment_period: 100, collector_id: '', disbursement_mode: 'Cash', interest_method: 'Upfront Monthly Flat', processing_fee: 0, tax_rate: 0, first_due_date: '', moratorium_periods: 0, moratorium_interest_capitalized: true, preclosure_charge_rate: 0, late_fee: 0, kfs_acknowledgement_reference: '', identity_verification_id: null, cash_handover: '', borrow_date: localDay(), existing_loan: false, already_repaid: '', repaid_up_to: localDay(), acknowledgement_no: '' });
+  const [ack, setAck] = useState({ session: null, code: '', ack_no: '', busy: false, error: '', key: '' });
+  const [ackClock, setAckClock] = useState(Date.now());
+  const [createdLoan, setCreatedLoan] = useState(null);
   const [providerStatus, setProviderStatus] = useState({ configured:false, verified_disbursal_required:false });
   const [identity, setIdentity] = useState({ purpose:'Identity verification before loan disbursal', consent_reference:'', owner_notes:'', verification_id:'', otp:'', attempts_remaining:3, resends_remaining:3, expires_at:'', resend_available_at:'' });
   const [identityError, setIdentityError] = useState('');
@@ -1056,6 +1074,37 @@ function Loans({ api, notify, user }) {
   const openLoanDetails = viewer.open;
   useEffect(() => { load(); }, []);
   useEffect(() => { setQuote(null); }, [form]);
+  const termsKey = ackTermsKey(form);
+  useEffect(() => {
+    if ((ack.ack_no || ack.session) && ack.key !== termsKey) {
+      setAck({ session: null, code: '', ack_no: '', busy: false, error: ack.ack_no ? 'Loan details changed after the customer confirmed. Send a new OTP so the customer confirms the final amount.' : '', key: '' });
+      setForm(f => ({ ...f, acknowledgement_no: '' }));
+    }
+  }, [termsKey]);
+  useEffect(() => { if (!ack.session) return; const timer = setInterval(() => setAckClock(Date.now()), 1000); return () => clearInterval(timer); }, [ack.session]);
+  const ackRequired = !form.existing_loan && boot.loan_ack_required !== false;
+  const selectedCustomer = customers.find(c => c.customer_id === form.customer_id);
+  async function sendAck() {
+    setAck(a => ({ ...a, busy: true, error: '' }));
+    try {
+      const result = await api('/api/loan-acknowledgements/send', { method: 'POST', body: JSON.stringify(loanRequestBody(form)) });
+      setAck({ session: result, code: '', ack_no: '', busy: false, error: '', key: termsKey });
+      notify(`Acknowledgement OTP sent to ${result.masked_destination}.${result.dev_otp ? ` (Demo OTP: ${result.dev_otp})` : ''}`);
+    } catch (err) { setAck(a => ({ ...a, busy: false, error: err.message })); }
+  }
+  async function verifyAck() {
+    if (ack.code.length !== 6) return setAck(a => ({ ...a, error: 'Enter the 6-digit OTP the customer received.' }));
+    setAck(a => ({ ...a, busy: true, error: '' }));
+    try {
+      const result = await api('/api/loan-acknowledgements/verify', { method: 'POST', body: JSON.stringify({ ack_request_id: ack.session.ack_request_id, otp: ack.code }) });
+      setAck(a => ({ ...a, session: null, code: '', ack_no: result.ack_no, busy: false, error: '', verified_at: result.verified_at, masked_destination: result.masked_destination }));
+      setForm(f => ({ ...f, acknowledgement_no: result.ack_no }));
+      notify(`Customer acknowledged the loan. Acknowledgement number ${result.ack_no}.`);
+    } catch (err) {
+      const match = err.message.match(/(\d+) attempts? remaining/i);
+      setAck(a => ({ ...a, busy: false, code: '', error: err.message, session: a.session && { ...a.session, attempts_remaining: match ? Number(match[1]) : /locked|expired|no longer/i.test(err.message) ? 0 : a.session.attempts_remaining } }));
+    }
+  }
   async function submit(e) {
     e.preventDefault();
     setLoanError('');
@@ -1063,9 +1112,11 @@ function Loans({ api, notify, user }) {
     setSavingLoan(true);
     try {
       const created = await api('/api/loans', { method: 'POST', body: JSON.stringify(body) });
-      notify(`Loan ${created.loan_id} created. Hand over ${money(created.net_disbursed)} in cash.`);
+      notify(form.existing_loan ? `Existing loan ${created.loan_id} added. Balance ${money(created.balance)}.` : `Loan ${created.loan_id} created. Hand over ${money(created.net_disbursed)} in cash.`);
+      setCreatedLoan({ ...created, customer: selectedCustomer });
       setQuote(null);
-      setForm(f => ({ ...f, customer_id: '', kfs_acknowledgement_reference: '', identity_verification_id: null, cash_handover: '' }));
+      setAck({ session: null, code: '', ack_no: '', busy: false, error: '', key: '' });
+      setForm(f => ({ ...f, customer_id: '', kfs_acknowledgement_reference: '', identity_verification_id: null, cash_handover: '', acknowledgement_no: '', borrow_date: localDay(), existing_loan: false, already_repaid: '', repaid_up_to: localDay() }));
       setIdentity(current => ({ ...current, consent_reference:'', owner_notes:'', verification_id:'', otp:'' }));
       await load();
     } catch (err) {
@@ -1108,6 +1159,17 @@ function Loans({ api, notify, user }) {
         <div className="panel-head"><h2>Loan disbursement</h2><span>Auto Loan ID, installment and completion date</span></div>
         <div className="locked-note">Automatic Aadhaar: {providerStatus.configured ? `${providerStatus.provider} connected` : 'Not configured — authorized AUA/KUA provider credentials required'}</div>
         <CustomerPicker customers={customers} value={form.customer_id} onChange={id => { if (id !== form.customer_id) { setIdentity(current => ({ ...current, verification_id:'', otp:'' })); setIdentityError(''); } setForm({ ...form, customer_id: id, identity_verification_id: id === form.customer_id ? form.identity_verification_id : null }); }} />
+        <div className="loan-date-box">
+          <div className="two-col">
+            <label>Loan date<input type="date" required max={localDay()} min={form.existing_loan ? localDay(-(boot.existing_loan_max_age_days || 1830)) : localDay(-(boot.new_loan_backdate_days ?? 7))} value={form.borrow_date} onChange={e => setForm({ ...form, borrow_date: e.target.value })} /><small>{form.existing_loan ? 'The date the money was originally given.' : `Today, or up to ${boot.new_loan_backdate_days ?? 7} days back for late entry.`}</small></label>
+            <label className="check-row existing-toggle"><input type="checkbox" checked={form.existing_loan} onChange={e => setForm({ ...form, existing_loan: e.target.checked, borrow_date: e.target.checked ? form.borrow_date : localDay(), acknowledgement_no: '' })} /> Existing loan (money given before using this app)</label>
+          </div>
+          {form.existing_loan && <><div className="two-col">
+            <label>Amount already repaid ₹<input type="number" min="0" step="0.01" inputMode="decimal" placeholder="0" value={form.already_repaid} onChange={e => setForm({ ...form, already_repaid: e.target.value })} /></label>
+            <label>Repaid up to (date)<input type="date" min={form.borrow_date} max={localDay()} value={form.repaid_up_to} disabled={!(Number(form.already_repaid) > 0)} onChange={e => setForm({ ...form, repaid_up_to: e.target.value })} /></label>
+          </div>
+          <div className="locked-note">Existing loans don't take money out of today's cash and don't need the customer's OTP. The schedule starts from the loan date, the amount already repaid is deducted, and you collect the rest as usual.</div></>}
+        </div>
         <div className="two-col">
           <label>Principal<input type="number" value={form.principal} onChange={e => setForm({ ...form, principal: e.target.value })} /></label>
           <label>Monthly interest %<input type="number" required min={boot.interest_rate?.min ?? 0.01} max={boot.interest_rate?.max ?? 10} step="0.01" value={form.interest_rate} onChange={e => setForm({ ...form, interest_rate: e.target.value })} /><small>{Number(form.interest_rate) || 0}% per month, deducted before handover (default 2.14%)</small></label>
@@ -1123,11 +1185,27 @@ function Loans({ api, notify, user }) {
         </div>; })()}
         <label>Collector<select value={form.collector_id} onChange={e => setForm({ ...form, collector_id: e.target.value })}>{boot.collectors.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label>
         <label>Disbursement account<select value={form.disbursement_mode} onChange={e => setForm({ ...form, disbursement_mode: e.target.value })}><option>Cash</option><option>UPI</option><option>Bank Transfer</option></select></label>
-        <label>KFS borrower acknowledgement reference<input required value={form.kfs_acknowledgement_reference} onChange={e=>setForm({...form,kfs_acknowledgement_reference:e.target.value})} placeholder="Signed/OTP acknowledgement ID"/></label>
+        {!form.existing_loan && <div className="servicing-box ack-box">
+          <div className="otp-box-head"><h3>Borrower acknowledgement</h3>{ack.ack_no && <span className="pill pill-ok">Acknowledged</span>}</div>
+          {ack.ack_no ? <div className="locked-note paid-state"><CheckCircle2 size={16}/><span>Customer confirmed this loan by OTP on {ack.masked_destination}. Acknowledgement number <strong>{ack.ack_no}</strong>.</span></div> : <>
+            <p className="form-intro">{ackRequired ? 'Before handing over the money, send the loan details and an OTP to the customer\'s registered mobile. The customer tells you the OTP only if they agree and have received the cash. This is the proof that they took the loan.' : 'SMS is not set up on this server, so OTP acknowledgement is optional. Enter the reference of the signed acknowledgement form, or send an OTP if available.'}</p>
+            {form.customer_id && <small>Customer mobile: <b>{selectedCustomer?.mobile || '—'}</b>{selectedCustomer && !selectedCustomer.mobile_verified ? ' (not yet verified — check it is the customer\'s own number)' : ''}</small>}
+            {ack.session && <>{ack.session.sms_preview && <div className="sms-preview"><small>SMS sent to the customer:</small><p>{ack.session.sms_preview}</p></div>}
+              <label>6-digit OTP from the customer<input inputMode="numeric" autoComplete="one-time-code" maxLength="6" value={ack.code} onChange={e => setAck({ ...ack, code: e.target.value.replace(/\D/g, '').slice(0, 6) })} onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), verifyAck())} /></label>
+              {ack.session.dev_otp && <div className="locked-note dev-otp-badge">Demo OTP: <strong>{ack.session.dev_otp}</strong></div>}</>}
+            <div className="action-row">
+              {ack.session && <button type="button" className="primary small" disabled={ack.busy || ack.code.length !== 6 || ack.session.attempts_remaining === 0} onClick={verifyAck}>{ack.busy ? 'Checking…' : 'Confirm OTP'}</button>}
+              <button type="button" className={ack.session ? 'ghost small' : 'primary small'} disabled={ack.busy || !form.customer_id || (ack.session && new Date(ack.session.resend_available_at) > ackClock)} onClick={sendAck}>{ack.busy && !ack.session ? 'Sending…' : ack.session ? (new Date(ack.session.resend_available_at) > ackClock ? `Resend in ${Math.ceil((new Date(ack.session.resend_available_at) - ackClock) / 1000)}s` : 'Resend OTP') : 'Send acknowledgement OTP'}</button>
+            </div>
+            {!ackRequired && <label>Signed acknowledgement reference<input value={form.kfs_acknowledgement_reference} onChange={e=>setForm({...form,kfs_acknowledgement_reference:e.target.value})} placeholder="e.g. signed form number"/></label>}
+          </>}
+          {ack.error && <div className="error-banner" role="alert">{ack.error}</div>}
+        </div>}
         {providerStatus.configured && <div className="servicing-box"><h3>Fresh Aadhaar OTP before money handover</h3><label>Purpose<input value={identity.purpose} onChange={e=>setIdentity({...identity,purpose:e.target.value})}/></label><label>Consent reference<input value={identity.consent_reference} onChange={e=>setIdentity({...identity,consent_reference:e.target.value})}/></label><label>Owner handover note<input value={identity.owner_notes} onChange={e=>setIdentity({...identity,owner_notes:e.target.value})}/></label><div className="action-row"><button type="button" className="ghost" disabled={identityBusy || !form.customer_id} onClick={startIdentityOtp}>{identityBusy ? 'Please wait…' : 'Send Aadhaar-linked OTP'}</button>{identity.verification_id && <><input inputMode="numeric" autoComplete="one-time-code" minLength="4" maxLength="6" pattern="(?:[0-9]{4}|[0-9]{6})" placeholder="4 or 6-digit OTP" value={identity.otp} onChange={e=>setIdentity({...identity,otp:e.target.value.replace(/\D/g,'').slice(0,6)})}/><button type="button" className="primary small" disabled={identityBusy || identity.attempts_remaining===0 || ![4,6].includes(identity.otp.length)} onClick={verifyIdentityOtp}>Verify OTP</button><button type="button" className="ghost small" disabled={identityBusy || identity.resends_remaining === 0} onClick={resendIdentityOtp}>Resend OTP</button></>}</div>{identity.verification_id && !form.identity_verification_id && <small>{identity.attempts_remaining > 0 ? `${identity.attempts_remaining} verification attempts remaining` : 'OTP locked — resend or start a new verification'} · {identity.resends_remaining} resends remaining. OTPs expire automatically.</small>}{identityError && <div className="error-banner" role="alert">{identityError}</div>}{form.identity_verification_id && <small>Verified reference: {form.identity_verification_id}</small>}</div>}
         <button type="button" className="ghost" disabled={!form.customer_id} onClick={preview}><FileText size={18}/> Preview APR, KFS and schedule</button>
         {loanError && <div className="error" role="alert">{loanError}</div>}
-        <button className="primary" disabled={savingLoan || !form.customer_id || !form.collector_id}><FileText size={18} /> {savingLoan ? 'Creating loan…' : 'Create loan directly'}</button>
+        <button className="primary" disabled={savingLoan || !form.customer_id || !form.collector_id || (ackRequired && !form.acknowledgement_no)} title={ackRequired && !form.acknowledgement_no ? 'The customer must confirm by OTP first' : ''}><FileText size={18} /> {savingLoan ? 'Saving…' : form.existing_loan ? 'Add existing loan' : 'Create loan'}</button>
+        {ackRequired && !form.acknowledgement_no && form.customer_id && <small className="muted-hint">Create loan unlocks after the customer confirms the OTP.</small>}
         {quote && <div className="locked-note">Monthly rate {quote.monthly_interest_rate}% · Interest deducted {money(quote.total_interest)} · Cash handed over {money(quote.net_disbursed_amount)}{quote.cash_rounding_adjustment ? ` (rounded from ${money(quote.calculated_net_disbursed)})` : ''} · Instalment {money(quote.periodic_instalment)} · Total repayment {money(quote.total_repayment)}</div>}
       </form>
       <section className="panel">
@@ -1146,8 +1224,32 @@ function Loans({ api, notify, user }) {
         </div>}
       </section>
       {viewer.element}
+      {createdLoan && <LoanAcknowledgementModal loan={createdLoan} onClose={() => setCreatedLoan(null)} />}
     </div>
   );
+}
+
+function LoanAcknowledgementModal({ loan, onClose }) {
+  const customer = loan.customer || {};
+  const plan = loan.loan_type === 'Daily 100-Day' ? 'daily' : loan.loan_type === 'Weekly' ? 'weekly' : 'monthly';
+  return <div className="modal-backdrop"><div className="modal">
+    <div className="panel-head"><h2>{loan.existing_loan ? 'Existing loan added' : 'Loan acknowledgement'}</h2><button className="icon-btn" aria-label="Close" onClick={onClose}><X size={18}/></button></div>
+    <div className="receipt-paper">
+      <h2>Sri Sakthi Thirumurugan Finance</h2>
+      <p>{loan.existing_loan ? 'Existing loan record' : 'Loan disbursement acknowledgement'}</p>
+      <dl>
+        <dt>Loan</dt><dd>{loan.loan_id} · {day(loan.borrow_date)}</dd>
+        <dt>Customer</dt><dd>{customer.customer_id || loan.customer_id}{customer.name ? ` · ${customer.name}` : ''}</dd>
+        <dt>Loan amount</dt><dd>{money(loan.principal)}</dd>
+        {!loan.existing_loan && <><dt>Cash handed over</dt><dd>{money(loan.net_disbursed)}</dd></>}
+        <dt>Repayment</dt><dd>{money(loan.installment)} × {loan.repayment_period} {plan} instalments</dd>
+        {loan.existing_loan && <><dt>Already repaid</dt><dd>{money(loan.paid)}</dd><dt>Balance</dt><dd>{money(loan.balance)}</dd></>}
+        {loan.acknowledgement_no ? <><dt>Acknowledgement no.</dt><dd><strong>{loan.acknowledgement_no}</strong></dd><dt>Confirmed by</dt><dd>OTP on {loan.acknowledgement_mobile} · {date(loan.acknowledgement_verified_at)}</dd></> : <><dt>Reference</dt><dd>{loan.kfs_acknowledgement_reference}</dd></>}
+      </dl>
+      <div className="signature-row"><span>Customer signature</span><span>Company seal</span></div>
+    </div>
+    <button className="primary" onClick={() => window.print()}><Printer size={18} /> Print / save PDF</button>
+  </div></div>;
 }
 
 // One loan viewer shared by every screen: opens the full loan record in place, with
@@ -1259,7 +1361,8 @@ function LoanDetailsModal({ data, api, notify, onRefresh, onInstantClose, user, 
     <div className="panel-head"><div><span className="section-kicker">Complete loan record</span><h2>{loan.loan_id} · {customer.name}</h2><span>{loan.frequency} plan · {customer.area_name || customer.area}</span></div><button className="icon-btn" onClick={onClose}><X size={18}/></button></div>
     <div className="finance-strip"><Metric icon={BadgeIndianRupee} label="Sanctioned" value={money(loan.principal)}/><Metric icon={WalletCards} label="Cash handed over" value={money(loan.net_disbursed ?? loan.principal)}/><Metric icon={CheckCircle2} label="Paid" value={money(loan.paid)}/><Metric icon={CalendarClock} label="Outstanding" value={money(loan.balance)}/></div>
     <div className="loan-detail-grid"><div><span>{loan.contract_version >= 2 ? 'Monthly interest' : 'Interest rate (legacy)'}</span><strong>{loan.interest_rate}%</strong></div><div><span>{loan.contract_version >= 2 ? 'Interest deducted' : 'Interest (collected in instalments)'}</span><strong>{money(loan.contract_version >= 2 ? loan.contract_interest : Math.max(Number(loan.total_payable || 0) - Number(loan.principal || 0), 0))}</strong>{loan.cash_rounding_adjustment ? <small>Cash rounded by hand from {money(loan.calculated_net_disbursed)}</small> : null}</div><div><span>Processing fee + tax</span><strong>{money(Number(loan.processing_fee||0)+Number(loan.tax_amount||0))}</strong></div><div><span>APR</span><strong>{loan.apr ? `${loan.apr}%` : 'Legacy contract'}</strong></div><div><span>Installment</span><strong>{money(loan.installment)}</strong></div><div><span>Remaining installments</span><strong>{loan.remaining_installments}</strong></div><div><span>Borrow date</span><strong>{day(loan.borrow_date)}</strong></div><div><span>Maturity</span><strong>{day(loan.maturity_date || loan.expected_completion)}</strong></div><div><span>Status</span><Status value={loan.status}/></div></div>
-    <div className="locked-note"><ShieldCheck size={16}/>{verification ? `OTP verified ${date(verification.verified_at || verification.attempted_at)} · Proof ${verification.verification_id}` : 'No Aadhaar OTP proof was linked to this loan disbursement.'}</div>
+    <div className={loan.acknowledgement_no ? 'locked-note paid-state' : 'locked-note'}><ShieldCheck size={16}/>{loan.acknowledgement_no ? `Borrower acknowledged by OTP on ${loan.acknowledgement_mobile} · ${date(loan.acknowledgement_verified_at)} · Acknowledgement no. ${loan.acknowledgement_no}` : loan.existing_loan ? `Existing loan (given before this app) · entered ${day(loan.entered_at)}` : `Borrower acknowledgement: ${loan.kfs_acknowledgement_reference || 'not recorded'}`}</div>
+    {verification && <div className="locked-note"><ShieldCheck size={16}/>{`Aadhaar OTP verified ${date(verification.verified_at || verification.attempted_at)} · Proof ${verification.verification_id}`}</div>}
     {closure?.closed && <div className="locked-note"><CheckCircle2 size={16}/>Closed {closure.closed_at ? date(closure.closed_at) : ''}{closure.final_receipt ? ` · Final receipt ${closure.final_receipt}` : ''}</div>}
     {(canCollect || canClose) && <div className="servicing-box loan-quick-actions"><h3>Quick actions</h3>
       <div className="action-row">

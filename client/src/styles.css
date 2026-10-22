@@ -1112,3 +1112,9 @@ td .action-row button { white-space: nowrap; }
 .pill-ok { color: #14713a; background: #e4f6e9; } .pill-warn { color: #9a6109; background: #fff3d7; } .pill-bad { color: #b4232d; background: #fde8e8; }
 .connecting-screen { min-height: 100vh; display: grid; place-content: center; gap: 16px; padding: 24px; text-align: center; color: var(--muted); }
 .login-card .primary:disabled { opacity: .75; cursor: progress; }
+.loan-date-box { display: grid; gap: 10px; padding: 12px; border: 1px dashed var(--line); border-radius: 12px; }
+.loan-date-box .existing-toggle { align-self: center; }
+.ack-box .form-intro { margin: 4px 0 8px; }
+.sms-preview { border-left: 3px solid var(--accent); padding: 8px 12px; background: color-mix(in srgb, var(--accent) 6%, transparent); border-radius: 6px; margin: 8px 0; }
+.sms-preview p { margin: 4px 0 0; font-size: 13px; }
+.muted-hint { color: var(--muted); }

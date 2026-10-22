@@ -115,3 +115,19 @@ Files: server/main.py, client/src/main.jsx, client/src/styles.css
   rows); loan tables hid Status / View off-screen; loan-record quick-action buttons were nearly invisible; "Paid today"
   badges were unreadable; KPI tiles overflowed; messages never disappeared; consent checkbox and OTP boxes were cramped;
   loan tables become cards on phones; reports show Rs amounts and readable dates.
+
+
+## Round 4 - Loan date, existing loans and OTP borrower acknowledgement - DONE
+- **Loan date**: every loan has a date. New loans: today or up to NEW_LOAN_BACKDATE_DAYS (7) back; never in the future.
+- **Existing loans** (money given before the app): tick "Existing loan", choose the original date (up to 5 years back),
+  enter the amount already repaid and the date up to which it was repaid. The schedule starts from the original date,
+  the balance is principal minus repaid, and the loan auto-closes if fully repaid. Accounting: no cash moves today -
+  the outstanding amount is posted Dr Loan Principal Receivable / Cr Opening Balance Equity; the earlier repayments are
+  stored as one "Opening balance" record (receipt OPN-<loan>) that is excluded from today's/monthly collection totals
+  and cannot be reversed as a receipt.
+- **Borrower acknowledgement by OTP**: "Send acknowledgement OTP" SMSes the loan's key facts (loan amount, cash given,
+  instalment x count, first due date) and an OTP to the customer's registered mobile. Entering the OTP creates an
+  acknowledgement number ACK-YYYYMMDD-NNNNNN tied to those exact terms; changing any amount needs a new OTP. The number
+  is stored on the loan, shown on the loan record, the KFS and a printable acknowledgement, and can be used only once.
+  LOAN_ACK_OTP=auto (default: required whenever SMS works), required, or off (typed reference instead).
+- Customer picker: typing a new name/mobile clears the previous selection (prevented loans going to the wrong customer).

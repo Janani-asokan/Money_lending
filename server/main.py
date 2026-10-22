@@ -158,6 +158,17 @@ MAX_MONTHLY_INTEREST_RATE = float(os.getenv("MAX_MONTHLY_INTEREST_RATE", "10"))
 # Cash handed to the borrower may be rounded by hand (e.g. 46,433.33 -> 46,430) by up to
 # this many rupees either way. The difference is absorbed in the upfront interest.
 MAX_CASH_ROUNDING_RUPEES = float(os.getenv("MAX_CASH_ROUNDING_RUPEES", "100"))
+# Loan date rules. A new loan may be entered a few days late; anything older must be
+# entered as an "existing loan" (money given before this system, no cash moved today).
+NEW_LOAN_BACKDATE_DAYS = int(os.getenv("NEW_LOAN_BACKDATE_DAYS", "7"))
+EXISTING_LOAN_MAX_AGE_DAYS = int(os.getenv("EXISTING_LOAN_MAX_AGE_DAYS", "1830"))
+# Borrower acknowledgement by OTP to the customer's registered mobile:
+#   auto     - required whenever this server can send OTPs (default)
+#   required - always required (loan creation is blocked if SMS is not working)
+#   off      - not used; a typed acknowledgement reference is accepted instead
+LOAN_ACK_OTP = os.getenv("LOAN_ACK_OTP", "auto").strip().lower()
+LOAN_ACK_OTP_TTL_SECONDS = 600
+LOAN_ACK_VALID_MINUTES = 60
 
 
 # Late charge rule - the ONLY place that decides who is a "defaulter".
@@ -368,9 +379,13 @@ class LoanIn(BaseModel):
     moratorium_interest_capitalized: bool = True
     preclosure_charge_rate: float = Field(default=0, ge=0, le=10)
     late_fee: float = Field(default=0, ge=0, le=1000000)
-    kfs_acknowledgement_reference: str = Field(min_length=3, max_length=120)
+    kfs_acknowledgement_reference: str = Field(default="", max_length=120)
     identity_verification_id: Optional[str] = Field(default=None, max_length=120)
     cash_handover: Optional[float] = Field(default=None, gt=0, le=100000000)
+    acknowledgement_no: Optional[str] = Field(default=None, max_length=40)
+    existing_loan: bool = False
+    already_repaid: float = Field(default=0, ge=0, le=100000000)
+    repaid_up_to: Optional[str] = None
 
     @field_validator("disbursement_mode")
     @classmethod
@@ -385,6 +400,11 @@ class LoanIn(BaseModel):
         if value not in {"Upfront Monthly Flat", "Reducing", "Flat"}:
             raise ValueError("Invalid interest method")
         return value
+
+
+class LoanAckVerifyIn(BaseModel):
+    ack_request_id: str = Field(min_length=3, max_length=40)
+    otp: str = Field(pattern=r"^\d{6}$")
 
 
 class PartPaymentIn(BaseModel):
@@ -986,6 +1006,8 @@ async def ensure_indexes() -> None:
         return
     await db.customers.create_index("customer_id", name="idx_customers_customer_id", unique=True)
     await db.mobile_otps.create_index("otp_id", name="idx_mobile_otps_otp_id", unique=True)
+    await db.loan_acknowledgements.create_index("ack_request_id", name="idx_loan_ack_request_id", unique=True)
+    await db.loan_acknowledgements.create_index("ack_no", name="idx_loan_ack_no", unique=True, partialFilterExpression={"ack_no": {"$type": "string"}})
     await db.mobile_otps.create_index([("customer_id", 1), ("created_at", -1)], name="idx_mobile_otps_customer_created")
     indexes = await db.customers.index_information()
     mobile_index = indexes.get("idx_customers_mobile")
@@ -2127,6 +2149,9 @@ async def bootstrap(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
         "loan_types": LOAN_TYPES,
         "interest_rate": {"default": DEFAULT_MONTHLY_INTEREST_RATE, "min": MIN_MONTHLY_INTEREST_RATE, "max": MAX_MONTHLY_INTEREST_RATE},
         "max_cash_rounding": MAX_CASH_ROUNDING_RUPEES,
+        "loan_ack_required": loan_ack_required(),
+        "new_loan_backdate_days": NEW_LOAN_BACKDATE_DAYS,
+        "existing_loan_max_age_days": EXISTING_LOAN_MAX_AGE_DAYS,
     }
 
 
@@ -2142,7 +2167,7 @@ async def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, A
 async def build_dashboard() -> dict[str, Any]:
     customers = await customer_views([x for x in await find_many("customers") if not x.get("profile_deleted_at")])
     loans = await enrich_loans(await find_many("loans"))
-    payments = [p for p in await find_many("payments") if p.get("status", "Posted") != "Reversed"]
+    payments = [p for p in await find_many("payments") if p.get("status", "Posted") != "Reversed" and p.get("payment_type") != "Opening balance"]
     today_key = business_now().date().isoformat()
     month_key = business_now().strftime("%Y-%m")
     today_payments = [p for p in payments if business_date_key(p["timestamp"]) == today_key]
@@ -2934,12 +2959,9 @@ async def loans(q: str = "", status_filter: str = "", loan_type: str = "", area:
 
 @app.post("/api/loan-quotes")
 async def loan_quote(payload: LoanIn, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
-    validate_new_loan_rate(payload.interest_rate)
-    # Tax on fee, moratorium and pre-closure charge were removed from disbursement: new loans always carry 0 for them.
-    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat", "tax_rate": 0, "moratorium_periods": 0, "preclosure_charge_rate": 0})
-    borrow = parse_date(payload.borrow_date)
-    schedule = apply_cash_rounding(build_amortization(payload, borrow), payload.cash_handover)
+    payload, borrow, _, schedule = prepare_loan_terms(payload)
     return {
+        "acknowledgement_required": not payload.existing_loan and loan_ack_required(),
         "calculated_net_disbursed": schedule["calculated_net_disbursed"], "cash_rounding_adjustment": schedule["cash_rounding_adjustment"],
         "quote_id": f"QTE-{uuid.uuid4().hex[:12].upper()}", "generated_at": iso(now()),
         "sanctioned_amount": payload.principal, "net_disbursed_amount": schedule["net_disbursed"],
@@ -3067,6 +3089,7 @@ async def loan_kfs(loan_id: str, user: dict[str, Any] = Depends(require("owner",
         "late_fee": loan["late_fee"], "preclosure_charge_rate": loan["preclosure_charge_rate"],
         "first_due_date": loan["first_due_date"], "maturity_date": loan["maturity_date"],
         "schedule_version": loan["schedule_version"], "schedule": schedule["rows"],
+        "borrower_acknowledgement": {"reference": loan.get("kfs_acknowledgement_reference"), "acknowledgement_no": loan.get("acknowledgement_no"), "method": loan.get("acknowledgement_method"), "mobile": loan.get("acknowledgement_mobile"), "verified_at": loan.get("acknowledgement_verified_at")},
         "generated_at": iso(now()), "disclaimer": "Charges not disclosed in this KFS must not be collected from the borrower.",
     }
 
@@ -3272,6 +3295,151 @@ async def write_off_loan(loan_id: str, payload: WriteOffIn, request: Request, us
     return {"writeoff": record, "loan": await enrich_loan(await find_one("loans", {"loan_id": loan_id}))}
 
 
+def parse_business_date(value: Optional[str], field: str) -> datetime:
+    """A calendar date chosen in the UI (YYYY-MM-DD) is taken as 10:00 India time that day."""
+    if not value:
+        return now()
+    text = str(value).strip()
+    try:
+        if len(text) == 10:
+            day = datetime.strptime(text, "%Y-%m-%d").date()
+            return datetime(day.year, day.month, day.day, 10, 0, tzinfo=BUSINESS_TIMEZONE).astimezone(timezone.utc)
+        return parse_date(text)
+    except ValueError as exc:
+        raise HTTPException(422, f"{field} is not a valid date") from exc
+
+
+def validate_loan_dates(payload: LoanIn) -> tuple[datetime, Optional[datetime]]:
+    today = business_now().date()
+    borrow = parse_business_date(payload.borrow_date, "Loan date")
+    borrow_day = borrow.astimezone(BUSINESS_TIMEZONE).date()
+    if borrow_day > today:
+        raise HTTPException(422, "Loan date cannot be in the future")
+    age = (today - borrow_day).days
+    if payload.existing_loan:
+        if age > EXISTING_LOAN_MAX_AGE_DAYS:
+            raise HTTPException(422, f"Existing loans can be entered up to {EXISTING_LOAN_MAX_AGE_DAYS // 365} years back")
+    elif age > NEW_LOAN_BACKDATE_DAYS:
+        raise HTTPException(422, f"A new loan can be dated at most {NEW_LOAN_BACKDATE_DAYS} days back. For an older loan, tick 'Existing loan'.")
+    repaid_on = None
+    if payload.existing_loan and payload.already_repaid > 0:
+        repaid_on = parse_business_date(payload.repaid_up_to, "Repaid up to date") if payload.repaid_up_to else min(now(), borrow + timedelta(days=1))
+        repaid_day = repaid_on.astimezone(BUSINESS_TIMEZONE).date()
+        if repaid_day < borrow_day or repaid_day > today:
+            raise HTTPException(422, "'Repaid up to' must be between the loan date and today")
+    return borrow, repaid_on
+
+
+def prepare_loan_terms(payload: LoanIn) -> tuple[LoanIn, datetime, Optional[datetime], dict[str, Any]]:
+    if payload.loan_type not in LOAN_TYPES:
+        raise HTTPException(422, "Invalid loan type")
+    validate_new_loan_rate(payload.interest_rate)
+    # Tax on fee, moratorium and pre-closure charge were removed from disbursement: new loans always carry 0 for them.
+    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat", "tax_rate": 0, "moratorium_periods": 0, "preclosure_charge_rate": 0})
+    borrow, repaid_on = validate_loan_dates(payload)
+    schedule = apply_cash_rounding(build_amortization(payload, borrow), payload.cash_handover)
+    if payload.existing_loan and payload.already_repaid > schedule["total_repayment"]:
+        raise HTTPException(422, f"Amount already repaid cannot be more than the total repayment of ₹{schedule['total_repayment']:,.2f}")
+    return payload, borrow, repaid_on, schedule
+
+
+def loan_ack_required() -> bool:
+    if LOAN_ACK_OTP == "off":
+        return False
+    if LOAN_ACK_OTP == "required":
+        return True
+    return sms_configured()
+
+
+def ack_terms(payload: LoanIn, schedule: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "principal": round(float(payload.principal), 2), "cash_handover": round(float(schedule["net_disbursed"]), 2),
+        "interest_rate": round(float(payload.interest_rate), 4), "loan_type": payload.loan_type,
+        "repayment_period": int(payload.repayment_period), "instalment": round(float(schedule["emi"]), 2),
+        "processing_fee": round(float(schedule["processing_fee"]), 2),
+    }
+
+
+def rupees(value: float) -> str:
+    return f"Rs {value:,.2f}".replace(".00", "")
+
+
+@app.post("/api/loan-acknowledgements/send")
+async def send_loan_acknowledgement(payload: LoanIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+    """SMS the loan's key facts and an OTP to the customer's registered mobile."""
+    if payload.existing_loan:
+        raise HTTPException(409, "Existing loans entered from old records do not need an OTP acknowledgement")
+    customer = await find_one("customers", {"customer_id": payload.customer_id})
+    if not customer or customer.get("profile_deleted_at"):
+        raise HTTPException(404, "Customer not found")
+    payload, borrow, _, schedule = prepare_loan_terms(payload)
+    stamp = now()
+    recent = [row for row in await find_many("loan_acknowledgements", {"customer_id": payload.customer_id}) if parse_date(row["created_at"]) > stamp - timedelta(days=1)]
+    if len(recent) >= MOBILE_OTP_DAILY_LIMIT:
+        raise HTTPException(429, "Daily OTP limit reached for this customer. Try again tomorrow.")
+    latest = max(recent, key=lambda row: row["created_at"], default=None)
+    if latest and latest.get("status") == "Sent" and parse_date(latest["created_at"]) + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS) > stamp:
+        wait = int((parse_date(latest["created_at"]) + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS) - stamp).total_seconds()) + 1
+        raise HTTPException(429, f"Please wait {wait} seconds before resending the OTP.")
+    terms = ack_terms(payload, schedule)
+    frequency = {"Daily 100-Day": "daily", "Weekly": "weekly"}.get(payload.loan_type, "monthly")
+    request_id = f"LAK-{await next_sequence('LAK', 'ack_request_id', 'loan_acknowledgements'):09d}"
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    first_due = parse_date(schedule["first_due_date"]).astimezone(BUSINESS_TIMEZONE).strftime("%d-%m-%Y")
+    text = (f"{SMS_SENDER_NAME}: You are taking a loan of {rupees(terms['principal'])}. Cash given to you {rupees(terms['cash_handover'])}. "
+            f"Repay {rupees(terms['instalment'])} x {terms['repayment_period']} {frequency} from {first_due}. "
+            f"OTP {otp}. Share this OTP with our staff ONLY if you agree and have received the cash.")
+    delivery = await send_sms(customer["mobile"], text)
+    for row in recent:
+        if row.get("status") == "Sent":
+            await update_where("loan_acknowledgements", {"ack_request_id": row["ack_request_id"], "status": "Sent"}, {"status": "Superseded"})
+    record = {
+        "ack_request_id": request_id, "customer_id": payload.customer_id, "mobile": customer["mobile"], "terms": terms,
+        "sms_text_sha256": hashlib.sha256(text.replace(otp, "******").encode()).hexdigest(), "sms_text_masked": text.replace(otp, "******"),
+        "otp_hash": mobile_otp_hash(request_id, otp), "status": "Sent", "created_at": iso(stamp),
+        "expires_at": iso(stamp + timedelta(seconds=LOAN_ACK_OTP_TTL_SECONDS)), "attempt_count": 0, "max_attempts": MOBILE_OTP_MAX_ATTEMPTS,
+        "provider": "demo" if delivery["demo"] else normalized_sms_provider(), "gateway_message_id": delivery["gateway_message_id"],
+        "requested_by": user["name"], "requested_by_id": user["id"],
+    }
+    await insert_one("loan_acknowledgements", record)
+    await audit(user, "loan_acknowledgement_otp_sent", "customer", payload.customer_id, {"ack_request_id": request_id, "mobile": mask_mobile(customer["mobile"]), "terms": terms}, request)
+    result = {"ack_request_id": request_id, "status": "Sent", "masked_destination": mask_mobile(customer["mobile"]), "terms": terms,
+              "expires_at": record["expires_at"], "resend_available_at": iso(stamp + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS)),
+              "attempts_remaining": MOBILE_OTP_MAX_ATTEMPTS, "sms_preview": record["sms_text_masked"]}
+    if delivery["demo"]:
+        result["dev_otp"] = otp
+    return result
+
+
+@app.post("/api/loan-acknowledgements/verify")
+async def verify_loan_acknowledgement(payload: LoanAckVerifyIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
+    record = await find_one("loan_acknowledgements", {"ack_request_id": payload.ack_request_id})
+    if not record:
+        raise HTTPException(404, "Acknowledgement request not found")
+    if record["status"] != "Sent":
+        raise HTTPException(409, "This OTP is no longer valid. Send a new OTP.")
+    stamp = now()
+    if parse_date(record["expires_at"]) <= stamp:
+        await update_where("loan_acknowledgements", {"ack_request_id": payload.ack_request_id, "status": "Sent"}, {"status": "Expired"})
+        raise HTTPException(410, "OTP expired. Send a new OTP.")
+    if not hmac.compare_digest(record["otp_hash"], mobile_otp_hash(payload.ack_request_id, payload.otp)):
+        attempts = int(record.get("attempt_count", 0))
+        remaining = max(int(record.get("max_attempts", MOBILE_OTP_MAX_ATTEMPTS)) - attempts - 1, 0)
+        if not await update_where("loan_acknowledgements", {"ack_request_id": payload.ack_request_id, "status": "Sent", "attempt_count": attempts}, {"status": "Locked" if remaining == 0 else "Sent", "last_failed_at": iso(stamp)}, {"attempt_count": 1}):
+            raise HTTPException(409, "OTP state changed. Please try again.")
+        await audit(user, "loan_acknowledgement_otp_failed", "customer", record["customer_id"], {"ack_request_id": payload.ack_request_id, "attempts_remaining": remaining}, request)
+        if remaining == 0:
+            raise HTTPException(423, "OTP locked after 3 incorrect attempts. Send a new OTP.")
+        raise HTTPException(422, f"Incorrect OTP. {remaining} attempt{'s' if remaining != 1 else ''} remaining.")
+    ack_no = f"ACK-{business_now().strftime('%Y%m%d')}-{await next_sequence('ACKN', 'ack_seq', 'loan_acknowledgements'):06d}"
+    fields = {"status": "Verified", "ack_no": ack_no, "ack_seq": f"ACKN{ack_no[-6:]}", "verified_at": iso(stamp), "verified_by": user["name"],
+              "valid_until": iso(stamp + timedelta(minutes=LOAN_ACK_VALID_MINUTES)), "ip": request.client.host if request.client else "local"}
+    if not await update_where("loan_acknowledgements", {"ack_request_id": payload.ack_request_id, "status": "Sent"}, fields):
+        raise HTTPException(409, "This OTP was already used")
+    await audit(user, "loan_acknowledgement_verified", "customer", record["customer_id"], {"ack_no": ack_no, "ack_request_id": payload.ack_request_id, "mobile": mask_mobile(record["mobile"]), "terms": record["terms"]}, request)
+    return {"ack_no": ack_no, "verified_at": fields["verified_at"], "valid_until": fields["valid_until"], "masked_destination": mask_mobile(record["mobile"]), "terms": record["terms"]}
+
+
 @app.post("/api/loans")
 async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = Depends(require("owner", "manager"))) -> dict[str, Any]:
     customer = await find_one("customers", {"customer_id": payload.customer_id})
@@ -3286,16 +3454,31 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
         raise HTTPException(409, "Verify the customer's mobile number by SMS OTP before disbursal")
     if identity_verification and float(identity_verification.get("disbursed_amount", 0)) != float(payload.principal):
         raise HTTPException(409, "Verified handover amount does not match the loan principal")
-    if payload.loan_type not in LOAN_TYPES:
-        raise HTTPException(422, "Invalid loan type")
-    validate_new_loan_rate(payload.interest_rate)
-    # Tax on fee, moratorium and pre-closure charge were removed from disbursement: new loans always carry 0 for them.
-    payload = payload.model_copy(update={"interest_method": "Upfront Monthly Flat", "tax_rate": 0, "moratorium_periods": 0, "preclosure_charge_rate": 0})
+    payload, borrow, repaid_on, schedule = prepare_loan_terms(payload)
     collector = await find_one("users", {"id": payload.collector_id})
     if not collector or collector.get("role") not in {"collector", "owner", "manager"} or not collector.get("active", True):
         raise HTTPException(422, "Select an active collector or the self-managed owner")
-    borrow = parse_date(payload.borrow_date)
-    schedule = apply_cash_rounding(build_amortization(payload, borrow), payload.cash_handover)
+    acknowledgement = None
+    if payload.existing_loan:
+        reference = payload.kfs_acknowledgement_reference.strip() or f"Existing loan entered on {business_now().strftime('%d-%m-%Y')}"
+        payload = payload.model_copy(update={"kfs_acknowledgement_reference": reference, "acknowledgement_no": None})
+    else:
+        ack_no = (payload.acknowledgement_no or "").strip().upper()
+        if ack_no:
+            acknowledgement = await find_one("loan_acknowledgements", {"ack_no": ack_no})
+            if not acknowledgement or acknowledgement.get("status") != "Verified":
+                raise HTTPException(409, "Acknowledgement number not found or already used. Send a new OTP to the customer.")
+            if acknowledgement["customer_id"] != payload.customer_id:
+                raise HTTPException(409, "This acknowledgement belongs to a different customer")
+            if parse_date(acknowledgement["valid_until"]) < now():
+                raise HTTPException(409, f"Acknowledgement expired ({LOAN_ACK_VALID_MINUTES} minutes after OTP). Send a new OTP.")
+            if acknowledgement["terms"] != ack_terms(payload, schedule):
+                raise HTTPException(409, "Loan details changed after the customer acknowledged them. Send a new OTP so the customer confirms the final amount.")
+            payload = payload.model_copy(update={"kfs_acknowledgement_reference": ack_no, "acknowledgement_no": ack_no})
+        elif loan_ack_required():
+            raise HTTPException(409, "The customer must acknowledge this loan by OTP on their registered mobile before it can be created.")
+        elif len(payload.kfs_acknowledgement_reference.strip()) < 3:
+            raise HTTPException(422, "Enter the borrower acknowledgement reference (at least 3 characters).")
     loan_seq = await next_sequence("LN", "loan_id", "loans")
     loan_id = f"LN-{loan_seq:09d}"
     loan = {
@@ -3324,7 +3507,12 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
         "total_repayment": schedule["total_repayment"], "schedule_version": 1,
         "kfs_acknowledgement_reference": payload.kfs_acknowledgement_reference,
         "identity_verification_id": payload.identity_verification_id,
+        "existing_loan": payload.existing_loan, "entered_at": iso(now()),
     }
+    if acknowledgement:
+        loan.update({"acknowledgement_no": acknowledgement["ack_no"], "acknowledgement_method": "OTP to registered mobile",
+                     "acknowledgement_mobile": mask_mobile(acknowledgement["mobile"]), "acknowledgement_verified_at": acknowledgement["verified_at"],
+                     "acknowledgement_sms": acknowledgement.get("sms_text_masked")})
     journal_seq = await next_sequence("JRN", "entry_id", "journal_entries")
     entry_id = f"JRN-{journal_seq:09d}"
     principal_paise = to_paise(payload.principal)
@@ -3332,28 +3520,56 @@ async def create_loan(payload: LoanIn, request: Request, user: dict[str, Any] = 
     fee_paise = to_paise(schedule["processing_fee"])
     tax_paise = to_paise(schedule["tax"])
     net_paise = to_paise(schedule["net_disbursed"])
-    lines = [
-        ledger_line("1100", debit_paise=principal_paise, loan_id=loan_id, customer_id=payload.customer_id),
-        ledger_line(cash_account(payload.disbursement_mode), credit_paise=net_paise, loan_id=loan_id),
-    ]
-    if fee_paise:
-        lines.append(ledger_line("4200", credit_paise=fee_paise, loan_id=loan_id))
-    if tax_paise:
-        lines.append(ledger_line("2100", credit_paise=tax_paise, loan_id=loan_id))
-    if interest_paise:
-        lines.append(ledger_line("4000", credit_paise=interest_paise, loan_id=loan_id))
-    if USE_MEMORY:
-        await insert_one("loans", loan)
-        await insert_one("loan_schedules", {"loan_id": loan_id, "version": 1, "reason": "Origination", "created_at": iso(now()), **schedule})
-        await post_journal(entry_id, "loan_disbursement", loan_id, f"Loan disbursed to {payload.customer_id}", lines, user)
-        await audit(user, "loan_disbursement", "loan", loan_id, loan, request)
+    opening_payment = None
+    if payload.existing_loan:
+        # Money was lent before this system: no cash moves today. The amount still owed is
+        # recorded as an opening receivable against Opening Balance Equity.
+        repaid_paise = to_paise(payload.already_repaid)
+        outstanding_paise = principal_paise - repaid_paise
+        lines = [ledger_line("1100", debit_paise=outstanding_paise, loan_id=loan_id, customer_id=payload.customer_id), ledger_line("3000", credit_paise=outstanding_paise, loan_id=loan_id)] if outstanding_paise > 0 else []
+        if repaid_paise > 0:
+            opening_payment = {
+                "receipt_no": f"OPN-{loan_id}", "loan_id": loan_id, "customer_id": payload.customer_id, "amount": from_paise(repaid_paise),
+                "mode": "Opening balance", "collector_id": payload.collector_id, "timestamp": iso(repaid_on), "status": "Posted",
+                "payment_type": "Opening balance", "journal_entry_id": None, "payment_reference": "Repaid before this system",
+                "allocation": {"penalty_paise": 0, "interest_paise": 0, "principal_paise": repaid_paise},
+                "balance_before": from_paise(principal_paise), "balance_after": from_paise(outstanding_paise), "recorded_at": iso(now()), "recorded_by": user["name"],
+            }
+        description = f"Existing loan brought in for {payload.customer_id}"
     else:
-        async with await mongo_client.start_session() as session:
-            async with session.start_transaction():
-                await db.loans.insert_one(deepcopy(loan), session=session)
-                await db.loan_schedules.insert_one(deepcopy({"loan_id": loan_id, "version": 1, "reason": "Origination", "created_at": iso(now()), **schedule}), session=session)
-                await post_journal(entry_id, "loan_disbursement", loan_id, f"Loan disbursed to {payload.customer_id}", lines, user, session=session)
-                await audit(user, "loan_disbursement", "loan", loan_id, loan, request, session=session)
+        lines = [
+            ledger_line("1100", debit_paise=principal_paise, loan_id=loan_id, customer_id=payload.customer_id),
+            ledger_line(cash_account(payload.disbursement_mode), credit_paise=net_paise, loan_id=loan_id),
+        ]
+        if fee_paise:
+            lines.append(ledger_line("4200", credit_paise=fee_paise, loan_id=loan_id))
+        if tax_paise:
+            lines.append(ledger_line("2100", credit_paise=tax_paise, loan_id=loan_id))
+        if interest_paise:
+            lines.append(ledger_line("4000", credit_paise=interest_paise, loan_id=loan_id))
+        description = f"Loan disbursed to {payload.customer_id}"
+    if not lines:
+        loan["journal_entry_id"] = None
+    async with atomic() as session:
+        if acknowledgement:
+            used = {"status": "Used", "loan_id": loan_id, "used_at": iso(now())}
+            if USE_MEMORY:
+                if not await update_where("loan_acknowledgements", {"ack_no": acknowledgement["ack_no"], "status": "Verified"}, used):
+                    raise HTTPException(409, "This acknowledgement was already used for another loan")
+            else:
+                result = await db.loan_acknowledgements.update_one({"ack_no": acknowledgement["ack_no"], "status": "Verified"}, {"$set": used}, session=session)
+                if result.modified_count != 1:
+                    raise HTTPException(409, "This acknowledgement was already used for another loan")
+        await tx_insert("loans", loan, session)
+        await tx_insert("loan_schedules", {"loan_id": loan_id, "version": 1, "reason": "Existing loan" if payload.existing_loan else "Origination", "created_at": iso(now()), **schedule}, session)
+        if opening_payment:
+            await tx_insert("payments", opening_payment, session)
+        if lines:
+            await post_journal(entry_id, "existing_loan" if payload.existing_loan else "loan_disbursement", loan_id, description, lines, user, session=session)
+        await audit(user, "existing_loan_entered" if payload.existing_loan else "loan_disbursement", "loan", loan_id, loan, request, session=session)
+    if payload.existing_loan:
+        await sync_loan_status(loan_id)
+        loan = await find_one("loans", {"loan_id": loan_id}) or loan
     return await enrich_loan(loan)
 
 
@@ -3835,6 +4051,8 @@ async def request_payment_reversal(receipt_no: str, payload: ReversalIn, request
         raise HTTPException(404, "Payment not found")
     if payment.get("status") == "Reversed":
         raise HTTPException(409, "Payment is already reversed")
+    if payment.get("payment_type") == "Opening balance":
+        raise HTTPException(409, "This is the amount repaid before the system was used. If it is wrong, ask the owner to correct the existing loan entry.")
     original = await find_one("journal_entries", {"entry_id": payment.get("journal_entry_id")})
     if not original:
         raise HTTPException(409, "This legacy receipt has no journal entry; migrate it before reversal")
@@ -3970,6 +4188,8 @@ async def reports(payload: ReportRequest, request: Request, user: dict[str, Any]
 async def build_report(payload: ReportRequest) -> dict[str, Any]:
     loans_rows = await enrich_loans(await find_many("loans"))
     payment_rows = await find_many("payments")
+    # Money actually collected through the system (not reversed, not amounts repaid before the system).
+    collected_rows = [p for p in payment_rows if p.get("status", "Posted") != "Reversed" and p.get("payment_type") != "Opening balance"]
     customers_rows = await customer_views(await find_many("customers"))
     if payload.report_type == "customer-ledger":
         cid = payload.customer_id or (customers_rows[0]["customer_id"] if customers_rows else "")
@@ -3981,11 +4201,11 @@ async def build_report(payload: ReportRequest) -> dict[str, Any]:
         }
     if payload.report_type == "daily-collection":
         day = payload.date or now().date().isoformat()
-        daily = [p for p in payment_rows if p["timestamp"][:10] == day]
+        daily = [p for p in collected_rows if business_date_key(p["timestamp"]) == day]
         return {"title": "Daily Collection Report", "date": day, "payments": daily, "total": round(sum(p["amount"] for p in daily), 2)}
     if payload.report_type == "monthly-cashflow":
         month = payload.month or now().strftime("%Y-%m")
-        monthly = [p for p in payment_rows if p["timestamp"][:7] == month]
+        monthly = [p for p in collected_rows if business_month_key(p["timestamp"]) == month]
         disbursed = [l for l in loans_rows if l["borrow_date"][:7] == month]
         return {
             "title": "Monthly Cash Flow",
@@ -4018,9 +4238,9 @@ async def build_report(payload: ReportRequest) -> dict[str, Any]:
         paid = sum(l["paid"] for l in loans_rows)
         return {"title": "Recovery Rate Report", "recovery_rate_percent": round(paid / due * 100, 2) if due else 0, "collected": round(paid, 2), "portfolio_value": round(due, 2)}
     if payload.report_type == "business-growth":
-        return {"title": "Business Growth Report", "cashflow": build_cashflow(payment_rows), "customers": len(customers_rows), "loans": len(loans_rows), "total_disbursed": round(sum(l["principal"] for l in loans_rows), 2)}
+        return {"title": "Business Growth Report", "cashflow": build_cashflow(collected_rows), "customers": len(customers_rows), "loans": len(loans_rows), "total_disbursed": round(sum(l["principal"] for l in loans_rows), 2)}
     year = str(payload.year or now().year)
-    year_payments = [p for p in payment_rows if p["timestamp"][:4] == year]
+    year_payments = [p for p in collected_rows if p["timestamp"][:4] == year]
     year_loans = [l for l in loans_rows if l["borrow_date"][:4] == year]
     return {
         "title": "Annual Report",
