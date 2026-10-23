@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import * as Icons from 'lucide-react';
 import './styles.css';
+import { downloadPdfDocument, kfsDocument, loanHistoryDocument, reportDocument } from './pdf.js';
 
 const API = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 const IS_DEMO = import.meta.env.VITE_SHOW_DEMO_ACCOUNTS === 'true';
@@ -1216,7 +1217,7 @@ function Loans({ api, notify, user }) {
           <label>Loan<select value={service.loan_id} onChange={e=>{setService({...service,loan_id:e.target.value});setAdjustmentPreview(null);setAdjustmentConfirmed(false)}}>{rows.map(l=><option key={l.loan_id}>{l.loan_id}</option>)}</select></label>
           <div className="two-col"><label>Amount<input type="number" min="0.01" step="0.01" value={service.amount} onChange={e=>{setService({...service,amount:e.target.value});setAdjustmentPreview(null);setAdjustmentConfirmed(false)}}/></label><label>Effective date<input type="date" value={service.effective_date} onChange={e=>setService({...service,effective_date:e.target.value})}/></label></div>
           <label>Borrower consent / approval reference<input value={service.consent} onChange={e=>setService({...service,consent:e.target.value})}/></label>
-          <div className="action-row"><button className="primary small" onClick={()=>openLoanDetails(service.loan_id)}>View complete loan history</button><button className="ghost" onClick={()=>api(`/api/loans/${service.loan_id}/kfs`).then(kfs=>downloadPdf(kfs,`KFS-${service.loan_id}`))}>Download KFS</button></div>
+          <div className="action-row"><button className="primary small" onClick={()=>openLoanDetails(service.loan_id)}>View complete loan history</button><button className="ghost" onClick={()=>api(`/api/loans/${service.loan_id}/kfs`).then(kfs=>downloadPdfDocument(kfsDocument(kfs),`KFS-${service.loan_id}`)).catch(err=>notify(err.message || 'KFS could not be downloaded.'))}>Download KFS</button></div>
           <details><summary>Part-payment</summary><label>Part-payment strategy<select value={service.strategy} onChange={e=>setService({...service,strategy:e.target.value})}><option>Reduce EMI</option><option>Reduce Tenor</option></select></label><div className="action-row"><button className="ghost" onClick={()=>servicePost(`/api/loans/${service.loan_id}/part-payment`,{amount:Number(service.amount),strategy:service.strategy,effective_date:service.effective_date,borrower_consent_reference:service.consent,mode:'Bank Transfer'},'Part-payment posted and schedule version updated.')}>Post part-payment</button></div></details>
           <details><summary>Interest adjustment</summary><div className="two-col"><label>Mandatory reason<input value={service.reason} onChange={e=>setService({...service,reason:e.target.value})} placeholder="Why is this rebate approved?"/></label><label>Manager approval reference<input value={service.approval} onChange={e=>setService({...service,approval:e.target.value})} placeholder="Approval ID or signed note"/></label></div><label>Borrower acknowledgement reference<input value={service.consent} onChange={e=>setService({...service,consent:e.target.value})} placeholder="Signed consent or OTP acknowledgement"/></label><button className="ghost" onClick={previewInterestRebate}>Preview adjustment</button>{adjustmentPreview && <div className={adjustmentPreview.permitted?'locked-note':'error-banner'}><span>Before <strong>{money(adjustmentPreview.balance_before)}</strong></span><span>Rebate <strong>{money(adjustmentPreview.proposed_rebate)}</strong></span><span>After <strong>{money(adjustmentPreview.balance_after)}</strong></span><span>Maximum allowed <strong>{money(adjustmentPreview.maximum_rebate)}</strong></span><small>{adjustmentPreview.message}</small></div>}{adjustmentPreview?.permitted && <label className="check-row"><input type="checkbox" checked={adjustmentConfirmed} onChange={e=>setAdjustmentConfirmed(e.target.checked)}/> I verified the before-and-after balance, borrower acknowledgement, and approval.</label>}<button className="primary small" disabled={!adjustmentPreview?.permitted||!adjustmentConfirmed} onClick={postInterestRebate}>Post immutable interest rebate</button></details>
           {user.role==='owner' && rows.find(row=>row.loan_id===service.loan_id)?.contract_version<2 && <details><summary>Legacy loan migration</summary><div className="error-banner">Migration changes the contractual calculation. Preview it and obtain borrower acknowledgement before continuing.</div><button className="ghost" onClick={previewLegacyMigration}>Preview controlled migration</button>{migration && <><div className="finance-strip"><Metric icon={WalletCards} label="Old outstanding" value={money(migration.quote.old_outstanding)}/><Metric icon={BadgeIndianRupee} label="New outstanding" value={money(migration.quote.new_outstanding)}/><Metric icon={CheckCircle2} label="Payments preserved" value={money(migration.quote.paid_preserved)}/></div><label>Migration reason<input value={migration.reason} onChange={e=>setMigration({...migration,reason:e.target.value})}/></label><label>Owner approval reference<input value={migration.approval_reference} onChange={e=>setMigration({...migration,approval_reference:e.target.value})}/></label><label>Borrower acknowledgement reference<input value={migration.borrower_acknowledgement_reference} onChange={e=>setMigration({...migration,borrower_acknowledgement_reference:e.target.value})}/></label><label>Type loan ID {service.loan_id}<input value={migration.confirmation} onChange={e=>setMigration({...migration,confirmation:e.target.value})}/></label>{migration.error&&<div className="error-banner">{migration.error}</div>}<button className="primary danger" disabled={migration.busy||migration.reason.trim().length<5||migration.approval_reference.trim().length<3||migration.borrower_acknowledgement_reference.trim().length<3||migration.confirmation.trim().toUpperCase()!==service.loan_id.toUpperCase()} onClick={migrateLegacyLoan}>{migration.busy?'Migrating…':'Confirm controlled migration'}</button></>}</details>}
@@ -1385,7 +1386,7 @@ function LoanDetailsModal({ data, api, notify, onRefresh, onInstantClose, user, 
     <details open><summary>Repayment and receipt history ({payments.length})</summary><div className="table-scroll"><table><thead><tr><th>Receipt</th><th>Date</th><th>Type</th><th>Amount</th><th>Principal</th><th>Interest</th><th>Balance after</th><th>Mode / reference</th><th>Status</th></tr></thead><tbody>{payments.map(p=><tr key={p.receipt_no || p.id}><td>{p.receipt_no}</td><td>{date(p.timestamp)}</td><td>{p.payment_type || 'Collection'}</td><td>{money(p.amount)}</td><td>{money(p.principal_paid||0)}</td><td>{money(p.interest_paid||0)}</td><td>{money(p.balance_after)}</td><td>{p.mode}<small>{p.payment_reference || '—'}</small></td><td><Status value={p.status || 'Posted'}/></td></tr>)}</tbody></table></div></details>
     <details><summary>Installment schedule · version {data.schedule_version} ({schedule.length})</summary><div className="table-scroll"><table><thead><tr><th>No.</th><th>Due date</th><th>Payment</th><th>Opening</th><th>Closing</th></tr></thead><tbody>{schedule.map(row=><tr key={row.number}><td>{row.number}</td><td>{date(row.due_date)}</td><td>{money(row.payment)}</td><td>{money(row.opening)}</td><td>{money(row.closing)}</td></tr>)}</tbody></table></div></details>
     <details open><summary>Adjustments and servicing history ({servicingHistory.length})</summary><div className="timeline">{servicingHistory.map((item,index)=><div className="timeline-item" key={item.adjustment_id || item.event_id || item.part_payment_id || item.writeoff_id || index}><FileText size={16}/><div><strong>{item.kind || item.event_type || item.strategy || 'Loan servicing event'}{item.amount ? ` · ${money(item.amount)}` : ''}</strong><span>{item.reason || item.description || 'Recorded servicing event'}</span><small>{date(item.timestamp || item.created_at)}{item.approval_reference ? ` · Approval ${item.approval_reference}` : ''}{item.borrower_acknowledgement_reference ? ` · Borrower acknowledgement ${item.borrower_acknowledgement_reference}` : ''}</small>{item.adjustment_id && item.status!=='Reversed' && item.journal_entry_id && <button className="ghost small" onClick={()=>requestAdjustmentReversal(item)}>Request adjustment reversal</button>}{item.status==='Reversed' && <Status value="Reversed"/>}</div></div>)}</div></details>
-    <div className="action-row"><button className="ghost" onClick={()=>downloadPdf(data,`Loan-history-${loan.loan_id}`)}><Printer size={17}/>Download complete history</button><button className="primary small" onClick={onClose}>Close</button></div>
+    <div className="action-row"><button className="ghost" onClick={()=>downloadPdfDocument(loanHistoryDocument(data),`Loan-history-${loan.loan_id}`).catch(err=>notify(err.message || 'PDF could not be created.'))}><Printer size={17}/>Download complete history</button>{loan.contract_version >= 2 && <button className="ghost" onClick={()=>api(`/api/loans/${encodeURIComponent(loan.loan_id)}/kfs`).then(kfs=>downloadPdfDocument(kfsDocument(kfs),`KFS-${loan.loan_id}`)).catch(err=>notify(err.message || 'KFS could not be downloaded.'))}><FileText size={17}/>Download KFS</button>}<button className="primary small" onClick={onClose}>Close</button></div>
   </div></div>
   {confirmingQuick && <PaymentConfirmModal payment={confirmingQuick} saving={quickSaving} error={quickError} onCancel={() => { setConfirmingQuick(null); setQuickError(''); }} onConfirm={saveQuick} />}
   {quickReceipt && <ReceiptModal title="Payment Receipt" onClose={() => setQuickReceipt(null)} data={quickReceipt} />}
@@ -1526,7 +1527,9 @@ function Reports({ api }) {
   const [report, setReport] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [collectorNames, setCollectorNames] = useState({});
   useEffect(() => { api('/api/customers').then(r => { setCustomers(r); setCustomerId(r[0]?.customer_id || ''); }); }, []);
+  useEffect(() => { api('/api/bootstrap').then(b => setCollectorNames(Object.fromEntries([...(b.collectors || []), b.user].filter(Boolean).map(u => [u.id, u.name])))).catch(() => {}); }, []);
   async function generate() {
     const body = { report_type: type, customer_id: customerId, date: new Date().toISOString().slice(0, 10), month: new Date().toISOString().slice(0, 7), year: new Date().getFullYear() };
     setLoading(true); setError('');
@@ -1547,7 +1550,7 @@ function Reports({ api }) {
         <div className="export-grid">
           <button className="ghost" disabled={!report} onClick={() => downloadCsv(report, filename)}><Download size={16} /> CSV</button>
           <button className="ghost" disabled={!report} onClick={() => downloadExcel(report, filename)}><FileText size={16} /> Excel</button>
-          <button className="ghost" disabled={!report} onClick={() => downloadPdf(report, filename)}><FileBarChart2 size={16} /> PDF</button>
+          <button className="ghost" disabled={!report} onClick={() => downloadPdfDocument(reportDocument(report, { collectors: collectorNames }), filename).catch(err => setError(err.message || 'PDF could not be created.'))}><FileBarChart2 size={16} /> PDF</button>
           <button className="ghost" disabled={!report} onClick={() => window.print()}><Printer size={16} /> Print</button>
           <button className="ghost" disabled={!report} onClick={() => shareReport(report, filename)}><Globe2 size={16} /> Share</button>
           <a className={`ghost ${!report ? 'disabled' : ''}`} href={report ? `mailto:?subject=${encodeURIComponent(report.title)}&body=${encodeURIComponent(reportSummary(report))}` : undefined}><Bell size={16} /> Email</a>
@@ -2164,24 +2167,6 @@ function downloadExcel(report, filename) {
   saveFile(table, `${filename}.xls`, 'application/vnd.ms-excel');
 }
 
-function downloadPdf(report, filename) {
-  const lines = [report.title || 'Business Report', `Generated: ${new Date().toLocaleString('en-IN')}`, '', ...JSON.stringify(report, null, 2).split('\n')].map(line => line.replace(/[^\x20-\x7E]/g, ' ').slice(0, 95));
-  const pages = Array.from({length: Math.max(1, Math.ceil(lines.length / 48))}, (_, i) => lines.slice(i * 48, (i + 1) * 48));
-  const fontRef = 3 + pages.length * 2;
-  const pageRefs = pages.map((_, i) => 3 + i * 2);
-  const objects = ['<< /Type /Catalog /Pages 2 0 R >>', `<< /Type /Pages /Kids [${pageRefs.map(ref=>`${ref} 0 R`).join(' ')}] /Count ${pages.length} >>`];
-  pages.forEach((pageLines, i) => {
-    const contentRef = 4 + i * 2;
-    const stream = `BT\n/F1 9 Tf\n42 800 Td\n15 TL\n${pageLines.map((line, index) => `${index ? 'T*' : ''} (${line.replaceAll('\\', '\\\\').replaceAll('(', '\\(').replaceAll(')', '\\)')}) Tj`).join('\n')}\nET`;
-    objects.push(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 ${fontRef} 0 R >> >> /Contents ${contentRef} 0 R >>`);
-    objects.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
-  });
-  objects.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
-  let pdf = '%PDF-1.4\n', offsets = [0]; objects.forEach((obj, i) => { offsets.push(pdf.length); pdf += `${i + 1} 0 obj\n${obj}\nendobj\n`; });
-  const size = objects.length + 1;
-  const xref = pdf.length; pdf += `xref\n0 ${size}\n0000000000 65535 f \n${offsets.slice(1).map(o => String(o).padStart(10, '0') + ' 00000 n ').join('\n')}\ntrailer << /Size ${size} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
-  saveFile(pdf, `${filename}.pdf`, 'application/pdf');
-}
 
 function reportSummary(report) { return `${report.title || 'Business report'}\n\n${JSON.stringify(report, null, 2).slice(0, 1800)}`; }
 async function shareReport(report, filename) {

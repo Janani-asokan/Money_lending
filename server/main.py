@@ -3009,7 +3009,8 @@ async def loan_details(loan_id: str, user: dict[str, Any] = Depends(current_user
     for row in payments:
         item = deepcopy(row)
         allocation = item.get("allocation", {})
-        applied = sum(int(allocation.get(key, 0)) for key in ("principal_paise", "interest_paise", "penalty_paise"))
+        # Older receipts have no allocation; the whole amount reduced the balance.
+        applied = sum(int(allocation.get(key, 0)) for key in ("principal_paise", "interest_paise", "penalty_paise")) if allocation else to_paise(item.get("amount", 0))
         item["principal_paid"] = from_paise(int(allocation.get("principal_paise", 0)))
         item["interest_paid"] = from_paise(int(allocation.get("interest_paise", 0)))
         item["penalty_paid"] = from_paise(int(allocation.get("penalty_paise", 0)))
@@ -4248,7 +4249,10 @@ async def build_report(payload: ReportRequest) -> dict[str, Any]:
         "collected": round(sum(p["amount"] for p in year_payments), 2),
         "disbursed": round(sum(l["principal"] for l in year_loans), 2),
         "bad_debts": round(sum(l["balance"] for l in loans_rows if l["status"] == "Overdue"), 2),
-        "area_contribution": await dashboard(await find_one("users", {"role": "owner"})),
+        "area_contribution": [
+            {"name": area["name"], "customers": area["customers"], "active_loans": area["active_loans"], "total_disbursed": area["total_disbursed"], "outstanding": area["outstanding"]}
+            for area in (await dashboard(await find_one("users", {"role": "owner"})))["area_summary"]
+        ],
     }
 
 
