@@ -3383,12 +3383,11 @@ async def send_loan_acknowledgement(payload: LoanIn, request: Request, user: dic
         wait = int((parse_date(latest["created_at"]) + timedelta(seconds=MOBILE_OTP_RESEND_SECONDS) - stamp).total_seconds()) + 1
         raise HTTPException(429, f"Please wait {wait} seconds before resending the OTP.")
     terms = ack_terms(payload, schedule)
-    frequency = {"Daily 100-Day": "daily", "Weekly": "weekly"}.get(payload.loan_type, "monthly")
     request_id = f"LAK-{await next_sequence('LAK', 'ack_request_id', 'loan_acknowledgements'):09d}"
     otp = f"{secrets.randbelow(1_000_000):06d}"
-    first_due = parse_date(schedule["first_due_date"]).astimezone(BUSINESS_TIMEZONE).strftime("%d-%m-%Y")
-    text = (f"{SMS_SENDER_NAME}: You are taking a loan of {rupees(terms['principal'])}. Cash given to you {rupees(terms['cash_handover'])}. "
-            f"Repay {rupees(terms['instalment'])} x {terms['repayment_period']} {frequency} from {first_due}. "
+    # Kept short at the client's request: loan amount and OTP only. The full terms
+    # (cash given, instalments) are still bound to this acknowledgement on the server.
+    text = (f"{SMS_SENDER_NAME}: You are taking a loan of {rupees(terms['principal'])}. "
             f"OTP {otp}. Share this OTP with our staff ONLY if you agree and have received the cash.")
     delivery = await send_sms(customer["mobile"], text)
     for row in recent:
