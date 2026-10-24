@@ -131,3 +131,10 @@ Files: server/main.py, client/src/main.jsx, client/src/styles.css
   is stored on the loan, shown on the loan record, the KFS and a printable acknowledgement, and can be used only once.
   LOAN_ACK_OTP=auto (default: required whenever SMS works), required, or off (typed reference instead).
 - Customer picker: typing a new name/mobile clears the previous selection (prevented loans going to the wrong customer).
+
+## Round 5 - Forgot password and show-password eye icon - DONE
+
+- Eye icon on every password field (sign-in, change password, reset password).
+- "Forgot password?" on the sign-in page: SMS OTP to the account's recovery mobile, then set a new password. Old sessions are revoked.
+- Settings -> Password recovery mobile (verified by OTP). `OWNER_RECOVERY_MOBILE` env var as a fallback for the owner.
+- Same reply for unknown usernames so accounts cannot be discovered; OTP 10 min, 5 attempts, single use; per-device and per-account rate limits.

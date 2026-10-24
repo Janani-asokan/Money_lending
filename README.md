@@ -139,6 +139,14 @@ API: `GET /api/sms/status`, `POST /api/customers/{customer_id}/mobile-otp/send`,
 - **Existing loans**: tick *Existing loan*, pick the original date, enter the amount already repaid. No cash is moved today and no OTP is needed.
 - **Borrower acknowledgement**: before handing over money, press *Send acknowledgement OTP*. The customer receives an SMS with the loan amount, cash given, instalments and an OTP, and gives the OTP to staff only if they agree and received the cash. The acknowledgement number (ACK-…) is printed on the loan acknowledgement and KFS. Set `LOAN_ACK_OTP=off` to fall back to a typed reference if SMS is unavailable.
 
+## Forgot password
+
+- Every password box has an eye icon to show or hide what you typed.
+- On the sign-in page, **Forgot password?** sends a 6-digit OTP by SMS to the account's recovery mobile. Enter it with a new password (12+ characters, upper, lower, number, symbol). All old sign-ins are signed out.
+- The owner sets the recovery mobile in **Settings → Password recovery mobile** (the number is confirmed by OTP first).
+- Locked out before setting one? Add `OWNER_RECOVERY_MOBILE=<10-digit mobile>` to the backend service's environment, redeploy, then use Forgot password.
+- Limits: OTP valid 10 minutes, 5 wrong tries, 60 s between resends, 5 resets a day per account, 5 requests per 15 minutes per device.
+
 ## Go-live gate
 
 - Deploy the frontend and API behind HTTPS, preferably on one trusted domain.

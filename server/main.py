@@ -105,6 +105,13 @@ BACKUP_ENCRYPTION_KEY = BACKUP_KEY_RAW.encode()
 OFFSITE_BACKUP_DIR_RAW = os.getenv("OFFSITE_BACKUP_DIR", "").strip()
 OFFSITE_BACKUP_DIR = Path(OFFSITE_BACKUP_DIR_RAW).resolve() if OFFSITE_BACKUP_DIR_RAW else None
 LOGIN_ATTEMPTS: dict[str, deque[float]] = defaultdict(deque)
+PASSWORD_RESET_REQUESTS: dict[str, deque[float]] = defaultdict(deque)
+PASSWORD_RESET_TTL_SECONDS = 600
+PASSWORD_RESET_MAX_ATTEMPTS = 5
+PASSWORD_RESET_RESEND_SECONDS = 60
+PASSWORD_RESET_DAILY_LIMIT = 5
+# Fallback recovery mobile for the owner account, used until a recovery mobile is saved in Settings.
+OWNER_RECOVERY_MOBILE = "".join(ch for ch in os.getenv("OWNER_RECOVERY_MOBILE", "") if ch.isdigit())[-10:]
 
 app = FastAPI(title="Sri Sakthi Thirumurugan Finance API", version="1.0.0")
 app.add_middleware(
@@ -212,7 +219,7 @@ VERIFICATION_STATUSES = {
 async def production_headers(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))[:100]
     started = time.perf_counter()
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {"/api/auth/login", "/api/auth/refresh"}:
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {"/api/auth/login", "/api/auth/refresh", "/api/auth/forgot-password/send", "/api/auth/forgot-password/reset"}:
         origin = request.headers.get("Origin")
         if origin and origin not in CORS_ORIGINS:
             return Response(content='{"detail":"Untrusted request origin"}', status_code=403, media_type="application/json")
@@ -286,6 +293,12 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=6, max_length=200)
 
 
+def check_strong_password(value: str) -> str:
+    if not all((any(c.islower() for c in value), any(c.isupper() for c in value), any(c.isdigit() for c in value), any(not c.isalnum() for c in value))):
+        raise ValueError("New password must include uppercase, lowercase, number, and symbol")
+    return value
+
+
 class PasswordChangeIn(BaseModel):
     current_password: str = Field(min_length=6, max_length=200)
     new_password: str = Field(min_length=12, max_length=200)
@@ -293,9 +306,27 @@ class PasswordChangeIn(BaseModel):
     @field_validator("new_password")
     @classmethod
     def strong_password(cls, value: str) -> str:
-        if not all((any(c.islower() for c in value), any(c.isupper() for c in value), any(c.isdigit() for c in value), any(not c.isalnum() for c in value))):
-            raise ValueError("New password must include uppercase, lowercase, number, and symbol")
-        return value
+        return check_strong_password(value)
+
+
+class PasswordResetSendIn(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+
+
+class PasswordResetIn(BaseModel):
+    reset_id: str = Field(min_length=8, max_length=60)
+    otp: str = Field(pattern=r"^\d{6}$")
+    new_password: str = Field(min_length=12, max_length=200)
+
+    @field_validator("new_password")
+    @classmethod
+    def strong_password(cls, value: str) -> str:
+        return check_strong_password(value)
+
+
+class RecoveryMobileIn(BaseModel):
+    mobile: str = Field(pattern=r"^[6-9]\d{9}$")
+    otp_id: str = Field(min_length=3, max_length=40)
 
 
 class CustomerIn(BaseModel):
@@ -2095,6 +2126,110 @@ async def change_password(payload: PasswordChangeIn, request: Request, user: dic
         await db.auth_sessions.update_many({"user_id": user["id"], "session_id": {"$ne": token_payload["sid"]}}, {"$set": {"revoked_at": iso(now())}})
     await audit(user, "password_changed", "user", user["id"], {"other_sessions_revoked": True}, request)
     return {"status": "Password changed; other sessions revoked"}
+
+
+def recovery_mobile_for(user: dict[str, Any]) -> str:
+    return user.get("recovery_mobile") or (OWNER_RECOVERY_MOBILE if user.get("role") == "owner" and len(OWNER_RECOVERY_MOBILE) == 10 else "")
+
+
+@app.post("/api/auth/forgot-password/send")
+async def send_password_reset_otp(payload: PasswordResetSendIn, request: Request) -> dict[str, Any]:
+    client_key = request.client.host if request.client else "unknown"
+    requests_log = PASSWORD_RESET_REQUESTS[client_key]
+    while requests_log and requests_log[0] < time.time() - 900:
+        requests_log.popleft()
+    if len(requests_log) >= 5:
+        raise HTTPException(429, "Too many reset requests. Try again in 15 minutes.", headers={"Retry-After": "900"})
+    requests_log.append(time.time())
+    stamp = now()
+    # The reply looks the same whether or not the username exists, so it cannot be used to discover accounts.
+    reset_id = f"PWR-{secrets.token_urlsafe(18)}"
+    result: dict[str, Any] = {
+        "reset_id": reset_id, "expires_in_seconds": PASSWORD_RESET_TTL_SECONDS, "resend_in_seconds": PASSWORD_RESET_RESEND_SECONDS,
+        "message": "If this username has a recovery mobile number, a 6-digit OTP has been sent to it.",
+    }
+    user = await find_one("users", {"username": payload.username.strip()})
+    mobile = recovery_mobile_for(user) if user and user.get("active", True) else ""
+    if not mobile:
+        return result
+    history = await find_many("password_resets", {"user_id": user["id"]})
+    if sum(1 for row in history if parse_date(row["created_at"]) > stamp - timedelta(days=1)) >= PASSWORD_RESET_DAILY_LIMIT:
+        raise HTTPException(429, "Daily reset limit reached for this account. Try again tomorrow.")
+    latest = max(history, key=lambda row: row["created_at"], default=None)
+    if latest and latest.get("status") == "Sent":
+        available_at = parse_date(latest["created_at"]) + timedelta(seconds=PASSWORD_RESET_RESEND_SECONDS)
+        if available_at > stamp:
+            raise HTTPException(429, f"Please wait {int((available_at - stamp).total_seconds()) + 1} seconds before requesting another OTP.")
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    delivery = await send_sms(mobile, f"{otp} is your OTP to reset your {SMS_SENDER_NAME} login password. Valid for {PASSWORD_RESET_TTL_SECONDS // 60} minutes. Do not share it with anyone.")
+    for row in history:
+        if row.get("status") == "Sent":
+            await update_where("password_resets", {"reset_id": row["reset_id"], "status": "Sent"}, {"status": "Superseded", "completed_at": iso(stamp)})
+    await insert_one("password_resets", {
+        "reset_id": reset_id, "user_id": user["id"], "mobile": mobile, "otp_hash": mobile_otp_hash(reset_id, otp),
+        "status": "Sent", "created_at": iso(stamp), "expires_at": iso(stamp + timedelta(seconds=PASSWORD_RESET_TTL_SECONDS)),
+        "attempt_count": 0, "max_attempts": PASSWORD_RESET_MAX_ATTEMPTS, "gateway_message_id": delivery["gateway_message_id"],
+        "ip": client_key,
+    })
+    await audit(user, "password_reset_otp_sent", "user", user["id"], {"reset_id": reset_id, "mobile": mask_mobile(mobile)}, request)
+    if delivery["demo"] or APP_ENV != "production":
+        result["dev_otp"] = otp
+    return result
+
+
+@app.post("/api/auth/forgot-password/reset")
+async def reset_password_with_otp(payload: PasswordResetIn, request: Request) -> dict[str, str]:
+    invalid = HTTPException(422, "Incorrect or expired OTP. Request a new OTP and try again.")
+    record = await find_one("password_resets", {"reset_id": payload.reset_id})
+    if not record or record["status"] != "Sent":
+        raise invalid
+    stamp = now()
+    if parse_date(record["expires_at"]) <= stamp:
+        await update_where("password_resets", {"reset_id": payload.reset_id, "status": "Sent"}, {"status": "Expired", "completed_at": iso(stamp)})
+        raise HTTPException(410, "OTP expired. Request a new OTP.")
+    if not hmac.compare_digest(record["otp_hash"], mobile_otp_hash(payload.reset_id, payload.otp)):
+        attempts = int(record.get("attempt_count", 0))
+        remaining = max(int(record.get("max_attempts", PASSWORD_RESET_MAX_ATTEMPTS)) - attempts - 1, 0)
+        await update_where("password_resets", {"reset_id": payload.reset_id, "status": "Sent", "attempt_count": attempts}, {"status": "Locked" if remaining == 0 else "Sent", "last_failed_at": iso(stamp)}, {"attempt_count": 1})
+        if remaining == 0:
+            raise HTTPException(423, "Too many incorrect attempts. Request a new OTP.")
+        raise HTTPException(422, f"Incorrect OTP. {remaining} attempt{'s' if remaining != 1 else ''} remaining.")
+    user = await find_one("users", {"id": record["user_id"]})
+    if not user or not user.get("active", True):
+        raise invalid
+    if pwd_context.verify(payload.new_password, user["password_hash"]):
+        raise HTTPException(422, "New password must be different from the old password.")
+    if not await update_where("password_resets", {"reset_id": payload.reset_id, "status": "Sent"}, {"status": "Used", "completed_at": iso(stamp)}):
+        raise invalid
+    updates = {"password_hash": pwd_context.hash(payload.new_password), "must_change_password": False, "password_changed_at": iso(stamp), "initial_password_fingerprint": "user-managed"}
+    await update_where("users", {"id": user["id"]}, updates)
+    for session in await find_many("auth_sessions", {"user_id": user["id"]}):
+        if not session.get("revoked_at"):
+            await update_where("auth_sessions", {"session_id": session["session_id"]}, {"revoked_at": iso(stamp)})
+    LOGIN_ATTEMPTS.pop(request.client.host if request.client else "unknown", None)
+    await audit(user, "password_reset_by_otp", "user", user["id"], {"reset_id": payload.reset_id, "mobile": mask_mobile(record["mobile"]), "all_sessions_revoked": True}, request)
+    return {"status": "Password reset. Sign in with your new password."}
+
+
+@app.get("/api/auth/recovery-mobile")
+async def get_recovery_mobile(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    mobile = recovery_mobile_for(user)
+    return {"configured": bool(mobile), "masked": mask_mobile(mobile) if mobile else None,
+            "source": "settings" if user.get("recovery_mobile") else ("server" if mobile else None)}
+
+
+@app.post("/api/auth/recovery-mobile")
+async def save_recovery_mobile(payload: RecoveryMobileIn, request: Request, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    # The number must have been proved by an SMS OTP sent by this same user in the last 15 minutes.
+    record = await find_one("mobile_otps", {"otp_id": payload.otp_id, "mobile": payload.mobile})
+    if (not record or record.get("status") != "Verified" or record.get("requested_by_id") != user["id"]
+            or parse_date(record.get("completed_at") or record["created_at"]) < now() - timedelta(minutes=15)):
+        raise HTTPException(422, "Verify this mobile number with an OTP first.")
+    if not await update_where("mobile_otps", {"otp_id": payload.otp_id, "status": "Verified"}, {"status": "Consumed"}):
+        raise HTTPException(409, "This OTP was already used. Verify the number again.")
+    await update_where("users", {"id": user["id"]}, {"recovery_mobile": payload.mobile, "recovery_mobile_verified_at": iso(now())})
+    await audit(user, "recovery_mobile_set", "user", user["id"], {"mobile": mask_mobile(payload.mobile)}, request)
+    return {"configured": True, "masked": mask_mobile(payload.mobile), "source": "settings"}
 
 
 @app.post("/api/auth/logout")

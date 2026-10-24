@@ -316,10 +316,77 @@ function viewTitle(view, t) {
   }[view] || t.dashboard;
 }
 
+function PasswordInput({ value, onChange, ...props }) {
+  const [show, setShow] = useState(false);
+  return <div className="password-field"><input {...props} type={show ? 'text' : 'password'} value={value} onChange={onChange} /><button type="button" className="password-toggle" aria-label={show ? 'Hide password' : 'Show password'} aria-pressed={show} title={show ? 'Hide password' : 'Show password'} onClick={() => setShow(on => !on)}>{show ? <EyeOff size={19}/> : <Eye size={19}/>}</button></div>;
+}
+
+function ForgotPassword({ api, initialUsername, onDone, onCancel }) {
+  const [username, setUsername] = useState(initialUsername || '');
+  const [reset, setReset] = useState(null);
+  const [otp, setOtp] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [clock, setClock] = useState(Date.now());
+  useEffect(() => { if (!reset) return; const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, [reset]);
+  const resendIn = reset ? Math.max(0, Math.ceil((reset.resendAt - clock) / 1000)) : 0;
+  async function sendOtp(e) {
+    e?.preventDefault();
+    if (busy) return;
+    setError(''); setBusy(true);
+    try {
+      if (!(await wakeServer())) throw new Error('The server is not responding right now. Please try again in a minute.');
+      const data = await api('/api/auth/forgot-password/send', { method: 'POST', body: JSON.stringify({ username: username.trim() }), timeoutMs: 60000 });
+      setClock(Date.now()); setReset({ ...data, resendAt: Date.now() + data.resend_in_seconds * 1000 }); setOtp('');
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+  async function resetPassword(e) {
+    e.preventDefault();
+    if (busy) return;
+    setError('');
+    if (password !== confirm) return setError('New passwords do not match.');
+    setBusy(true);
+    try {
+      await api('/api/auth/forgot-password/reset', { method: 'POST', body: JSON.stringify({ reset_id: reset.reset_id, otp, new_password: password }) });
+      onDone(username.trim());
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+  if (!reset) return (
+    <form className="login-card" onSubmit={sendOtp}>
+      <div className="form-head"><h2>Forgot password</h2></div>
+      <p className="muted-note">Enter your username. We will send a 6-digit OTP by SMS to the recovery mobile number saved for your account.</p>
+      <label>Username<input required autoFocus autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} /></label>
+      {error && <div className="error" role="alert">{error}</div>}
+      <button className="primary" disabled={busy}>{busy ? 'Sending OTP…' : 'Send OTP'} <ChevronRight size={18} /></button>
+      <button type="button" className="link-btn" onClick={onCancel}>Back to sign in</button>
+    </form>
+  );
+  return (
+    <form className="login-card" onSubmit={resetPassword}>
+      <div className="form-head"><h2>Set a new password</h2></div>
+      <div className="locked-note" role="status">{reset.message}</div>
+      {reset.dev_otp && <div className="locked-note">Demo OTP: <b>{reset.dev_otp}</b></div>}
+      <label>OTP<input required inputMode="numeric" autoComplete="one-time-code" pattern="\d{6}" maxLength="6" value={otp} onChange={e => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>
+      <label>New password<PasswordInput required minLength="12" autoComplete="new-password" value={password} onChange={e => setPassword(e.target.value)} /><small>12+ characters with uppercase, lowercase, number and symbol.</small></label>
+      <label>Confirm new password<PasswordInput required minLength="12" autoComplete="new-password" value={confirm} onChange={e => setConfirm(e.target.value)} /></label>
+      {error && <div className="error" role="alert">{error}</div>}
+      <button className="primary" disabled={busy || otp.length !== 6}>{busy ? 'Saving…' : 'Reset password'} <ChevronRight size={18} /></button>
+      <div className="link-row">
+        <button type="button" className="link-btn" disabled={busy || resendIn > 0} onClick={sendOtp}>{resendIn > 0 ? `Resend OTP in ${resendIn}s` : 'Resend OTP'}</button>
+        <button type="button" className="link-btn" onClick={onCancel}>Back to sign in</button>
+      </div>
+      <small className="muted-note">No SMS? The owner can save a recovery mobile in Settings. Staff can ask the owner for help.</small>
+    </form>
+  );
+}
+
 function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
   const [username, setUsername] = useState(IS_DEMO ? 'owner' : '');
   const [password, setPassword] = useState(IS_DEMO ? 'owner123' : '');
-  const [showPassword, setShowPassword] = useState(false);
+  const [forgot, setForgot] = useState(false);
+  const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
   const [signingIn, setSigningIn] = useState(false);
   const [waking, setWaking] = useState(false);
@@ -363,6 +430,7 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
           <Metric icon={AreaChart} label="One clear view" value="Four operating areas" />
         </div>
       </section>
+      {forgot ? <ForgotPassword api={api} initialUsername={username} onCancel={() => setForgot(false)} onDone={name => { setForgot(false); setUsername(name); setPassword(''); setError(''); setNotice('Password reset successfully. Sign in with your new password.'); }} /> :
       <form className="login-card" onSubmit={submit}>
         <div className="form-head">
           <h2>{t.login}</h2>
@@ -372,7 +440,9 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
           </div>
         </div>
         <label>Username<input required autoComplete="username" value={username} onChange={e => setUsername(e.target.value)} /></label>
-        <label>Password<div className="password-field"><input required autoComplete="current-password" type={showPassword ? 'text' : 'password'} value={password} onChange={e => setPassword(e.target.value)} /><button type="button" className="password-toggle" aria-label={showPassword ? 'Hide password' : 'Show password'} aria-pressed={showPassword} onClick={() => setShowPassword(value => !value)}>{showPassword ? <EyeOff size={19}/> : <Eye size={19}/>}</button></div></label>
+        <label>Password<PasswordInput required autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} /></label>
+        <div className="forgot-row"><button type="button" className="link-btn" onClick={() => { setError(''); setNotice(''); setForgot(true); }}>Forgot password?</button></div>
+        {notice && !error && <div className="success-note" role="status"><CheckCircle2 size={16}/> {notice}</div>}
         {waking && !error && <div className="locked-note" role="status">Waking up the server… After a quiet period the first sign-in can take up to a minute. Please keep this page open.</div>}
         {error && <div className="error" role="alert">{error}</div>}
         <button className="primary" disabled={signingIn}>{signingIn ? (waking ? 'Waking up server…' : 'Signing in…') : 'Enter secure workspace'} <ChevronRight size={18} /></button>
@@ -383,7 +453,7 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
             </button>
           ))}
         </div>}
-      </form>
+      </form>}
     </div>
   );
 }
@@ -1806,13 +1876,55 @@ function SettingsView({ api, notify }) {
       <SmsSetupPanel api={api} notify={notify} />
       <form className="panel form-panel" onSubmit={changePassword}>
         <div className="panel-head"><h2>Change owner password</h2><span>Revokes every other active session</span></div>
-        <label>Current password<input required type="password" autoComplete="current-password" value={passwords.current_password} onChange={e=>setPasswords({...passwords,current_password:e.target.value})}/></label>
-        <label>New password<input required type="password" minLength="12" autoComplete="new-password" value={passwords.new_password} onChange={e=>setPasswords({...passwords,new_password:e.target.value})}/><small>12+ characters with uppercase, lowercase, number and symbol.</small></label>
-        <label>Confirm new password<input required type="password" minLength="12" autoComplete="new-password" value={passwords.confirm_password} onChange={e=>setPasswords({...passwords,confirm_password:e.target.value})}/></label>
+        <label>Current password<PasswordInput required autoComplete="current-password" value={passwords.current_password} onChange={e=>setPasswords({...passwords,current_password:e.target.value})}/></label>
+        <label>New password<PasswordInput required minLength="12" autoComplete="new-password" value={passwords.new_password} onChange={e=>setPasswords({...passwords,new_password:e.target.value})}/><small>12+ characters with uppercase, lowercase, number and symbol.</small></label>
+        <label>Confirm new password<PasswordInput required minLength="12" autoComplete="new-password" value={passwords.confirm_password} onChange={e=>setPasswords({...passwords,confirm_password:e.target.value})}/></label>
         {passwordError && <div className="error" role="alert">{passwordError}</div>}
         <button className="primary">Update password securely</button>
       </form>
+      <RecoveryMobilePanel api={api} notify={notify} />
     </div>
+  );
+}
+
+function RecoveryMobilePanel({ api, notify }) {
+  const [status, setStatus] = useState(null);
+  const [mobile, setMobile] = useState('');
+  const [session, setSession] = useState(null);
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  useEffect(() => { api('/api/auth/recovery-mobile').then(setStatus).catch(() => setStatus({ configured: false })); }, []);
+  async function run(task) {
+    if (busy) return;
+    setError(''); setBusy(true);
+    try { await task(); } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+  const sendOtp = e => { e?.preventDefault(); run(async () => {
+    if (!/^[6-9]\d{9}$/.test(mobile)) throw new Error('Enter a valid 10-digit mobile number.');
+    setSession(await api('/api/registration/mobile-otp/send', { method: 'POST', body: JSON.stringify({ mobile }) })); setCode('');
+  }); };
+  const verify = e => { e.preventDefault(); run(async () => {
+    await api('/api/registration/mobile-otp/verify', { method: 'POST', body: JSON.stringify({ otp_id: session.otp_id, mobile, otp: code }) });
+    setStatus(await api('/api/auth/recovery-mobile', { method: 'POST', body: JSON.stringify({ mobile, otp_id: session.otp_id }) }));
+    setSession(null); setMobile(''); setCode('');
+    notify('Recovery mobile saved. Use "Forgot password?" on the sign-in page if you ever forget your password.');
+  }); };
+  return (
+    <form className="panel form-panel" onSubmit={session ? verify : sendOtp}>
+      <div className="panel-head"><h2>Password recovery mobile</h2><span>Receives the OTP when you use "Forgot password?"</span></div>
+      {status && <div className={status.configured ? 'success-note' : 'locked-note'}>{status.configured ? <><CheckCircle2 size={16}/> Recovery OTPs go to {status.masked}{status.source === 'server' ? ' (set on the server)' : ''}.</> : 'No recovery mobile yet. Add one so you can reset a forgotten password.'}</div>}
+      <label>{status?.configured ? 'Change to mobile number' : 'Mobile number'}<input inputMode="numeric" maxLength="10" disabled={!!session} value={mobile} onChange={e => setMobile(e.target.value.replace(/\D/g, '').slice(0, 10))} placeholder="10-digit mobile" /></label>
+      {session && <>
+        {session.dev_otp && <div className="locked-note">Demo OTP: <b>{session.dev_otp}</b></div>}
+        <label>OTP sent to {session.masked_destination}<input required inputMode="numeric" autoComplete="one-time-code" maxLength="6" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>
+      </>}
+      {error && <div className="error" role="alert">{error}</div>}
+      <div className="link-row">
+        <button className="primary" disabled={busy || (session && code.length !== 6)}>{busy ? 'Please wait…' : session ? 'Verify and save' : 'Send OTP'}</button>
+        {session && <button type="button" className="link-btn" disabled={busy} onClick={() => { setSession(null); setCode(''); setError(''); }}>Change number</button>}
+      </div>
+    </form>
   );
 }
 
