@@ -1143,3 +1143,8 @@ td .action-row button { white-space: nowrap; }
 @media (max-width: 680px) {
   .login-card-logo { display: block; height: 104px; width: auto; margin: 0 auto 6px; filter: drop-shadow(0 6px 14px rgba(0,0,0,.16)); }
 }
+.receipt-head { display: flex; align-items: center; gap: 14px; padding-bottom: 12px; margin-bottom: 12px; border-bottom: 1px solid #e5e7eb; }
+.receipt-head img { flex: none; width: auto; height: 76px; object-fit: contain; }
+.receipt-head h2 { margin: 0 0 4px; }
+.receipt-head p { margin: 0; color: #4b5563; }
+@media print { .receipt-head img { -webkit-print-color-adjust: exact; print-color-adjust: exact; } }

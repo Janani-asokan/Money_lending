@@ -1307,8 +1307,7 @@ function LoanAcknowledgementModal({ loan, onClose }) {
   return <div className="modal-backdrop"><div className="modal">
     <div className="panel-head"><h2>{loan.existing_loan ? 'Existing loan added' : 'Loan acknowledgement'}</h2><button className="icon-btn" aria-label="Close" onClick={onClose}><X size={18}/></button></div>
     <div className="receipt-paper">
-      <h2>Sri Sakthi Thirumurugan Finance</h2>
-      <p>{loan.existing_loan ? 'Existing loan record' : 'Loan disbursement acknowledgement'}</p>
+      <ReceiptHeader subtitle={loan.existing_loan ? 'Existing loan record' : 'Loan disbursement acknowledgement'} />
       <dl>
         <dt>Loan</dt><dd>{loan.loan_id} · {day(loan.borrow_date)}</dd>
         <dt>Customer</dt><dd>{customer.customer_id || loan.customer_id}{customer.name ? ` · ${customer.name}` : ''}</dd>
@@ -2157,14 +2156,20 @@ function PaymentConfirmModal({ payment, saving, error, onCancel, onConfirm }) {
   );
 }
 
+function ReceiptHeader({ subtitle }) {
+  return <div className="receipt-head">
+    <img src="/brand-logo.webp" width="64" height="76" alt="" />
+    <div><h2>Sri Sakthi Thirumurugan Finance</h2><p>{subtitle}</p></div>
+  </div>;
+}
+
 function ReceiptModal({ title, data, onClose }) {
   return (
     <div className="modal-backdrop">
       <div className="modal">
         <div className="panel-head"><h2>{title}</h2><button className="icon-btn" onClick={onClose}>×</button></div>
         <div className="receipt-paper">
-          <h2>Sri Sakthi Thirumurugan Finance</h2>
-          <p>{title}</p>
+          <ReceiptHeader subtitle={title} />
           <dl>
             <dt>Reference</dt><dd>{data.ack || data.receipt_no}</dd>
             <dt>Customer</dt><dd>{data.customer?.customer_id} · {data.customer?.name}</dd>
