@@ -231,7 +231,7 @@ function App() {
       <aside className="sidebar">
         <button className="sidebar-toggle" aria-label={sidebarCollapsed ? 'Expand navigation menu' : 'Collapse navigation menu'} aria-expanded={!sidebarCollapsed} title={sidebarCollapsed ? 'Expand menu' : 'Collapse menu'} onClick={()=>setSidebarCollapsed(value=>!value)}>{sidebarCollapsed ? <PanelLeftOpen size={18}/> : <PanelLeftClose size={18}/>}</button>
         <div className="brand">
-          <div className="brand-mark"><img src="/logo-mark.svg" alt="" /></div>
+          <img className="brand-logo" src="/brand-logo.webp" width="70" height="83" alt="Sri Sakthi Thirumurugan Finance logo" />
           <div>
             <strong>{t.title}</strong>
             <span>{t.subtitle}</span>
@@ -415,7 +415,7 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
     <div className="login-page">
       <section className="login-hero">
         <div className="brand large">
-          <div className="brand-mark"><img src="/logo-mark.svg" alt="" /></div>
+          <img className="brand-logo" src="/brand-logo.webp" width="70" height="83" alt="Sri Sakthi Thirumurugan Finance logo" />
           <div>
             <strong>{t.title}</strong>
             <span>{t.subtitle}</span>
@@ -432,6 +432,7 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
       </section>
       {forgot ? <ForgotPassword api={api} initialUsername={username} onCancel={() => setForgot(false)} onDone={name => { setForgot(false); setUsername(name); setPassword(''); setError(''); setNotice('Password reset successfully. Sign in with your new password.'); }} /> :
       <form className="login-card" onSubmit={submit}>
+        <img className="login-card-logo" src="/brand-logo.webp" width="88" height="104" alt="Sri Sakthi Thirumurugan Finance logo" />
         <div className="form-head">
           <h2>{t.login}</h2>
           <div className="mini-actions">

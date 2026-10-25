@@ -1127,3 +1127,19 @@ td .action-row button { white-space: nowrap; }
 .muted-note { color: var(--muted); font-size: 0.9rem; line-height: 1.5; margin: 0 0 6px; }
 .success-note { display: flex; gap: 8px; align-items: center; padding: 11px 12px; margin: 6px 0 14px; color: var(--success); border-radius: 8px; border: 1px solid color-mix(in srgb, var(--success) 40%, var(--line)); background: color-mix(in srgb, var(--success) 8%, transparent); }
 .login-card > .link-btn { align-self: center; margin-top: 6px; }
+
+/* Brand logo (Sri Sakthi Thirumurugan Finance emblem) */
+.brand-logo { flex: none; display: block; width: auto; height: 64px; object-fit: contain; filter: drop-shadow(0 6px 14px rgba(0,0,0,.18)); }
+.brand.large .brand-logo { height: 132px; }
+.sidebar-collapsed .brand-logo { height: 48px; }
+@media (max-width: 1100px) {
+  .sidebar .brand-logo { height: 46px; }
+  .brand.large .brand-logo { height: 96px; }
+}
+
+.login-hero .brand strong { color: var(--text); }
+.login-hero .brand span { color: var(--muted); }
+.login-card-logo { display: none; }
+@media (max-width: 680px) {
+  .login-card-logo { display: block; height: 104px; width: auto; margin: 0 auto 6px; filter: drop-shadow(0 6px 14px rgba(0,0,0,.16)); }
+}
