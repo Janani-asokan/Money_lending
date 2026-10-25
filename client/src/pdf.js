@@ -41,8 +41,19 @@ function formatValue(key, value) {
  *                                      | { heading, columns: [header...], rows: [[...]], money?: [colIndex...] }
  *                                      | { heading, text } ], signatures?: [label...] }
  */
+const LOGO_RATIO = 203 / 240; // width / height of /pdf-logo.jpg
+let logoPromise;
+// Loaded once per session; a PDF is still produced without the logo if it cannot be fetched.
+function loadLogo() {
+  logoPromise ||= fetch('/pdf-logo.jpg')
+    .then(response => (response.ok ? response.blob() : null))
+    .then(blob => blob && new Promise(resolve => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => resolve(null); reader.readAsDataURL(blob); }))
+    .catch(() => null);
+  return logoPromise;
+}
+
 export async function downloadPdfDocument(doc, filename) {
-  const [{ jsPDF }, { autoTable }] = await Promise.all([import('jspdf'), import('jspdf-autotable')]);
+  const [{ jsPDF }, { autoTable }, logo] = await Promise.all([import('jspdf'), import('jspdf-autotable'), loadLogo()]);
   const wide = doc.sections.some(s => s.columns && s.columns.length > 7);
   const pdf = new jsPDF({ orientation: wide ? 'landscape' : 'portrait', unit: 'pt', format: 'a4' });
   const pageWidth = pdf.internal.pageSize.getWidth();
@@ -52,12 +63,15 @@ export async function downloadPdfDocument(doc, filename) {
 
   // Title block
   pdf.setFillColor(...ACCENT); pdf.rect(0, 0, pageWidth, 6, 'F');
+  const logoHeight = 66;
+  if (logo) pdf.addImage(logo, 'JPEG', margin, 16, logoHeight * LOGO_RATIO, logoHeight);
+  const textX = logo ? margin + logoHeight * LOGO_RATIO + 14 : margin;
   pdf.setFont('helvetica', 'bold'); pdf.setFontSize(16); pdf.setTextColor(25, 25, 35);
-  pdf.text(BRAND, margin, 42);
+  pdf.text(BRAND, textX, 38);
   pdf.setFontSize(13); pdf.setTextColor(...ACCENT);
-  pdf.text(clean(doc.title), margin, 64);
+  pdf.text(clean(doc.title), textX, 58);
   pdf.setFont('helvetica', 'normal'); pdf.setFontSize(9); pdf.setTextColor(...MUTED);
-  pdf.text(clean(doc.subtitle ? `${doc.subtitle}   |   Generated ${generated}` : `Generated ${generated}`), margin, 80);
+  pdf.text(clean(doc.subtitle ? `${doc.subtitle}   |   Generated ${generated}` : `Generated ${generated}`), textX, 74);
   pdf.setDrawColor(220, 220, 228); pdf.line(margin, 90, pageWidth - margin, 90);
   let y = 104;
 
@@ -77,7 +91,7 @@ export async function downloadPdfDocument(doc, filename) {
       const body = [];
       for (let i = 0; i < pairs.length; i += 2) body.push([clean(pairs[i][0]), clean(pairs[i][1]), clean(pairs[i + 1]?.[0] ?? ''), clean(pairs[i + 1]?.[1] ?? '')]);
       autoTable(pdf, {
-        startY: y, margin: { left: margin, right: margin }, body, theme: 'grid',
+        startY: y, margin: { left: margin, right: margin, top: 48 }, body, theme: 'grid',
         styles: { fontSize: 9.5, cellPadding: 5, lineColor: [230, 230, 236], lineWidth: 0.5, textColor: [30, 30, 40] },
         columnStyles: { 0: { fontStyle: 'bold', textColor: MUTED, cellWidth: 'auto', fillColor: [248, 247, 252] }, 2: { fontStyle: 'bold', textColor: MUTED, fillColor: [248, 247, 252] } },
       });
@@ -91,7 +105,7 @@ export async function downloadPdfDocument(doc, filename) {
       const money = new Set(section.money || []);
       const columnStyles = Object.fromEntries([...money].map(index => [index, { halign: 'right' }]));
       autoTable(pdf, {
-        startY: y, margin: { left: margin, right: margin }, head: [section.columns.map(clean)], body: section.rows.map(row => row.map(clean)),
+        startY: y, margin: { left: margin, right: margin, top: 48 }, head: [section.columns.map(clean)], body: section.rows.map(row => row.map(clean)),
         foot: section.footer ? [section.footer.map(clean)] : undefined, showFoot: 'lastPage', theme: 'striped',
         styles: { fontSize: 8.5, cellPadding: 4, overflow: 'linebreak', textColor: [30, 30, 40] },
         headStyles: { fillColor: ACCENT, textColor: 255, fontStyle: 'bold' },
@@ -124,6 +138,7 @@ export async function downloadPdfDocument(doc, filename) {
   for (let page = 1; page <= pages; page++) {
     pdf.setPage(page);
     pdf.setFont('helvetica', 'normal'); pdf.setFontSize(8); pdf.setTextColor(...MUTED);
+    if (logo && page > 1) pdf.addImage(logo, 'JPEG', margin, 12, 26 * LOGO_RATIO, 26);
     pdf.text(`${BRAND}  |  ${clean(doc.title)}`, margin, pageHeight - 22);
     pdf.text(`Page ${page} of ${pages}`, pageWidth - margin, pageHeight - 22, { align: 'right' });
   }
