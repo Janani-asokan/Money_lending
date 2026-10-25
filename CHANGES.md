@@ -138,3 +138,9 @@ Files: server/main.py, client/src/main.jsx, client/src/styles.css
 - "Forgot password?" on the sign-in page: SMS OTP to the account's recovery mobile, then set a new password. Old sessions are revoked.
 - Settings -> Password recovery mobile (verified by OTP). `OWNER_RECOVERY_MOBILE` env var as a fallback for the owner.
 - Same reply for unknown usernames so accounts cannot be discovered; OTP 10 min, 5 attempts, single use; per-device and per-account rate limits.
+
+## Round 6 - Dashboard monthly payment status, dues filters, WhatsApp share with logo - DONE
+
+- Dashboard -> Monthly payment status: pick a month; every loan shows scheduled vs paid in that month and is marked Paid / Less paid / Not paid (Upcoming for future months), with short amount and older arrears. Filters: month, area, plan, status, search.
+- Dashboard -> Pending dues: new month, area and search filters with a total to collect.
+- Report "Share (WhatsApp)" now shares a PDF with the logo (phone share sheet); receipts have a Share button too. On computers the PDF is downloaded to attach.

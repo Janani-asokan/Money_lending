@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import * as Icons from 'lucide-react';
 import './styles.css';
-import { downloadPdfDocument, kfsDocument, loanHistoryDocument, reportDocument } from './pdf.js';
+import { downloadPdfDocument, kfsDocument, loanHistoryDocument, receiptDocument, reportDocument, sharePdfDocument } from './pdf.js';
 
 const API = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 const IS_DEMO = import.meta.env.VITE_SHOW_DEMO_ACCOUNTS === 'true';
@@ -28,6 +28,7 @@ const EyeOff = Icons.EyeOff || FallbackIcon;
 const FileBarChart2 = Icons.FileBarChart2 || Icons.FileChartColumn || Icons.FileText || FallbackIcon;
 const FileText = Icons.FileText || FallbackIcon;
 const Globe2 = Icons.Globe2 || Icons.Globe || FallbackIcon;
+const Share2 = Icons.Share2 || Icons.Share || FallbackIcon;
 const LayoutDashboard = Icons.LayoutDashboard || Icons.Gauge || FallbackIcon;
 const LockKeyhole = Icons.LockKeyhole || Icons.Lock || FallbackIcon;
 const LogOut = Icons.LogOut || FallbackIcon;
@@ -459,9 +460,65 @@ function Login({ t, setUser, api, theme, setTheme, lang, setLang }) {
   );
 }
 
+function monthLabel(key) {
+  const [year, month] = key.split('-').map(Number);
+  return new Date(year, month - 1, 1).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
+}
+
+function MonthlyPaymentStatus({ api, areas, onOpenCustomer, viewer }) {
+  const [month, setMonth] = useState(() => indiaDayKey(new Date().toISOString()).slice(0, 7));
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+  const [status, setStatus] = useState('All');
+  const [area, setArea] = useState('');
+  const [plan, setPlan] = useState('');
+  const [search, setSearch] = useState('');
+  useEffect(() => {
+    let live = true; setError('');
+    api(`/api/dashboard/monthly-status?month=${month}`).then(result => { if (live) setData(result); }).catch(err => { if (live) setError(err.message); });
+    return () => { live = false; };
+  }, [month]);
+  const text = search.trim().toLowerCase();
+  const inScope = (data?.rows || []).filter(r => (!area || r.area === area) && (!plan || r.frequency === plan)
+    && (!text || [r.customer_name, r.customer_id, r.loan_id, r.mobile].some(v => String(v || '').toLowerCase().includes(text))));
+  const rows = inScope.filter(r => status === 'All' || r.status === status);
+  const count = name => inScope.filter(r => r.status === name).length;
+  const sum = key => rows.reduce((total, r) => total + Number(r[key] || 0), 0);
+  const options = ['All', 'Paid', 'Less paid', 'Not paid', ...(count('Upcoming') ? ['Upcoming'] : [])];
+  return (
+    <section className="panel full">
+      <div className="panel-head"><h2>Monthly payment status</h2><span>Paid this month compared with what was scheduled{data ? ` (dues up to ${day(data.due_until)})` : ''}</span></div>
+      <div className="loan-filters">
+        <input type="month" aria-label="Month" value={month} onChange={e => e.target.value && setMonth(e.target.value)} />
+        <select aria-label="Area" value={area} onChange={e => setArea(e.target.value)}><option value="">All areas</option>{areas.map(a => <option key={a.area} value={a.area}>{a.name}</option>)}</select>
+        <select aria-label="Plan" value={plan} onChange={e => setPlan(e.target.value)}><option value="">All plans</option><option>Daily</option><option>Weekly</option><option>Monthly</option></select>
+        <div className="searchbox"><Search size={16} /><input aria-label="Search monthly status" placeholder="Customer, ID, loan or mobile" value={search} onChange={e => setSearch(e.target.value)} /></div>
+      </div>
+      <div className="segmented-control status-tabs">{options.map(option => <button key={option} className={status === option ? 'active' : ''} onClick={() => setStatus(option)}>{option}{option !== 'All' ? ` (${count(option)})` : ` (${inScope.length})`}</button>)}</div>
+      {error && <div className="error" role="alert">{error}</div>}
+      {!data && !error ? <Skeleton /> : data && <>
+        <div className="filter-summary">Scheduled {money(sum('scheduled'))} · Paid {money(sum('paid_in_month'))} · Short {money(sum('short'))}</div>
+        {rows.length ? <div className="table-scroll"><table><thead><tr><th>Customer</th><th>Area</th><th>Plan</th><th>Dues in month</th><th>Scheduled</th><th>Paid in month</th><th>Short</th><th>Older arrears</th><th>Status</th></tr></thead><tbody>
+          {rows.map(r => <tr key={r.loan_id}>
+            <td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(r.customer_id)}>{r.customer_name}</button> : r.customer_name}<small>{r.customer_id} · {r.mobile}</small></td>
+            <td>{r.area_name || '—'}</td>
+            <td>{r.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(r.loan_id)}>{r.loan_id}</button></small></td>
+            <td>{r.instalments_due}</td><td>{money(r.scheduled)}</td><td>{money(r.paid_in_month)}</td>
+            <td>{r.short > 0 ? <strong>{money(r.short)}</strong> : '—'}</td><td>{r.old_arrears > 0 ? money(r.old_arrears) : '—'}</td>
+            <td><Status value={r.status} /></td>
+          </tr>)}
+        </tbody></table></div> : <div className="locked-note">No loans match these filters for {monthLabel(month)}.</div>}
+      </>}
+    </section>
+  );
+}
+
 function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
   const [data, setData] = useState(null);
   const [dueFilter, setDueFilter] = useState('All');
+  const [dueArea, setDueArea] = useState('');
+  const [dueMonth, setDueMonth] = useState('');
+  const [dueSearch, setDueSearch] = useState('');
   const [loadError, setLoadError] = useState('');
   const load = () => api('/api/dashboard').then(result => { setData(result); setLoadError(''); }).catch(err => setLoadError(err.message));
   const viewer = useLoanViewer({ api, notify, user, onChanged: load });
@@ -471,7 +528,12 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
   const totals = data.totals;
   const expectedCollection = Math.round(totals.monthly_collection + totals.outstanding * 0.06);
   const collectionRate = Math.min(100, Math.round((totals.monthly_collection / Math.max(expectedCollection, 1)) * 100));
-  const visibleDues = (data.pending_dues || []).filter(d => dueFilter === 'All' || dueFilter === 'Overdue' ? (dueFilter === 'All' || d.overdue) : d.frequency === dueFilter);
+  const dueText = dueSearch.trim().toLowerCase();
+  const visibleDues = (data.pending_dues || []).filter(d => (dueFilter === 'All' || (dueFilter === 'Overdue' ? d.overdue : d.frequency === dueFilter))
+    && (!dueArea || d.area === dueArea) && (!dueMonth || indiaDayKey(d.next_due_date).slice(0, 7) === dueMonth)
+    && (!dueText || [d.customer_name, d.customer_id, d.loan_id, d.mobile].some(v => String(v || '').toLowerCase().includes(dueText))));
+  const dueMonths = [...new Set((data.pending_dues || []).map(d => indiaDayKey(d.next_due_date).slice(0, 7)))].sort();
+  const dueTotal = visibleDues.reduce((sum, d) => sum + Number(d.amount_due || 0), 0);
   const collectibleAreas = data.area_summary.filter(area => area.outstanding > 0 || area.customer_dues.length > 0);
   return (
     <div className="content-grid">
@@ -510,8 +572,16 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
       <section className="panel full">
         <div className="panel-head"><h2>Pending dues</h2><span>Nearest due first across every client plan</span></div>
         <div className="segmented-control five">{['All','Daily','Weekly','Monthly','Overdue'].map(option=><button key={option} className={dueFilter===option?'active':''} onClick={()=>setDueFilter(option)}>{option}</button>)}</div>
+        <div className="loan-filters">
+          <div className="searchbox"><Search size={16} /><input aria-label="Search pending dues" placeholder="Customer, ID, loan or mobile" value={dueSearch} onChange={e => setDueSearch(e.target.value)} /></div>
+          <select aria-label="Due month" value={dueMonth} onChange={e => setDueMonth(e.target.value)}><option value="">All months</option>{dueMonths.map(m => <option key={m} value={m}>{monthLabel(m)}</option>)}</select>
+          <select aria-label="Area" value={dueArea} onChange={e => setDueArea(e.target.value)}><option value="">All areas</option>{data.area_summary.map(a => <option key={a.area} value={a.area}>{a.name}</option>)}</select>
+          {(dueSearch || dueMonth || dueArea || dueFilter !== 'All') && <button type="button" className="ghost" onClick={() => { setDueSearch(''); setDueMonth(''); setDueArea(''); setDueFilter('All'); }}>Clear</button>}
+        </div>
+        <div className="filter-summary">{visibleDues.length} due{visibleDues.length === 1 ? '' : 's'} · {money(dueTotal)} to collect</div>
         <div className="table-scroll"><table><thead><tr><th>Due date</th><th>Client</th><th>Plan</th><th>Installment</th><th>Amount due</th><th>Plan balance</th><th>Status</th></tr></thead><tbody>{visibleDues.map(d=><tr key={`${d.loan_id}-${d.installment_number}`}><td>{day(d.next_due_date)}</td><td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(d.customer_id)}>{d.customer_name}</button> : d.customer_name}<small>{d.customer_id} · {d.mobile}</small></td><td>{d.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(d.loan_id)}>{d.loan_id}</button></small></td><td>#{d.installment_number}</td><td>{money(d.amount_due)}</td><td>{money(d.plan_balance)}</td><td><Status value={d.overdue ? `Overdue ${d.days_overdue}d` : 'Upcoming'} /></td></tr>)}</tbody></table></div>
       </section>
+      <MonthlyPaymentStatus api={api} areas={data.area_summary} onOpenCustomer={onOpenCustomer} viewer={viewer} />
       <section className="panel wide area-performance">
         <div className="panel-head"><h2>Areas requiring collection</h2><span>Click an area, then click a customer for their complete profile</span></div>
         {collectibleAreas.length ? <div className="area-drilldowns">{collectibleAreas.map(area => <details key={area.area}><summary>{area.name || area.area} — {area.customers_with_dues} customers to collect · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.map(item => <tr key={item.loan_id}><td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(item.customer_id)}>{item.customer_name}</button> : item.customer_name}<small>{item.customer_id}</small></td><td>{item.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(item.loan_id)}>{item.loan_id}</button></small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? day(item.next_due_date) : 'Completed'}</td></tr>)}</tbody></table></div></details>)}</div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No area requires collection</strong><span>All active balances are clear.</span></div>}
@@ -1622,7 +1692,7 @@ function Reports({ api }) {
           <button className="ghost" disabled={!report} onClick={() => downloadExcel(report, filename)}><FileText size={16} /> Excel</button>
           <button className="ghost" disabled={!report} onClick={() => downloadPdfDocument(reportDocument(report, { collectors: collectorNames }), filename).catch(err => setError(err.message || 'PDF could not be created.'))}><FileBarChart2 size={16} /> PDF</button>
           <button className="ghost" disabled={!report} onClick={() => window.print()}><Printer size={16} /> Print</button>
-          <button className="ghost" disabled={!report} onClick={() => shareReport(report, filename)}><Globe2 size={16} /> Share</button>
+          <button className="ghost" disabled={!report} onClick={() => sharePdfDocument(reportDocument(report, { collectors: collectorNames }), filename).catch(err => setError(err.message || 'PDF could not be shared.'))}><Share2 size={16} /> Share (WhatsApp)</button>
           <a className={`ghost ${!report ? 'disabled' : ''}`} href={report ? `mailto:?subject=${encodeURIComponent(report.title)}&body=${encodeURIComponent(reportSummary(report))}` : undefined}><Bell size={16} /> Email</a>
         </div>
       </section>
@@ -2164,6 +2234,15 @@ function ReceiptHeader({ subtitle }) {
 }
 
 function ReceiptModal({ title, data, onClose }) {
+  const [shareNote, setShareNote] = useState('');
+  async function share() {
+    setShareNote('');
+    try {
+      const name = `Receipt-${data.receipt_no || data.ack || 'payment'}`;
+      const result = await sharePdfDocument(receiptDocument(title, data), name, `${title} from Sri Sakthi Thirumurugan Finance${data.amount ? `: ${money(data.amount)} received` : ''}.`);
+      if (result === 'downloaded') setShareNote('Receipt PDF downloaded. Attach it in WhatsApp to send it to the customer.');
+    } catch (err) { setShareNote(err.message || 'Receipt could not be shared.'); }
+  }
   return (
     <div className="modal-backdrop">
       <div className="modal">
@@ -2181,7 +2260,11 @@ function ReceiptModal({ title, data, onClose }) {
           </dl>
           <div className="signature-row"><span>Customer signature</span><span>Company seal</span></div>
         </div>
-        <button className="primary" onClick={() => window.print()}><Printer size={18} /> Print / save PDF</button>
+        {shareNote && <div className="locked-note" role="status">{shareNote}</div>}
+        <div className="receipt-actions">
+          <button className="primary" onClick={() => window.print()}><Printer size={18} /> Print / save PDF</button>
+          <button className="ghost" onClick={share}><Share2 size={18} /> Share (WhatsApp)</button>
+        </div>
       </div>
     </div>
   );
@@ -2287,10 +2370,5 @@ function downloadExcel(report, filename) {
 
 
 function reportSummary(report) { return `${report.title || 'Business report'}\n\n${JSON.stringify(report, null, 2).slice(0, 1800)}`; }
-async function shareReport(report, filename) {
-  const file = new File([csvText(report)], `${filename}.csv`, { type: 'text/csv' });
-  if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))) await navigator.share({ title: report.title, text: 'Finance report', files: [file] });
-  else downloadCsv(report, filename);
-}
 
 createRoot(document.getElementById('root')).render(<App />);

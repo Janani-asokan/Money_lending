@@ -52,7 +52,7 @@ function loadLogo() {
   return logoPromise;
 }
 
-export async function downloadPdfDocument(doc, filename) {
+async function buildPdf(doc) {
   const [{ jsPDF }, { autoTable }, logo] = await Promise.all([import('jspdf'), import('jspdf-autotable'), loadLogo()]);
   const wide = doc.sections.some(s => s.columns && s.columns.length > 7);
   const pdf = new jsPDF({ orientation: wide ? 'landscape' : 'portrait', unit: 'pt', format: 'a4' });
@@ -142,7 +142,47 @@ export async function downloadPdfDocument(doc, filename) {
     pdf.text(`${BRAND}  |  ${clean(doc.title)}`, margin, pageHeight - 22);
     pdf.text(`Page ${page} of ${pages}`, pageWidth - margin, pageHeight - 22, { align: 'right' });
   }
+  return pdf;
+}
+
+export async function downloadPdfDocument(doc, filename) {
+  (await buildPdf(doc)).save(`${filename}.pdf`);
+}
+
+// Opens the phone's share sheet (WhatsApp, email, ...) with the PDF attached.
+// Where sharing files is not supported (most desktops) the PDF is downloaded instead; returns 'shared' | 'downloaded' | 'cancelled'.
+export async function sharePdfDocument(doc, filename, message) {
+  const pdf = await buildPdf(doc);
+  const file = new File([pdf.output('blob')], `${filename}.pdf`, { type: 'application/pdf' });
+  if (navigator.share && navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: clean(doc.title), text: message || `${BRAND} - ${clean(doc.title)}` });
+      return 'shared';
+    } catch (err) {
+      if (err?.name === 'AbortError') return 'cancelled';
+    }
+  }
   pdf.save(`${filename}.pdf`);
+  return 'downloaded';
+}
+
+// ---------- Payment receipt ----------
+export function receiptDocument(title, data) {
+  return {
+    title,
+    subtitle: data.receipt_no || data.ack || '',
+    sections: [{ heading: 'Details', pairs: [
+      ['Reference', data.ack || data.receipt_no],
+      ['Customer', [data.customer?.customer_id, data.customer?.name].filter(Boolean).join(' - ')],
+      ['Loan', data.loan?.loan_id],
+      ['Balance after payment', data.loan ? rs(data.loan.balance) : undefined],
+      ['Amount', data.amount ? `${rs(data.amount)} via ${data.mode || ''}` : undefined],
+      ['Reference ID', data.payment_reference],
+      ['Collector', data.collector],
+      ['Date & time', dateTimeText(data.timestamp || new Date().toISOString())],
+    ] }],
+    signatures: ['Customer signature', 'For ' + BRAND],
+  };
 }
 
 const planName = type => (type === 'Daily 100-Day' ? 'Daily' : type === 'Weekly' ? 'Weekly' : type === 'Monthly EMI' ? 'Monthly' : type || '-');
