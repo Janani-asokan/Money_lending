@@ -144,3 +144,13 @@ Files: server/main.py, client/src/main.jsx, client/src/styles.css
 - Dashboard -> Monthly payment status: pick a month; every loan shows scheduled vs paid in that month and is marked Paid / Less paid / Not paid (Upcoming for future months), with short amount and older arrears. Filters: month, area, plan, status, search.
 - Dashboard -> Pending dues: new month, area and search filters with a total to collect.
 - Report "Share (WhatsApp)" now shares a PDF with the logo (phone share sheet); receipts have a Share button too. On computers the PDF is downloaded to attach.
+
+## Round 7 - Final client changes - DONE
+
+- Dashboard status updates instantly after a payment (refreshes after every change, when the window is focused, and every minute).
+- Monthly status compares the whole month's scheduled amount with what was paid that month: Paid / Less paid / Not paid; "Not paid" only once an instalment date has passed (otherwise "Upcoming").
+- Existing loans are tracked only from the day they were entered; the amount already repaid counts as paid, so they are not marked Not paid.
+- "Older arrears" column removed.
+- Pending dues now lists only the chosen month's Not paid and Less paid customers, with due date, days late, balance to pay and filters (month, area, plan, search, status).
+- Customer 360: full customer details (father's name, mobile, address, area, guarantor, Aadhaar, registered on) and a customer search bar instead of the drop-down.
+- Customers page: "Edit an existing customer" uses the same search bar instead of the drop-down.

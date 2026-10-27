@@ -465,49 +465,115 @@ function monthLabel(key) {
   return new Date(year, month - 1, 1).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
 }
 
-function MonthlyPaymentStatus({ api, areas, onOpenCustomer, viewer }) {
+// Shared by "Pending dues" and "Monthly payment status": one month, one fetch, refreshed after every change.
+function useMonthlyStatus(api) {
   const [month, setMonth] = useState(() => indiaDayKey(new Date().toISOString()).slice(0, 7));
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
-  const [status, setStatus] = useState('All');
+  const latest = React.useRef(0);
+  const apiRef = React.useRef(api);
+  apiRef.current = api;
+  const reload = React.useCallback(() => {
+    const ticket = ++latest.current;
+    return apiRef.current(`/api/dashboard/monthly-status?month=${month}`)
+      .then(result => { if (ticket === latest.current) { setData(result); setError(''); } })
+      .catch(err => { if (ticket === latest.current) setError(err.message); });
+  }, [month]);
+  useEffect(() => { reload(); }, [reload]);
+  // Pick up payments recorded on another device or tab as soon as this screen is looked at again.
+  useEffect(() => {
+    const refresh = () => { if (document.visibilityState === 'visible') reload(); };
+    window.addEventListener('focus', refresh); document.addEventListener('visibilitychange', refresh);
+    const timer = setInterval(refresh, 60000);
+    return () => { window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', refresh); clearInterval(timer); };
+  }, [reload]);
+  return { month, setMonth, data: data?.month === month ? data : null, error, reload };
+}
+
+function useRowFilters(rows) {
   const [area, setArea] = useState('');
   const [plan, setPlan] = useState('');
   const [search, setSearch] = useState('');
-  useEffect(() => {
-    let live = true; setError('');
-    api(`/api/dashboard/monthly-status?month=${month}`).then(result => { if (live) setData(result); }).catch(err => { if (live) setError(err.message); });
-    return () => { live = false; };
-  }, [month]);
   const text = search.trim().toLowerCase();
-  const inScope = (data?.rows || []).filter(r => (!area || r.area === area) && (!plan || r.frequency === plan)
+  const filtered = rows.filter(r => (!area || r.area === area) && (!plan || r.frequency === plan)
     && (!text || [r.customer_name, r.customer_id, r.loan_id, r.mobile].some(v => String(v || '').toLowerCase().includes(text))));
-  const rows = inScope.filter(r => status === 'All' || r.status === status);
-  const count = name => inScope.filter(r => r.status === name).length;
+  const active = Boolean(area || plan || search);
+  return { area, setArea, plan, setPlan, search, setSearch, filtered, active, clear: () => { setArea(''); setPlan(''); setSearch(''); } };
+}
+
+function MonthFilters({ monthly, areas, filters, label }) {
+  return <div className="loan-filters">
+    <input type="month" aria-label="Month" value={monthly.month} onChange={e => e.target.value && monthly.setMonth(e.target.value)} />
+    <select aria-label="Area" value={filters.area} onChange={e => filters.setArea(e.target.value)}><option value="">All areas</option>{areas.map(a => <option key={a.area} value={a.area}>{a.name}</option>)}</select>
+    <select aria-label="Plan" value={filters.plan} onChange={e => filters.setPlan(e.target.value)}><option value="">All plans</option><option>Daily</option><option>Weekly</option><option>Monthly</option></select>
+    <div className="searchbox"><Search size={16} /><input aria-label={label} placeholder="Customer, ID, loan or mobile" value={filters.search} onChange={e => filters.setSearch(e.target.value)} /></div>
+    {filters.active && <button type="button" className="ghost" onClick={filters.clear}>Clear</button>}
+  </div>;
+}
+
+function CustomerCell({ row, onOpenCustomer }) {
+  return <td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(row.customer_id)}>{row.customer_name}</button> : row.customer_name}<small>{row.customer_id} · {row.mobile}</small></td>;
+}
+
+function PlanCell({ row, viewer }) {
+  return <td>{row.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(row.loan_id)}>{row.loan_id}</button></small></td>;
+}
+
+function PendingDues({ monthly, areas, onOpenCustomer, viewer }) {
+  const unpaid = (monthly.data?.rows || []).filter(r => r.status === 'Not paid' || r.status === 'Less paid');
+  const filters = useRowFilters(unpaid);
+  const [status, setStatus] = useState('All');
+  const rows = filters.filtered.filter(r => status === 'All' || r.status === status);
+  const count = name => filters.filtered.filter(r => r.status === name).length;
+  const total = rows.reduce((sum, r) => sum + Number(r.short || 0), 0);
+  return (
+    <section className="panel full">
+      <div className="panel-head"><h2>Pending dues</h2><span>Customers who have not paid, or paid less, for {monthLabel(monthly.month)}</span></div>
+      <MonthFilters monthly={monthly} areas={areas} filters={filters} label="Search pending dues" />
+      <div className="segmented-control status-tabs">{[['All', `All pending (${filters.filtered.length})`], ['Not paid', `Not paid (${count('Not paid')})`], ['Less paid', `Less paid (${count('Less paid')})`]].map(([key, text]) => <button key={key} className={status === key ? 'active' : ''} onClick={() => setStatus(key)}>{text}</button>)}</div>
+      {monthly.error && <div className="error" role="alert">{monthly.error}</div>}
+      {!monthly.data && !monthly.error ? <Skeleton /> : monthly.data && <>
+        <div className="filter-summary">{rows.length} customer{rows.length === 1 ? '' : 's'} · {money(total)} still to collect</div>
+        {rows.length ? <div className="table-scroll"><table><thead><tr><th>Due date</th><th>Customer</th><th>Area</th><th>Plan</th><th>Scheduled</th><th>Paid</th><th>Balance to pay</th><th>Status</th></tr></thead><tbody>
+          {rows.map(r => <tr key={r.loan_id}>
+            <td>{r.next_due_date ? day(`${r.next_due_date}T12:00:00+05:30`) : '—'}{r.days_overdue > 0 && <small className="late-note">{r.days_overdue} day{r.days_overdue === 1 ? '' : 's'} late</small>}</td>
+            <CustomerCell row={r} onOpenCustomer={onOpenCustomer} />
+            <td>{r.area_name || '—'}</td>
+            <PlanCell row={r} viewer={viewer} />
+            <td>{money(r.scheduled)}</td><td>{money(r.paid_in_month)}</td><td><strong>{money(r.short)}</strong></td>
+            <td><Status value={r.status} /></td>
+          </tr>)}
+        </tbody></table></div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No pending dues</strong><span>Everyone matching these filters has paid in full for {monthLabel(monthly.month)}.</span></div>}
+      </>}
+    </section>
+  );
+}
+
+function MonthlyPaymentStatus({ monthly, areas, onOpenCustomer, viewer }) {
+  const filters = useRowFilters(monthly.data?.rows || []);
+  const [status, setStatus] = useState('All');
+  const rows = filters.filtered.filter(r => status === 'All' || r.status === status);
+  const count = name => filters.filtered.filter(r => r.status === name).length;
   const sum = key => rows.reduce((total, r) => total + Number(r[key] || 0), 0);
   const options = ['All', 'Paid', 'Less paid', 'Not paid', ...(count('Upcoming') ? ['Upcoming'] : [])];
   return (
     <section className="panel full">
-      <div className="panel-head"><h2>Monthly payment status</h2><span>Paid this month compared with what was scheduled{data ? ` (dues up to ${day(data.due_until)})` : ''}</span></div>
-      <div className="loan-filters">
-        <input type="month" aria-label="Month" value={month} onChange={e => e.target.value && setMonth(e.target.value)} />
-        <select aria-label="Area" value={area} onChange={e => setArea(e.target.value)}><option value="">All areas</option>{areas.map(a => <option key={a.area} value={a.area}>{a.name}</option>)}</select>
-        <select aria-label="Plan" value={plan} onChange={e => setPlan(e.target.value)}><option value="">All plans</option><option>Daily</option><option>Weekly</option><option>Monthly</option></select>
-        <div className="searchbox"><Search size={16} /><input aria-label="Search monthly status" placeholder="Customer, ID, loan or mobile" value={search} onChange={e => setSearch(e.target.value)} /></div>
-      </div>
-      <div className="segmented-control status-tabs">{options.map(option => <button key={option} className={status === option ? 'active' : ''} onClick={() => setStatus(option)}>{option}{option !== 'All' ? ` (${count(option)})` : ` (${inScope.length})`}</button>)}</div>
-      {error && <div className="error" role="alert">{error}</div>}
-      {!data && !error ? <Skeleton /> : data && <>
-        <div className="filter-summary">Scheduled {money(sum('scheduled'))} · Paid {money(sum('paid_in_month'))} · Short {money(sum('short'))}</div>
-        {rows.length ? <div className="table-scroll"><table><thead><tr><th>Customer</th><th>Area</th><th>Plan</th><th>Dues in month</th><th>Scheduled</th><th>Paid in month</th><th>Short</th><th>Older arrears</th><th>Status</th></tr></thead><tbody>
+      <div className="panel-head"><h2>Monthly payment status</h2><span>Paid in {monthLabel(monthly.month)} compared with what was scheduled for the month</span></div>
+      <MonthFilters monthly={monthly} areas={areas} filters={filters} label="Search monthly status" />
+      <div className="segmented-control status-tabs">{options.map(option => <button key={option} className={status === option ? 'active' : ''} onClick={() => setStatus(option)}>{option} ({option === 'All' ? filters.filtered.length : count(option)})</button>)}</div>
+      {monthly.error && <div className="error" role="alert">{monthly.error}</div>}
+      {!monthly.data && !monthly.error ? <Skeleton /> : monthly.data && <>
+        <div className="filter-summary">Scheduled {money(sum('scheduled'))} · Paid {money(sum('paid_in_month'))} · Balance {money(sum('short'))}</div>
+        {rows.length ? <div className="table-scroll"><table><thead><tr><th>Customer</th><th>Area</th><th>Plan</th><th>Dues in month</th><th>Scheduled</th><th>Paid in month</th><th>Balance</th><th>Status</th></tr></thead><tbody>
           {rows.map(r => <tr key={r.loan_id}>
-            <td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(r.customer_id)}>{r.customer_name}</button> : r.customer_name}<small>{r.customer_id} · {r.mobile}</small></td>
+            <CustomerCell row={r} onOpenCustomer={onOpenCustomer} />
             <td>{r.area_name || '—'}</td>
-            <td>{r.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(r.loan_id)}>{r.loan_id}</button></small></td>
+            <PlanCell row={r} viewer={viewer} />
             <td>{r.instalments_due}</td><td>{money(r.scheduled)}</td><td>{money(r.paid_in_month)}</td>
-            <td>{r.short > 0 ? <strong>{money(r.short)}</strong> : '—'}</td><td>{r.old_arrears > 0 ? money(r.old_arrears) : '—'}</td>
+            <td>{r.short > 0 ? <strong>{money(r.short)}</strong> : '—'}</td>
             <td><Status value={r.status} /></td>
           </tr>)}
-        </tbody></table></div> : <div className="locked-note">No loans match these filters for {monthLabel(month)}.</div>}
+        </tbody></table></div> : <div className="locked-note">No loans match these filters for {monthLabel(monthly.month)}.</div>}
       </>}
     </section>
   );
@@ -515,12 +581,9 @@ function MonthlyPaymentStatus({ api, areas, onOpenCustomer, viewer }) {
 
 function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
   const [data, setData] = useState(null);
-  const [dueFilter, setDueFilter] = useState('All');
-  const [dueArea, setDueArea] = useState('');
-  const [dueMonth, setDueMonth] = useState('');
-  const [dueSearch, setDueSearch] = useState('');
   const [loadError, setLoadError] = useState('');
-  const load = () => api('/api/dashboard').then(result => { setData(result); setLoadError(''); }).catch(err => setLoadError(err.message));
+  const monthly = useMonthlyStatus(api);
+  const load = () => { monthly.reload(); return api('/api/dashboard').then(result => { setData(result); setLoadError(''); }).catch(err => setLoadError(err.message)); };
   const viewer = useLoanViewer({ api, notify, user, onChanged: load });
   useEffect(() => { load(); }, []);
   if (!data && loadError) return <section className="panel"><div className="error" role="alert">{loadError}</div><button className="primary" onClick={load}>Retry</button></section>;
@@ -528,12 +591,6 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
   const totals = data.totals;
   const expectedCollection = Math.round(totals.monthly_collection + totals.outstanding * 0.06);
   const collectionRate = Math.min(100, Math.round((totals.monthly_collection / Math.max(expectedCollection, 1)) * 100));
-  const dueText = dueSearch.trim().toLowerCase();
-  const visibleDues = (data.pending_dues || []).filter(d => (dueFilter === 'All' || (dueFilter === 'Overdue' ? d.overdue : d.frequency === dueFilter))
-    && (!dueArea || d.area === dueArea) && (!dueMonth || indiaDayKey(d.next_due_date).slice(0, 7) === dueMonth)
-    && (!dueText || [d.customer_name, d.customer_id, d.loan_id, d.mobile].some(v => String(v || '').toLowerCase().includes(dueText))));
-  const dueMonths = [...new Set((data.pending_dues || []).map(d => indiaDayKey(d.next_due_date).slice(0, 7)))].sort();
-  const dueTotal = visibleDues.reduce((sum, d) => sum + Number(d.amount_due || 0), 0);
   const collectibleAreas = data.area_summary.filter(area => area.outstanding > 0 || area.customer_dues.length > 0);
   return (
     <div className="content-grid">
@@ -569,19 +626,8 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
         <Donut daily={data.split.daily} monthly={data.split.monthly} />
         <div className="locked-note">Weekly plans: {data.split.weekly || 0}</div>
       </section>
-      <section className="panel full">
-        <div className="panel-head"><h2>Pending dues</h2><span>Nearest due first across every client plan</span></div>
-        <div className="segmented-control five">{['All','Daily','Weekly','Monthly','Overdue'].map(option=><button key={option} className={dueFilter===option?'active':''} onClick={()=>setDueFilter(option)}>{option}</button>)}</div>
-        <div className="loan-filters">
-          <div className="searchbox"><Search size={16} /><input aria-label="Search pending dues" placeholder="Customer, ID, loan or mobile" value={dueSearch} onChange={e => setDueSearch(e.target.value)} /></div>
-          <select aria-label="Due month" value={dueMonth} onChange={e => setDueMonth(e.target.value)}><option value="">All months</option>{dueMonths.map(m => <option key={m} value={m}>{monthLabel(m)}</option>)}</select>
-          <select aria-label="Area" value={dueArea} onChange={e => setDueArea(e.target.value)}><option value="">All areas</option>{data.area_summary.map(a => <option key={a.area} value={a.area}>{a.name}</option>)}</select>
-          {(dueSearch || dueMonth || dueArea || dueFilter !== 'All') && <button type="button" className="ghost" onClick={() => { setDueSearch(''); setDueMonth(''); setDueArea(''); setDueFilter('All'); }}>Clear</button>}
-        </div>
-        <div className="filter-summary">{visibleDues.length} due{visibleDues.length === 1 ? '' : 's'} · {money(dueTotal)} to collect</div>
-        <div className="table-scroll"><table><thead><tr><th>Due date</th><th>Client</th><th>Plan</th><th>Installment</th><th>Amount due</th><th>Plan balance</th><th>Status</th></tr></thead><tbody>{visibleDues.map(d=><tr key={`${d.loan_id}-${d.installment_number}`}><td>{day(d.next_due_date)}</td><td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(d.customer_id)}>{d.customer_name}</button> : d.customer_name}<small>{d.customer_id} · {d.mobile}</small></td><td>{d.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(d.loan_id)}>{d.loan_id}</button></small></td><td>#{d.installment_number}</td><td>{money(d.amount_due)}</td><td>{money(d.plan_balance)}</td><td><Status value={d.overdue ? `Overdue ${d.days_overdue}d` : 'Upcoming'} /></td></tr>)}</tbody></table></div>
-      </section>
-      <MonthlyPaymentStatus api={api} areas={data.area_summary} onOpenCustomer={onOpenCustomer} viewer={viewer} />
+      <PendingDues monthly={monthly} areas={data.area_summary} onOpenCustomer={onOpenCustomer} viewer={viewer} />
+      <MonthlyPaymentStatus monthly={monthly} areas={data.area_summary} onOpenCustomer={onOpenCustomer} viewer={viewer} />
       <section className="panel wide area-performance">
         <div className="panel-head"><h2>Areas requiring collection</h2><span>Click an area, then click a customer for their complete profile</span></div>
         {collectibleAreas.length ? <div className="area-drilldowns">{collectibleAreas.map(area => <details key={area.area}><summary>{area.name || area.area} — {area.customers_with_dues} customers to collect · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.map(item => <tr key={item.loan_id}><td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(item.customer_id)}>{item.customer_name}</button> : item.customer_name}<small>{item.customer_id}</small></td><td>{item.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(item.loan_id)}>{item.loan_id}</button></small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? day(item.next_due_date) : 'Completed'}</td></tr>)}</tbody></table></div></details>)}</div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No area requires collection</strong><span>All active balances are clear.</span></div>}
@@ -644,6 +690,26 @@ function CustomerPicker({ customers, value, onChange }) {
       {selected
         ? <div className="locked-note"><CheckCircle2 size={16} /> Selected: <strong>{selected.name}</strong> · {selected.customer_id} · {selected.mobile} · {selected.status}</div>
         : <div className="locked-note"><AlertTriangle size={16} /> No customer selected. Type a name or mobile number and choose from the list.</div>}
+    </div>
+  );
+}
+
+// One search box: type a name, customer ID, mobile, Aadhaar last 4 or area, then pick from the list.
+function CustomerSearch({ customers, onSelect, label = 'Search customer', placeholder = 'Type name, customer ID, mobile or area…' }) {
+  const [query, setQuery] = useState('');
+  const text = query.trim().toLowerCase();
+  const matches = useMemo(() => !text ? [] : customers.filter(c => [c.name, c.customer_id, c.mobile, c.aadhaar_last4, c.area_name, c.area_code, c.father_name]
+    .some(v => String(v || '').toLowerCase().includes(text))).slice(0, 8), [customers, text]);
+  function choose(customer) { setQuery(''); onSelect(customer); }
+  return (
+    <div className="customer-search">
+      <div className="searchbox"><Search size={18} /><input aria-label={label} value={query} placeholder={placeholder} onChange={e => setQuery(e.target.value)}
+        onKeyDown={e => { if (e.key === 'Enter' && matches.length) { e.preventDefault(); choose(matches[0]); } if (e.key === 'Escape') setQuery(''); }} /></div>
+      {text && <div className="customer-search-results" role="listbox" aria-label="Matching customers">
+        {matches.length ? matches.map(c => <button type="button" role="option" key={c.customer_id} onClick={() => choose(c)}>
+          <span><strong>{c.name}</strong><small>{c.customer_id} · {c.mobile}{c.area_name ? ` · ${c.area_name}` : ''}</small></span><ChevronRight size={16} />
+        </button>) : <div className="customer-search-empty">No customer matches “{query.trim()}”.</div>}
+      </div>}
     </div>
   );
 }
@@ -926,7 +992,7 @@ function Customers({ api, user, notify }) {
   async function viewApproved(r) { const result = await api(`/api/customers/${r.customer_id}/aadhaar?access_request_id=${encodeURIComponent(r.request_id)}`); setFullAadhaar(current=>({...current,[r.customer_id]:result.aadhaar})); window.setTimeout(()=>setFullAadhaar(current=>({...current,[r.customer_id]:undefined})),15000); await load(); }
   return (
     <div className="split-layout">
-      {['owner','manager'].includes(user.role) && <section className="panel full customer-editor"><div className="panel-head"><div><span className="section-kicker">Customer corrections</span><h2>Edit an existing customer</h2></div><select aria-label="Select customer to edit" value={editCandidate?.customer_id || ''} onChange={e=>setEditCandidate(rows.find(row=>row.customer_id===e.target.value) || null)}><option value="">Select customer</option>{rows.map(row=><option key={row.customer_id} value={row.customer_id}>{row.name} · {row.customer_id}</option>)}</select></div>{editCandidate && <form onSubmit={saveCustomerEdit}><div className="two-col"><label>Name<input required minLength="2" value={editCandidate.name} onChange={e=>setEditCandidate({...editCandidate,name:e.target.value})}/></label><label>Father's name<input required minLength="2" value={editCandidate.father_name} onChange={e=>setEditCandidate({...editCandidate,father_name:e.target.value})}/></label><label>Mobile<input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" value={editCandidate.mobile} onChange={e=>setEditCandidate({...editCandidate,mobile:e.target.value.replace(/\D/g,'').slice(0,10)})}/></label><label>Area<select value={editCandidate.area_code || editCandidate.area} onChange={e=>setEditCandidate({...editCandidate,area_code:e.target.value})}>{areas.map(a=><option key={a.code} value={a.code}>{a.name}</option>)}</select></label></div><label>Address<textarea required minLength="5" value={editCandidate.address} onChange={e=>setEditCandidate({...editCandidate,address:e.target.value})}/></label><label>Guarantor<input value={editCandidate.guarantor || ''} onChange={e=>setEditCandidate({...editCandidate,guarantor:e.target.value})}/></label><div className="locked-note">Customer ID and Aadhaar identity remain locked. Every correction is recorded in the audit trail.</div><div className="action-row"><button type="button" className="ghost" onClick={()=>setEditCandidate(null)}>Cancel</button><button className="primary" disabled={updatingCustomerId===editCandidate.customer_id}>{updatingCustomerId===editCandidate.customer_id?'Saving…':'Save customer changes'}</button></div></form>}</section>}
+      {['owner','manager'].includes(user.role) && <section className="panel full customer-editor"><div className="panel-head"><div><span className="section-kicker">Customer corrections</span><h2>Edit an existing customer</h2></div></div><CustomerSearch customers={rows} onSelect={c => setEditCandidate({ ...c })} label="Search customer to edit" placeholder="Search the customer to edit: name, ID, mobile or area…" />{editCandidate && <div className="locked-note"><CheckCircle2 size={16}/> Editing <strong>{editCandidate.name}</strong> · {editCandidate.customer_id} <button type="button" className="link-btn" onClick={() => setEditCandidate(null)}>Cancel</button></div>}{editCandidate && <form onSubmit={saveCustomerEdit}><div className="two-col"><label>Name<input required minLength="2" value={editCandidate.name} onChange={e=>setEditCandidate({...editCandidate,name:e.target.value})}/></label><label>Father's name<input required minLength="2" value={editCandidate.father_name} onChange={e=>setEditCandidate({...editCandidate,father_name:e.target.value})}/></label><label>Mobile<input required inputMode="numeric" minLength="10" maxLength="10" pattern="[6-9][0-9]{9}" value={editCandidate.mobile} onChange={e=>setEditCandidate({...editCandidate,mobile:e.target.value.replace(/\D/g,'').slice(0,10)})}/></label><label>Area<select value={editCandidate.area_code || editCandidate.area} onChange={e=>setEditCandidate({...editCandidate,area_code:e.target.value})}>{areas.map(a=><option key={a.code} value={a.code}>{a.name}</option>)}</select></label></div><label>Address<textarea required minLength="5" value={editCandidate.address} onChange={e=>setEditCandidate({...editCandidate,address:e.target.value})}/></label><label>Guarantor<input value={editCandidate.guarantor || ''} onChange={e=>setEditCandidate({...editCandidate,guarantor:e.target.value})}/></label><div className="locked-note">Customer ID and Aadhaar identity remain locked. Every correction is recorded in the audit trail.</div><div className="action-row"><button type="button" className="ghost" onClick={()=>setEditCandidate(null)}>Cancel</button><button className="primary" disabled={updatingCustomerId===editCandidate.customer_id}>{updatingCustomerId===editCandidate.customer_id?'Saving…':'Save customer changes'}</button></div></form>}</section>}
       <form className="panel form-panel full onboarding-form" onSubmit={submit}>
         <div className="panel-head"><div><span className="section-kicker">Secure onboarding</span><h2>Register a customer</h2></div><ShieldCheck size={22} /></div>
         <div className="segmented-control"><button type="button" className={registrationMode === 'aadhaar' ? 'active' : ''} onClick={() => setRegistrationMode('aadhaar')}>Aadhaar registration</button><button type="button" className={registrationMode === 'manual' ? 'active' : ''} onClick={() => { setRegistrationMode('manual'); setForm({ ...form, aadhaar: '' }); }}>Manual registration</button></div>
@@ -1113,11 +1179,23 @@ function Customer360({ api, initialCustomerId = '', user, notify }) {
 
   return (
     <div className="profile-layout">
+      <section className="panel full customer-search-panel">
+        <CustomerSearch customers={customers} onSelect={c => setSelectedId(c.customer_id)} label="Search customer for Customer 360" />
+      </section>
       <section className="panel profile-card">
         <div className="avatar">{customer.name.split(' ').map(x => x[0]).slice(0, 2).join('')}</div>
         <h2>{customer.name}</h2>
         <p>{customer.customer_id} - {customer.area_name || customer.area} - {customer.mobile}</p>
-        <label>Customer<select value={customer.customer_id} onChange={e => setSelectedId(e.target.value)}>{customers.map(c => <option key={c.customer_id} value={c.customer_id}>{c.customer_id} - {c.name}</option>)}</select></label>
+        <dl className="customer-details">
+          <dt>Customer ID</dt><dd>{customer.customer_id}</dd>
+          <dt>Father's name</dt><dd>{customer.father_name || '—'}</dd>
+          <dt>Mobile</dt><dd>{customer.mobile || '—'}{customer.mobile_verified ? ' (verified)' : ''}</dd>
+          <dt>Address</dt><dd>{customer.address || '—'}</dd>
+          <dt>Area</dt><dd>{customer.area_name || customer.area || '—'}{customer.area_code ? ` (${customer.area_code})` : ''}</dd>
+          <dt>Guarantor</dt><dd>{customer.guarantor || '—'}</dd>
+          <dt>Aadhaar</dt><dd>{customer.aadhaar_masked || '—'}</dd>
+          <dt>Registered on</dt><dd>{customer.created_at ? date(customer.created_at) : '—'}</dd>
+        </dl>
         <div className="profile-tags">
           <Status value={customer.status} />
           <span className="pill">Risk {customer.risk_score}</span>

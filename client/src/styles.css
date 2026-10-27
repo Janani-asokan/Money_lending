@@ -1161,3 +1161,19 @@ td .action-row button { white-space: nowrap; }
 :root[data-theme="dark"] .status.not-paid { color: #fecaca; background: rgba(239,68,68,.16); }
 .receipt-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .status.paid, .status.less-paid, .status.not-paid, .status.upcoming { white-space: nowrap; }
+.late-note { color: var(--danger); font-weight: 700; }
+
+/* Customer search bar (Customer 360, customer edit) and full customer details */
+.customer-search { position: relative; display: grid; gap: 6px; }
+.customer-search .searchbox { width: 100%; }
+.customer-search-results { display: grid; gap: 4px; max-height: 340px; overflow: auto; padding: 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-strong); box-shadow: var(--shadow); }
+.customer-search-results button { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; padding: 10px 12px; border: 0; border-radius: 6px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
+.customer-search-results button:hover, .customer-search-results button:focus-visible { background: var(--violet-soft); }
+.customer-search-results span { display: grid; gap: 2px; }
+.customer-search-results small, .customer-search-empty { color: var(--muted); }
+.customer-search-empty { padding: 10px 12px; }
+.customer-search-panel { padding-top: 16px; padding-bottom: 16px; }
+.customer-editor .customer-search { margin: 12px 0; }
+.customer-details { display: grid; grid-template-columns: minmax(110px, auto) 1fr; gap: 8px 14px; margin: 4px 0; padding: 14px; border: 1px solid var(--line); border-radius: 8px; }
+.customer-details dt { color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.customer-details dd { margin: 0; overflow-wrap: anywhere; }
