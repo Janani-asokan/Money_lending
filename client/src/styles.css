@@ -1151,7 +1151,7 @@ td .action-row button { white-space: nowrap; }
 
 /* Dashboard filters and monthly payment status */
 .filter-summary { margin: 4px 0 10px; color: var(--muted); font-size: 13px; font-weight: 600; }
-.loan-filters input[type="month"] { flex: 0 1 170px; min-width: 150px; min-height: 40px; }
+.loan-filters input[type="date"], .loan-filters input[type="month"] { flex: 0 1 170px; min-width: 150px; min-height: 40px; }
 .segmented-control.status-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .status.paid { color: #14713a; background: #e4f6e9; }
 .status.less-paid { color: #9a6109; background: #fff3d7; }

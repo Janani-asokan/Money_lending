@@ -154,3 +154,9 @@ Files: server/main.py, client/src/main.jsx, client/src/styles.css
 - Pending dues now lists only the chosen month's Not paid and Less paid customers, with due date, days late, balance to pay and filters (month, area, plan, search, status).
 - Customer 360: full customer details (father's name, mobile, address, area, guarantor, Aadhaar, registered on) and a customer search bar instead of the drop-down.
 - Customers page: "Edit an existing customer" uses the same search bar instead of the drop-down.
+
+## Round 8 - Daily status for daily collection (Naveen's feedback) - DONE
+
+- Dashboard "Pending dues" and "Payment status" now use a date (default today) instead of a month, and judge each loan on its own collection cycle: daily loans on that day's instalment, weekly loans on that week (Mon-Sun), monthly loans on that month.
+- A Period column shows the day / week / month each loan is judged on. Arrears from earlier days are not mixed into today's daily status.
+- Replaces /api/dashboard/monthly-status with /api/dashboard/payment-status?on=YYYY-MM-DD.
