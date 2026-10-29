@@ -160,3 +160,11 @@ Files: server/main.py, client/src/main.jsx, client/src/styles.css
 - Dashboard "Pending dues" and "Payment status" now use a date (default today) instead of a month, and judge each loan on its own collection cycle: daily loans on that day's instalment, weekly loans on that week (Mon-Sun), monthly loans on that month.
 - A Period column shows the day / week / month each loan is judged on. Arrears from earlier days are not mixed into today's daily status.
 - Replaces /api/dashboard/monthly-status with /api/dashboard/payment-status?on=YYYY-MM-DD.
+
+## Round 9 - Dashboard Pending dues and Payment status reworked - DONE
+
+- One "Collections" filter bar (date, area, plan, search, Clear) drives both sections, so filters always apply to both tables. Areas match by code, area name or customer-ID prefix, so older records filter correctly.
+- Pending dues: unpaid instalments up to the chosen date, tagged in each loan's own unit ("3 days pending", "2 weeks pending", "1 month pending"), with pending since, amount pending, instalment per day/week/month and last payment. Closed loans never appear; amounts are capped at the real balance and part-payments count as paid.
+- Payment status: that day's instalment for daily loans, that week's for weekly, that month's for monthly - Paid / Less paid / Not paid / Upcoming.
+- Speed: previous results stay on screen while a new date loads (no blank flash), long lists show 50 rows at a time, the main dashboard no longer computes the old unused pending list.
+- Fix: MongoDB list reads were capped at 10,000 records, so with many payments the paid totals and statuses were silently understated across the app. The cap is removed.

@@ -465,60 +465,73 @@ function monthLabel(key) {
   return new Date(year, month - 1, 1).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
 }
 
-// Shared by "Pending dues" and "Payment status": one date, one fetch, refreshed after every change.
-// Each loan is judged on its own cycle: daily loans on that day, weekly on that week, monthly on that month.
+// Feeds "Pending dues" and "Payment status" from one request for the chosen date.
+// The previous result stays on screen while a new one loads, so the tables never blink empty.
 function usePaymentStatus(api) {
   const [on, setOn] = useState(() => indiaDayKey(new Date().toISOString()));
   const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const latest = React.useRef(0);
   const apiRef = React.useRef(api);
   apiRef.current = api;
   const reload = React.useCallback(() => {
     const ticket = ++latest.current;
+    setLoading(true);
     return apiRef.current(`/api/dashboard/payment-status?on=${on}`)
       .then(result => { if (ticket === latest.current) { setData(result); setError(''); } })
-      .catch(err => { if (ticket === latest.current) setError(err.message); });
+      .catch(err => { if (ticket === latest.current) setError(err.message); })
+      .finally(() => { if (ticket === latest.current) setLoading(false); });
   }, [on]);
   useEffect(() => { reload(); }, [reload]);
-  // Pick up payments recorded on another device or tab as soon as this screen is looked at again.
+  // Payments recorded on another phone or tab show up when this screen is looked at again.
   useEffect(() => {
     const refresh = () => { if (document.visibilityState === 'visible') reload(); };
     window.addEventListener('focus', refresh); document.addEventListener('visibilitychange', refresh);
-    const timer = setInterval(refresh, 60000);
+    const timer = setInterval(refresh, 120000);
     return () => { window.removeEventListener('focus', refresh); document.removeEventListener('visibilitychange', refresh); clearInterval(timer); };
   }, [reload]);
-  return { on, setOn, data: data?.date === on ? data : null, error, reload };
+  return { on, setOn, data, loading: loading || (data && data.date !== on), error, reload };
 }
 
-function periodLabel(row) {
-  const d = value => new Date(`${value}T12:00:00+05:30`);
-  if (row.period === 'day') return day(d(row.period_start));
-  if (row.period === 'week') return `${d(row.period_start).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })} – ${day(d(row.period_end))}`;
+const asDay = key => new Date(`${key}T12:00:00+05:30`);
+function dayLabel(key) { return day(asDay(key)); }
+function shortDay(key) { return asDay(key).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' }); }
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+function periodLabel(row, today) {
+  if (row.period === 'day') return row.period_start === today ? 'Today' : dayLabel(row.period_start);
+  if (row.period === 'week') return `${shortDay(row.period_start)} – ${shortDay(row.period_end)}`;
   return monthLabel(row.period_start.slice(0, 7));
 }
 
-function dayLabel(key) { return day(new Date(`${key}T12:00:00+05:30`)); }
-
-function useRowFilters(rows) {
+function useCollectionFilters() {
   const [area, setArea] = useState('');
   const [plan, setPlan] = useState('');
   const [search, setSearch] = useState('');
   const text = search.trim().toLowerCase();
-  const filtered = rows.filter(r => (!area || r.area === area) && (!plan || r.frequency === plan)
-    && (!text || [r.customer_name, r.customer_id, r.loan_id, r.mobile].some(v => String(v || '').toLowerCase().includes(text))));
-  const active = Boolean(area || plan || search);
-  return { area, setArea, plan, setPlan, search, setSearch, filtered, active, clear: () => { setArea(''); setPlan(''); setSearch(''); } };
+  const match = r => (!area || r.area === area) && (!plan || r.frequency === plan)
+    && (!text || [r.customer_name, r.customer_id, r.loan_id, r.mobile].some(v => String(v || '').toLowerCase().includes(text)));
+  return { area, setArea, plan, setPlan, search, setSearch, match, active: Boolean(area || plan || search), clear: () => { setArea(''); setPlan(''); setSearch(''); } };
 }
 
-function StatusFilters({ status, areas, filters, label }) {
-  return <div className="loan-filters">
-    <input type="date" aria-label="Date" value={status.on} onChange={e => e.target.value && status.setOn(e.target.value)} />
-    <select aria-label="Area" value={filters.area} onChange={e => filters.setArea(e.target.value)}><option value="">All areas</option>{areas.map(a => <option key={a.area} value={a.area}>{a.name}</option>)}</select>
-    <select aria-label="Plan" value={filters.plan} onChange={e => filters.setPlan(e.target.value)}><option value="">All plans</option><option>Daily</option><option>Weekly</option><option>Monthly</option></select>
-    <div className="searchbox"><Search size={16} /><input aria-label={label} placeholder="Customer, ID, loan or mobile" value={filters.search} onChange={e => filters.setSearch(e.target.value)} /></div>
-    {filters.active && <button type="button" className="ghost" onClick={filters.clear}>Clear</button>}
-  </div>;
+// One filter bar for both sections, so what you pick always applies to both tables.
+function CollectionFilters({ feed, areas, filters }) {
+  const today = feed.data?.today || indiaDayKey(new Date().toISOString());
+  return (
+    <section className="panel full collection-filters">
+      <div className="panel-head"><h2>Collections</h2><span>{feed.loading ? 'Updating…' : 'Daily loans are checked by day, weekly by week, monthly by month'}</span></div>
+      <div className="loan-filters">
+        <label className="inline-field">Date<input type="date" aria-label="Date" value={feed.on} max="2100-12-31" onChange={e => e.target.value && feed.setOn(e.target.value)} /></label>
+        {feed.on !== today && <button type="button" className="ghost" onClick={() => feed.setOn(today)}>Today</button>}
+        <select aria-label="Area" value={filters.area} onChange={e => filters.setArea(e.target.value)}><option value="">All areas</option>{areas.map(a => <option key={a.area} value={a.area}>{a.name}</option>)}</select>
+        <select aria-label="Plan" value={filters.plan} onChange={e => filters.setPlan(e.target.value)}><option value="">All plans</option><option value="Daily">Daily</option><option value="Weekly">Weekly</option><option value="Monthly">Monthly</option></select>
+        <div className="searchbox"><Search size={16} /><input aria-label="Search collections" placeholder="Customer, ID, loan or mobile" value={filters.search} onChange={e => filters.setSearch(e.target.value)} /></div>
+        {filters.active && <button type="button" className="ghost" onClick={filters.clear}>Clear filters</button>}
+      </div>
+      {feed.error && <div className="error" role="alert">{feed.error} <button type="button" className="link-btn" onClick={feed.reload}>Try again</button></div>}
+    </section>
+  );
 }
 
 function CustomerCell({ row, onOpenCustomer }) {
@@ -529,65 +542,79 @@ function PlanCell({ row, viewer }) {
   return <td>{row.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(row.loan_id)}>{row.loan_id}</button></small></td>;
 }
 
-const CYCLE_NOTE = 'Daily loans: that day · Weekly: that week · Monthly: that month';
+// Long lists are shown 50 rows at a time so the dashboard stays quick.
+function useShowMore(resetKey) {
+  const [limit, setLimit] = useState(50);
+  useEffect(() => { setLimit(50); }, [resetKey]);
+  return { limit, more: () => setLimit(n => n + 50) };
+}
+function MoreRows({ shown, total, onMore }) {
+  return total > shown ? <button type="button" className="ghost show-more" onClick={onMore}>Show more ({total - shown} more)</button> : null;
+}
 
-function PendingDues({ status: feed, areas, onOpenCustomer, viewer }) {
-  const unpaid = (feed.data?.rows || []).filter(r => r.status === 'Not paid' || r.status === 'Less paid');
-  const filters = useRowFilters(unpaid);
-  const [status, setStatus] = useState('All');
-  const rows = filters.filtered.filter(r => status === 'All' || r.status === status);
-  const count = name => filters.filtered.filter(r => r.status === name).length;
-  const total = rows.reduce((sum, r) => sum + Number(r.short || 0), 0);
+function PendingTag({ row }) {
+  const tone = row.pending_count >= 3 ? 'not-paid' : row.pending_count === 2 ? 'less-paid' : 'upcoming';
+  return <span className={`status ${tone}`}>{plural(row.pending_count, row.unit)} pending</span>;
+}
+
+function PendingDues({ feed, filters, onOpenCustomer, viewer }) {
+  const all = (feed.data?.rows || []).filter(r => r.pending_count > 0 && filters.match(r))
+    .sort((a, b) => (a.pending_since < b.pending_since ? -1 : a.pending_since > b.pending_since ? 1 : b.pending_amount - a.pending_amount));
+  const page = useShowMore(`${feed.on}|${filters.area}|${filters.plan}|${filters.search}`);
+  const rows = all.slice(0, page.limit);
+  const total = all.reduce((sum, r) => sum + Number(r.pending_amount || 0), 0);
+  const byUnit = unit => all.filter(r => r.unit === unit).length;
   return (
-    <section className="panel full">
-      <div className="panel-head"><h2>Pending dues</h2><span>Not paid or paid less as on {dayLabel(feed.on)} · {CYCLE_NOTE}</span></div>
-      <StatusFilters status={feed} areas={areas} filters={filters} label="Search pending dues" />
-      <div className="segmented-control status-tabs">{[['All', `All pending (${filters.filtered.length})`], ['Not paid', `Not paid (${count('Not paid')})`], ['Less paid', `Less paid (${count('Less paid')})`]].map(([key, text]) => <button key={key} className={status === key ? 'active' : ''} onClick={() => setStatus(key)}>{text}</button>)}</div>
-      {feed.error && <div className="error" role="alert">{feed.error}</div>}
-      {!feed.data && !feed.error ? <Skeleton /> : feed.data && <>
-        <div className="filter-summary">{rows.length} customer{rows.length === 1 ? '' : 's'} · {money(total)} still to collect</div>
-        {rows.length ? <div className="table-scroll"><table><thead><tr><th>Due date</th><th>Customer</th><th>Area</th><th>Plan</th><th>Period</th><th>Due</th><th>Paid</th><th>Balance to pay</th><th>Status</th></tr></thead><tbody>
+    <section className={`panel full ${feed.loading ? 'is-updating' : ''}`}>
+      <div className="panel-head"><h2>Pending dues</h2><span>Unpaid instalments up to {dayLabel(feed.on)}</span></div>
+      {!feed.data ? (feed.error ? null : <Skeleton />) : <>
+        <div className="filter-summary">{plural(all.length, 'customer')} · {money(total)} pending{all.length ? ` · Daily ${byUnit('day')} · Weekly ${byUnit('week')} · Monthly ${byUnit('month')}` : ''}</div>
+        {rows.length ? <div className="table-scroll"><table><thead><tr><th>Customer</th><th>Area</th><th>Plan</th><th>Pending</th><th>Pending since</th><th>Amount pending</th><th>Last paid</th></tr></thead><tbody>
           {rows.map(r => <tr key={r.loan_id}>
-            <td>{r.next_due_date ? dayLabel(r.next_due_date) : '—'}{r.days_overdue > 0 && <small className="late-note">{r.days_overdue} day{r.days_overdue === 1 ? '' : 's'} late</small>}</td>
             <CustomerCell row={r} onOpenCustomer={onOpenCustomer} />
             <td>{r.area_name || '—'}</td>
             <PlanCell row={r} viewer={viewer} />
-            <td>{periodLabel(r)}</td>
-            <td>{money(r.scheduled)}</td><td>{money(r.paid)}</td><td><strong>{money(r.short)}</strong></td>
-            <td><Status value={r.status} /></td>
+            <td><PendingTag row={r} /></td>
+            <td>{r.pending_since ? dayLabel(r.pending_since) : '—'}</td>
+            <td><strong>{money(r.pending_amount)}</strong><small>{money(r.instalment)} per {r.unit}</small></td>
+            <td>{r.last_paid_on ? <>{dayLabel(r.last_paid_on)}<small>{money(r.last_paid_amount)}</small></> : 'No payment yet'}</td>
           </tr>)}
-        </tbody></table></div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No pending dues</strong><span>Everyone matching these filters has paid as on {dayLabel(feed.on)}.</span></div>}
+        </tbody></table></div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No pending dues</strong><span>Every customer matching these filters is paid up to {dayLabel(feed.on)}.</span></div>}
+        <MoreRows shown={rows.length} total={all.length} onMore={page.more} />
       </>}
     </section>
   );
 }
 
-function PaymentStatus({ status: feed, areas, onOpenCustomer, viewer }) {
-  const filters = useRowFilters(feed.data?.rows || []);
+function PaymentStatus({ feed, filters, onOpenCustomer, viewer }) {
   const [status, setStatus] = useState('All');
-  const rows = filters.filtered.filter(r => status === 'All' || r.status === status);
-  const count = name => filters.filtered.filter(r => r.status === name).length;
-  const sum = key => rows.reduce((total, r) => total + Number(r[key] || 0), 0);
-  const options = ['All', 'Paid', 'Less paid', 'Not paid', ...(count('Upcoming') ? ['Upcoming'] : [])];
+  const inScope = (feed.data?.rows || []).filter(r => r.status && filters.match(r));
+  const all = inScope.filter(r => status === 'All' || r.status === status);
+  const page = useShowMore(`${feed.on}|${filters.area}|${filters.plan}|${filters.search}|${status}`);
+  const rows = all.slice(0, page.limit);
+  const count = name => inScope.filter(r => r.status === name).length;
+  const sum = key => all.reduce((total, r) => total + Number(r[key] || 0), 0);
+  const options = ['All', 'Not paid', 'Less paid', 'Paid', ...(count('Upcoming') ? ['Upcoming'] : [])];
+  const today = feed.data?.today;
   return (
-    <section className="panel full">
-      <div className="panel-head"><h2>Payment status</h2><span>Due versus paid as on {dayLabel(feed.on)} · {CYCLE_NOTE}</span></div>
-      <StatusFilters status={feed} areas={areas} filters={filters} label="Search payment status" />
-      <div className="segmented-control status-tabs">{options.map(option => <button key={option} className={status === option ? 'active' : ''} onClick={() => setStatus(option)}>{option} ({option === 'All' ? filters.filtered.length : count(option)})</button>)}</div>
-      {feed.error && <div className="error" role="alert">{feed.error}</div>}
-      {!feed.data && !feed.error ? <Skeleton /> : feed.data && <>
+    <section className={`panel full ${feed.loading ? 'is-updating' : ''}`}>
+      <div className="panel-head"><h2>Payment status</h2><span>{feed.on === today ? "Today's" : `${dayLabel(feed.on)}'s`} instalment for daily loans, this week's for weekly, this month's for monthly</span></div>
+      <div className="segmented-control status-tabs">{options.map(option => <button key={option} className={status === option ? 'active' : ''} onClick={() => setStatus(option)}>{option} ({option === 'All' ? inScope.length : count(option)})</button>)}</div>
+      {!feed.data ? (feed.error ? null : <Skeleton />) : <>
         <div className="filter-summary">Due {money(sum('scheduled'))} · Paid {money(sum('paid'))} · Balance {money(sum('short'))}</div>
-        {rows.length ? <div className="table-scroll"><table><thead><tr><th>Customer</th><th>Area</th><th>Plan</th><th>Period</th><th>Due</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead><tbody>
+        {rows.length ? <div className="table-scroll"><table><thead><tr><th>Customer</th><th>Area</th><th>Plan</th><th>For</th><th>Due</th><th>Paid</th><th>Balance</th><th>Status</th></tr></thead><tbody>
           {rows.map(r => <tr key={r.loan_id}>
             <CustomerCell row={r} onOpenCustomer={onOpenCustomer} />
             <td>{r.area_name || '—'}</td>
             <PlanCell row={r} viewer={viewer} />
-            <td>{periodLabel(r)}</td>
-            <td>{money(r.scheduled)}</td><td>{money(r.paid)}{r.paid_in_advance > 0 && r.paid < r.scheduled && <small>+ {money(r.paid_in_advance)} paid earlier</small>}</td>
+            <td>{periodLabel(r, today)}</td>
+            <td>{money(r.scheduled)}</td>
+            <td>{money(r.paid)}{r.paid_in_advance > 0 && r.paid < r.scheduled && <small>+ {money(r.paid_in_advance)} paid earlier</small>}</td>
             <td>{r.short > 0 ? <strong>{money(r.short)}</strong> : '—'}</td>
             <td><Status value={r.status} /></td>
           </tr>)}
-        </tbody></table></div> : <div className="locked-note">No loans match these filters for {dayLabel(feed.on)}.</div>}
+        </tbody></table></div> : <div className="locked-note">No loans match these filters.</div>}
+        <MoreRows shown={rows.length} total={all.length} onMore={page.more} />
       </>}
     </section>
   );
@@ -597,6 +624,7 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
   const [data, setData] = useState(null);
   const [loadError, setLoadError] = useState('');
   const paymentStatus = usePaymentStatus(api);
+  const collectionFilters = useCollectionFilters();
   const load = () => { paymentStatus.reload(); return api('/api/dashboard').then(result => { setData(result); setLoadError(''); }).catch(err => setLoadError(err.message)); };
   const viewer = useLoanViewer({ api, notify, user, onChanged: load });
   useEffect(() => { load(); }, []);
@@ -640,8 +668,9 @@ function Dashboard({ api, onNavigate, onOpenCustomer, user, notify }) {
         <Donut daily={data.split.daily} monthly={data.split.monthly} />
         <div className="locked-note">Weekly plans: {data.split.weekly || 0}</div>
       </section>
-      <PendingDues status={paymentStatus} areas={data.area_summary} onOpenCustomer={onOpenCustomer} viewer={viewer} />
-      <PaymentStatus status={paymentStatus} areas={data.area_summary} onOpenCustomer={onOpenCustomer} viewer={viewer} />
+      <CollectionFilters feed={paymentStatus} areas={data.area_summary} filters={collectionFilters} />
+      <PendingDues feed={paymentStatus} filters={collectionFilters} onOpenCustomer={onOpenCustomer} viewer={viewer} />
+      <PaymentStatus feed={paymentStatus} filters={collectionFilters} onOpenCustomer={onOpenCustomer} viewer={viewer} />
       <section className="panel wide area-performance">
         <div className="panel-head"><h2>Areas requiring collection</h2><span>Click an area, then click a customer for their complete profile</span></div>
         {collectibleAreas.length ? <div className="area-drilldowns">{collectibleAreas.map(area => <details key={area.area}><summary>{area.name || area.area} — {area.customers_with_dues} customers to collect · {area.paid_customers_today} paid today · {area.customers_yet_to_pay} yet to pay · {money(area.outstanding)} outstanding</summary><div className="table-scroll"><table><thead><tr><th>Customer</th><th>Plan</th><th>Installment</th><th>Paid total</th><th>Yet to pay</th><th>Remaining</th><th>Next due</th></tr></thead><tbody>{area.customer_dues.map(item => <tr key={item.loan_id}><td>{onOpenCustomer ? <button className="table-link" onClick={() => onOpenCustomer(item.customer_id)}>{item.customer_name}</button> : item.customer_name}<small>{item.customer_id}</small></td><td>{item.frequency}<small><button className="table-link" disabled={viewer.busy} onClick={() => viewer.open(item.loan_id)}>{item.loan_id}</button></small></td><td>{money(item.installment)}</td><td>{money(item.paid)}</td><td><strong>{money(item.outstanding)}</strong></td><td>{item.remaining_installments} {item.frequency.toLowerCase()} installments</td><td>{item.next_due_date ? day(item.next_due_date) : 'Completed'}</td></tr>)}</tbody></table></div></details>)}</div> : <div className="empty-chart"><CheckCircle2 size={24}/><strong>No area requires collection</strong><span>All active balances are clear.</span></div>}
