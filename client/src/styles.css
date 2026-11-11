@@ -1183,3 +1183,8 @@ td .action-row button { white-space: nowrap; }
 .is-updating table, .is-updating .filter-summary { opacity: .55; transition: opacity .15s; }
 .show-more { margin-top: 10px; width: 100%; }
 .status.upcoming { white-space: nowrap; }
+.cycle-badge { margin-top: 4px; }
+.status.closed { white-space: nowrap; }
+.status.paid-early { color: #14713a; background: #e4f6e9; white-space: nowrap; }
+:root[data-theme="dark"] .status.paid-early { color: #bbf7d0; background: rgba(34,197,94,.16); }
+.cycle-next { display: block; margin-bottom: 4px; }

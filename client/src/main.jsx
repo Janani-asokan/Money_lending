@@ -594,7 +594,7 @@ function PaymentStatus({ feed, filters, onOpenCustomer, viewer }) {
   const rows = all.slice(0, page.limit);
   const count = name => inScope.filter(r => r.status === name).length;
   const sum = key => all.reduce((total, r) => total + Number(r[key] || 0), 0);
-  const options = ['All', 'Not paid', 'Less paid', 'Paid', ...(count('Upcoming') ? ['Upcoming'] : [])];
+  const options = ['All', 'Not paid', 'Less paid', 'Paid', ...(count('Paid early') ? ['Paid early'] : []), ...(count('Upcoming') ? ['Upcoming'] : [])];
   const today = feed.data?.today;
   return (
     <section className={`panel full ${feed.loading ? 'is-updating' : ''}`}>
@@ -609,7 +609,7 @@ function PaymentStatus({ feed, filters, onOpenCustomer, viewer }) {
             <PlanCell row={r} viewer={viewer} />
             <td>{periodLabel(r, today)}</td>
             <td>{money(r.scheduled)}</td>
-            <td>{money(r.paid)}{r.paid_in_advance > 0 && r.paid < r.scheduled && <small>+ {money(r.paid_in_advance)} paid earlier</small>}</td>
+            <td>{money(r.paid)}</td>
             <td>{r.short > 0 ? <strong>{money(r.short)}</strong> : '—'}</td>
             <td><Status value={r.status} /></td>
           </tr>)}
@@ -1654,6 +1654,23 @@ function LoanDetailsModal({ data, api, notify, onRefresh, onInstantClose, user, 
   </>;
 }
 
+function CycleNote({ cycle, nextDue }) {
+  if (!cycle) return null;
+  const when = cycle.period_word;
+  const good = cycle.status === 'Paid' || cycle.status === 'Paid early';
+  const text = {
+    'Paid': `Paid ${money(cycle.paid)} ${when} — ${when}'s instalment is covered.`,
+    'Paid early': `${when[0].toUpperCase()}${when.slice(1)}'s instalment was already paid early.`,
+    'Less paid': `Paid ${money(cycle.paid)} ${when} — ${money(cycle.short)} still due ${when}.`,
+    'Not paid': `No payment recorded ${when} — ${money(cycle.short)} due.`,
+    'Upcoming': `Nothing due yet ${when}.`,
+  }[cycle.status] || '';
+  return <>
+    {text && <div className={good ? 'locked-note paid-state' : 'locked-note unpaid-state'}>{good ? <CheckCircle2 size={16}/> : <AlertTriangle size={16}/>} {text}</div>}
+    <small className="cycle-next">Next due: <b>{nextDue ? day(nextDue) : '—'}</b>{cycle.next_due_amount > 0 ? ` · ${money(cycle.next_due_amount)}` : ''}{pendingText(cycle) ? ` · ${pendingText(cycle)}` : ''}</small>
+  </>;
+}
+
 function Collections({ api, user, notify }) {
   const [loans, setLoans] = useState([]);
   const [payments, setPayments] = useState([]);
@@ -1679,12 +1696,9 @@ function Collections({ api, user, notify }) {
   };
   useEffect(() => { load(); }, []);
   const filtered = loans.filter(l => !query || `${l.loan_id} ${l.customer_id} ${l.customer_name}`.toLowerCase().includes(query.toLowerCase()));
-  const todayKey = indiaDayKey(new Date());
   const paymentsForLoan = loanId => payments.filter(payment => payment.loan_id === loanId && payment.status !== 'Reversed');
   const selectedPayments = selected ? paymentsForLoan(selected.loan_id).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)) : [];
   const lastPayment = selectedPayments[0];
-  const paidToday = selectedPayments.filter(payment => indiaDayKey(payment.timestamp) === todayKey);
-  const paidTodayAmount = paidToday.reduce((sum,payment)=>sum+Number(payment.amount || 0),0);
   function submit(e) {
     e.preventDefault();
     if (!selected || saving) return;
@@ -1720,7 +1734,7 @@ function Collections({ api, user, notify }) {
       <section className="panel loan-picker">
         <div className="panel-head"><h2>Find loan</h2><span>Loan ID or Customer ID</span></div>
         <div className="searchbox"><Search size={18} /><input placeholder="Search loan..." value={query} onChange={e => setQuery(e.target.value)} /></div>
-        <div className="loan-list">{filtered.slice(0, 24).map(l => { const todayPayments=paymentsForLoan(l.loan_id).filter(payment=>indiaDayKey(payment.timestamp)===todayKey); const todayTotal=todayPayments.reduce((sum,payment)=>sum+Number(payment.amount||0),0); return <button key={l.loan_id} className={selected?.loan_id === l.loan_id ? 'loan-item selected' : 'loan-item'} onClick={() => { setSelected(l); setAmount(Math.min(l.installment,l.balance)); setPaymentReference(''); }}><span className="loan-item-head"><strong>{l.customer_name}</strong><Status value={todayTotal>0?'Paid today':'Not paid today'}/></span><span>{l.customer_id} · {l.loan_id} · {l.frequency}</span><span>{money(l.balance)} remaining · installment {money(l.installment)}</span>{todayTotal>0&&<small>{money(todayTotal)} received today</small>}</button>})}</div>
+        <div className="loan-list">{filtered.slice(0, 24).map(l => <button key={l.loan_id} className={selected?.loan_id === l.loan_id ? 'loan-item selected' : 'loan-item'} onClick={() => { setSelected(l); setAmount(Math.min(l.cycle?.next_due_amount || l.installment, l.balance)); setPaymentReference(''); }}><span className="loan-item-head"><strong>{l.customer_name}</strong><CycleBadge cycle={l.cycle} /></span><span>{l.customer_id} · {l.loan_id} · {l.frequency}</span><span>Borrowed {day(l.borrow_date)} · {money(l.balance)} remaining · instalment {money(l.installment)}</span>{l.cycle?.paid > 0 && <small>{money(l.cycle.paid)} received {l.cycle.period_word}</small>}{pendingText(l.cycle) && <small className="late-note">{pendingText(l.cycle)}</small>}</button>)}</div>
       </section>
       <form className="panel collection-card" onSubmit={submit}>
         <div className="panel-head"><h2>Collection entry</h2><span>Simple field workflow with locked server timestamp</span></div>
@@ -1729,9 +1743,10 @@ function Collections({ api, user, notify }) {
             <div className="summary-card">
               <strong>{selected.customer_name}</strong>
               <span>{selected.customer_id} · {selected.loan_id} · {selected.frequency}</span>
+              <span>Borrowed on <b>{day(selected.borrow_date)}</b> · Loan {money(selected.principal)}</span>
               <div className="amount-line">{money(selected.balance)} <small>outstanding</small></div>
               <div className="collection-facts"><span><b>{money(selected.paid)}</b><small>Total paid</small></span><span><b>{money(selected.installment)}</b><small>Current installment</small></span><span><b>{selected.remaining_installments}</b><small>Installments left</small></span></div>
-              <div className={paidTodayAmount>0?'locked-note paid-state':'locked-note unpaid-state'}>{paidTodayAmount>0?<><CheckCircle2 size={16}/> Paid {money(paidTodayAmount)} today</>:<><AlertTriangle size={16}/> No payment recorded today</>}</div>
+              <CycleNote cycle={selected.cycle} nextDue={selected.next_due_date} />
               {lastPayment&&<small>Last payment: {money(lastPayment.amount)} via {lastPayment.mode}{lastPayment.payment_reference?` · Ref ${lastPayment.payment_reference}`:''} · {date(lastPayment.timestamp)}</small>}
             </div>
             <div className="two-col">
@@ -2311,6 +2326,22 @@ function LoanBook({ rows, areas, collectors, onView, viewBusy }) {
   </>;
 }
 
+// Payment status of a loan for its current period (daily: today, weekly: this week, monthly: this month).
+const CYCLE_TONE = { 'Paid': 'paid', 'Paid early': 'paid', 'Less paid': 'less-paid', 'Not paid': 'not-paid', 'Upcoming': 'upcoming', 'Closed': 'closed' };
+function cycleLabel(cycle) {
+  if (!cycle?.status) return '';
+  if (cycle.status === 'Upcoming') return `Due ${cycle.period_word === 'today' ? 'today' : `later ${cycle.period_word}`}`;
+  if (cycle.status === 'Closed') return 'Closed';
+  return `${cycle.status} ${cycle.period_word}`;
+}
+function CycleBadge({ cycle }) {
+  if (!cycle?.status) return null;
+  return <span className={`status ${CYCLE_TONE[cycle.status] || 'upcoming'}`}>{cycleLabel(cycle)}</span>;
+}
+function pendingText(cycle) {
+  return cycle?.pending_count > 0 ? `${cycle.pending_count} ${cycle.unit}${cycle.pending_count === 1 ? '' : 's'} pending · ${money(cycle.pending_amount)}` : '';
+}
+
 function LoanTable({ rows, onView, viewBusy = false, onOpenCustomer = null }) {
   return <div className="table-scroll loan-table"><table><thead><tr><th>Loan</th><th>Plan</th><th>Paid / Yet to pay</th><th>Next due</th><th>Status</th></tr></thead><tbody>{rows.map(l => <tr key={l.loan_id} className={onView ? 'clickable-row' : ''} onClick={onView ? e => { if (!e.target.closest('button') && !viewBusy) onView(l.loan_id); } : undefined}>
     <td>{onView ? <button className="table-link" disabled={viewBusy} onClick={()=>onView(l.loan_id)} title="Open the complete loan record">{l.loan_id}</button> : <strong>{l.loan_id}</strong>}
@@ -2318,8 +2349,8 @@ function LoanTable({ rows, onView, viewBusy = false, onOpenCustomer = null }) {
       <small>{day(l.borrow_date)} · {money(l.principal)}</small></td>
     <td>{l.frequency || l.loan_type}<small>{money(l.installment)} each</small></td>
     <td>{money(l.paid)}<small>{money(l.balance)} to pay</small></td>
-    <td>{l.next_due_date ? day(l.next_due_date) : 'Completed'}<small>{l.remaining_installments ?? 0} left</small></td>
-    <td><Status value={l.status} /></td>
+    <td>{l.next_due_date ? day(l.next_due_date) : 'Completed'}<small>{l.remaining_installments ?? 0} left</small>{pendingText(l.cycle) && <small className="late-note">{pendingText(l.cycle)}</small>}</td>
+    <td><Status value={l.status} />{l.status !== 'Closed' && l.cycle?.status && <div className="cycle-badge"><CycleBadge cycle={l.cycle} /></div>}</td>
   </tr>)}</tbody></table></div>;
 }
 

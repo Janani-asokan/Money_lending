@@ -1515,6 +1515,94 @@ def repayment_rows(loan: dict[str, Any], schedule_doc: Optional[dict[str, Any]])
     return rows
 
 
+PERIOD_WORDS = {"day": ("day", "today"), "week": ("week", "this week"), "month": ("month", "this month")}
+ROUNDING_TOLERANCE = Decimal("1.00")  # a shortfall of Rs 1 or less (rounding) still counts as paid
+
+
+def loan_plan(loan: dict[str, Any]) -> str:
+    return "Daily" if loan["loan_type"] == "Daily 100-Day" else "Weekly" if loan["loan_type"] == "Weekly" else "Monthly"
+
+
+def payment_cycle(loan: dict[str, Any], rows: list[dict[str, Any]], payments: list[dict[str, Any]],
+                  part_payments: list[dict[str, Any]], as_of: date, today: date, balance: float) -> dict[str, Any]:
+    """Payment status of one loan as on a date, judged per collection period (daily: day, weekly: week, monthly: month).
+
+    Money paid during a period first pays that period's instalment(s). Anything extra clears older unpaid
+    instalments, then pays the next instalments early. So paying this month marks this month as paid and
+    moves the next due date to next month, even if an older month is still pending (shown separately)."""
+    zero = Decimal("0")
+    plan = loan_plan(loan)
+    to_day = lambda value: parse_date(value).astimezone(BUSINESS_TIMEZONE).date()
+    key_of = lambda day: collection_period(plan, day)[0]
+    instalments = [{"day": to_day(r["due_date"]), "due_date": r["due_date"], "amount": Decimal(str(r.get("payment", 0))), "alloc": zero}
+                   for r in rows if Decimal(str(r.get("payment", 0))) > 0]
+    events = [(to_day(p["timestamp"]), Decimal(str(p["amount"]))) for p in payments if p.get("payment_type") != "Opening balance"]
+    events += [(to_day(p.get("timestamp") or p.get("created_at")), Decimal(str(p.get("amount", 0)))) for p in part_payments]
+    events = sorted((d, a) for d, a in events if d <= as_of)
+    opening = sum((Decimal(str(p["amount"])) for p in payments if p.get("payment_type") == "Opening balance"), zero)
+    # An existing loan is tracked from the day it was entered; what was repaid before counts as paid in advance.
+    entered = to_day(loan["entered_at"]) if loan.get("existing_loan") and loan.get("entered_at") else None
+    pool = zero
+    if entered:
+        pool = max(opening - sum((i["amount"] for i in instalments if i["day"] < entered), zero), zero)
+        instalments = [i for i in instalments if i["day"] >= entered]
+    by_period: dict[date, Decimal] = defaultdict(lambda: zero)
+    for day, amount in events:
+        by_period[key_of(day)] += amount
+    for key, amount in by_period.items():
+        for item in instalments:
+            if key_of(item["day"]) == key and amount > 0:
+                take = min(amount, item["amount"] - item["alloc"]); item["alloc"] += take; amount -= take
+        pool += amount
+    for item in instalments:
+        if pool <= 0:
+            break
+        take = min(pool, item["amount"] - item["alloc"]); item["alloc"] += take; pool -= take
+    closed = balance <= 0 or loan.get("status") == "Closed"
+    unpaid = lambda item: not closed and item["alloc"] < item["amount"] - ROUNDING_TOLERANCE
+    start, end, period = collection_period(plan, as_of)
+    current = [i for i in instalments if start <= i["day"] <= end]
+    due = sum((i["amount"] for i in current), zero)
+    covered = due if closed else sum((i["alloc"] for i in current), zero)
+    paid_now = sum((a for d, a in events if start <= d <= end), zero)
+    if due <= 0:
+        status = ("Paid early" if paid_now > 0 else None) if not closed or paid_now > 0 else None
+    elif not any(unpaid(i) for i in current):
+        status = "Paid" if paid_now > 0 else ("Closed" if closed else "Paid early")
+    elif covered > 0:
+        status = "Less paid"
+    elif any(i["day"] <= min(as_of, today) for i in current) and not (entered and start <= entered <= end):
+        status = "Not paid"
+    else:
+        status = "Upcoming"
+    pending = [i for i in instalments if i["day"] <= as_of and unpaid(i)]
+    if entered and as_of == entered and all(i["day"] == entered for i in pending):
+        pending = []  # entered today: nothing is late yet
+    upcoming = [i for i in instalments if i["day"] >= start and unpaid(i)]
+    unit, this_word = PERIOD_WORDS[period]
+    last = events[-1] if events else None
+    return {
+        "plan": plan, "unit": unit, "period": period, "period_word": this_word if as_of == today else f"on {as_of.isoformat()}",
+        "period_start": start.isoformat(), "period_end": end.isoformat(),
+        "due": float(due), "paid": float(paid_now), "covered": float(min(covered, due)), "short": float(max(due - covered, zero)) if status not in ("Paid", "Paid early", "Closed") else 0.0,
+        "status": status,
+        "pending_count": len(pending), "pending_amount": float(sum((i["amount"] - i["alloc"] for i in pending), zero)),
+        "pending_since": pending[0]["day"].isoformat() if pending else None,
+        "next_due_date": None if closed else (upcoming[0]["due_date"] if upcoming else None),
+        "next_due_amount": float(upcoming[0]["amount"] - upcoming[0]["alloc"]) if upcoming and not closed else 0.0,
+        "last_paid_on": last[0].isoformat() if last else None, "last_paid_amount": float(last[1]) if last else None,
+        "instalment": float(instalments[0]["amount"]) if instalments else 0.0, "entered": entered.isoformat() if entered else None,
+    }
+
+
+async def loan_live_children(loan: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    live = lambda rows: [row for row in rows if row.get("status", "Posted") != "Reversed"]
+    cached = prefetched_rows("payments", loan["loan_id"])
+    if cached is not None:
+        return live(cached), live(prefetched_rows("part_payments", loan["loan_id"]) or [])
+    return live(await find_many("payments", {"loan_id": loan["loan_id"]})), live(await find_many("part_payments", {"loan_id": loan["loan_id"]}))
+
+
 async def enrich_loan(loan: dict[str, Any]) -> dict[str, Any]:
     balances = await loan_component_balances(loan)
     paid = from_paise(balances["paid_paise"])
@@ -1541,6 +1629,11 @@ async def enrich_loan(loan: dict[str, Any]) -> dict[str, Any]:
         remaining_installments = 1
         next_due_date = rows[-1]["due_date"] if rows else iso(now())
     frequency = "Daily" if loan["loan_type"] == "Daily 100-Day" else "Weekly" if loan["loan_type"] == "Weekly" else "Monthly"
+    payments, part_payments = await loan_live_children(loan)
+    today = business_now().date()
+    cycle = payment_cycle(loan, rows, payments, part_payments, today, today, balance)
+    if balance > 0 and cycle["next_due_date"]:
+        next_due_date = cycle["next_due_date"]
     status_value = loan.get("status", "Active")
     if balance <= 0:
         status_value = "Closed"
@@ -1557,7 +1650,7 @@ async def enrich_loan(loan: dict[str, Any]) -> dict[str, Any]:
         "penalty_balance": from_paise(balances["penalty_balance_paise"]),
         "frequency": frequency, "installments_paid": installments_paid,
         "remaining_installments": remaining_installments, "next_due_date": next_due_date,
-        "days_elapsed": elapsed, "status": status_value,
+        "days_elapsed": elapsed, "status": status_value, "cycle": cycle,
     }
 
 
@@ -2375,22 +2468,14 @@ def collection_period(plan: str, day: date) -> tuple[date, date, str]:
     return start, (start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1), "month"
 
 
-UNIT_WORD = {"Daily": "day", "Weekly": "week", "Monthly": "month"}
-
-
 @app.get("/api/dashboard/payment-status")
 async def payment_status(on: Optional[str] = None, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    """Collection view for one date. For every loan:
-    - this cycle (daily loans: that day, weekly: that Mon-Sun week, monthly: that month): due vs paid -> Paid / Less paid / Not paid / Upcoming
-    - pending as on that date: how many instalments are unpaid (counted in days, weeks or months), since when, and how much."""
+    """Dashboard collections view for one date, using the same payment_cycle rule as every other screen."""
     today = business_now().date()
     try:
         selected = date.fromisoformat(on) if on else today
     except ValueError:
         raise HTTPException(422, "Date must look like 2026-10-27")
-    zero = Decimal("0")
-    to_day = lambda value: parse_date(value).astimezone(BUSINESS_TIMEZONE).date()
-    # One read of every collection, shared by the balance rebuild and the schedule/payment lookups below.
     token = _PREFETCH.set(await build_prefetch())
     try:
         cache = _PREFETCH.get()
@@ -2398,9 +2483,6 @@ async def payment_status(on: Optional[str] = None, user: dict[str, Any] = Depend
     finally:
         _PREFETCH.reset(token)
     live = lambda rows: [row for row in rows if row.get("status", "Posted") != "Reversed"]
-    payments_by_loan = {loan_id: live(rows) for loan_id, rows in cache["payments"].items()}
-    part_payments_by_loan = {loan_id: live(rows) for loan_id, rows in cache["part_payments"].items()}
-    schedules = cache["loan_schedules"]
     areas = await find_many("areas")
     area_names = {a["code"]: a["name"] for a in areas}
     code_by_name = {str(a["name"]).strip().lower(): a["code"] for a in areas}
@@ -2419,77 +2501,28 @@ async def payment_status(on: Optional[str] = None, user: dict[str, Any] = Depend
     for loan in loans:
         if loan.get("status") == "Written Off":
             continue
-        plan = "Daily" if loan["loan_type"] == "Daily 100-Day" else "Weekly" if loan["loan_type"] == "Weekly" else "Monthly"
-        start, end, period = collection_period(plan, selected)
-        schedule_doc = schedules.get((loan["loan_id"], int(loan.get("schedule_version", 1))))
-        schedule = [(to_day(r["due_date"]), Decimal(str(r["payment"]))) for r in repayment_rows(loan, schedule_doc)]
-        loan_payments = payments_by_loan.get(loan["loan_id"], [])
-        opening = sum((Decimal(str(p["amount"])) for p in loan_payments if p.get("payment_type") == "Opening balance"), zero)
-        collections = sorted([(to_day(p["timestamp"]), Decimal(str(p["amount"]))) for p in loan_payments if p.get("payment_type") != "Opening balance"]
-                             + [(to_day(p.get("timestamp") or p.get("created_at")), Decimal(str(p.get("amount", 0)))) for p in part_payments_by_loan.get(loan["loan_id"], [])])
-        # An existing loan is only tracked from the day it was entered; the amount already repaid counts as paid in advance.
-        carry = zero
-        entered = to_day(loan["entered_at"]) if loan.get("existing_loan") and loan.get("entered_at") else None
-        if entered:
-            if selected < entered:
-                continue
-            carry = max(opening - sum((amount for day, amount in schedule if day < entered), zero), zero)
-            schedule = [(day, amount) for day, amount in schedule if day >= entered]
-        # ---- this cycle ----
-        period_rows = [(day, amount) for day, amount in schedule if start <= day <= end]
-        due = sum((amount for _, amount in period_rows), zero)
-        paid = sum((amount for day, amount in collections if start <= day <= end), zero)
-        prior_due = sum((amount for day, amount in schedule if day < start), zero)
-        advance = max(sum((amount for day, amount in collections if day < start), zero) + carry - prior_due, zero)
-        covered = min(paid + advance, due)
-        if due <= 0 and paid <= 0:
-            status = None
-        elif covered >= due:
-            status = "Paid"
-        elif covered > 0:
-            status = "Less paid"
-        elif any(day <= min(selected, today) for day, _ in period_rows) and not (entered and start <= entered <= end):
-            status = "Not paid"
-        else:
-            status = "Upcoming"  # nothing due yet in this cycle, or an existing loan entered during this cycle
-        # ---- pending as on the selected date (oldest instalments are cleared first) ----
-        left = sum((amount for day, amount in collections if day <= selected), zero) + carry
-        pending_count, pending_amount, pending_since = 0, zero, None
-        for day, amount in schedule:
-            if day > selected:
-                break
-            if left >= amount:
-                left -= amount
-                continue
-            pending_count += 1
-            pending_amount += amount - left
-            pending_since = pending_since or day
-            left = zero
-        if entered and pending_since == entered and pending_count == 1 and selected == entered:
-            pending_count, pending_amount, pending_since = 0, zero, None  # entered today: not late yet
-        if loan.get("status") == "Closed" or Decimal(str(loan.get("balance", 0))) <= 0:
-            pending_count, pending_amount, pending_since = 0, zero, None
-        elif selected >= today:
-            pending_amount = min(pending_amount, Decimal(str(loan.get("balance", 0))))
-        if status is None and pending_count == 0:
+        entered = parse_date(loan["entered_at"]).astimezone(BUSINESS_TIMEZONE).date() if loan.get("existing_loan") and loan.get("entered_at") else None
+        if entered and selected < entered:
             continue
-        last = collections[-1] if collections else None
+        schedule_doc = cache["loan_schedules"].get((loan["loan_id"], int(loan.get("schedule_version", 1))))
+        cycle = payment_cycle(loan, repayment_rows(loan, schedule_doc), live(cache["payments"].get(loan["loan_id"], [])),
+                              live(cache["part_payments"].get(loan["loan_id"], [])), selected, today, loan.get("balance", 0))
+        if cycle["status"] is None and cycle["pending_count"] == 0:
+            continue
         client = customers.get(loan["customer_id"], {})
         code = area_code_of(client)
         rows.append({
             "loan_id": loan["loan_id"], "customer_id": loan["customer_id"], "customer_name": client.get("name", loan["customer_id"]),
-            "mobile": client.get("mobile", ""), "area": code, "area_name": area_names.get(code, code),
-            "frequency": plan, "unit": UNIT_WORD[plan], "period": period, "period_start": start.isoformat(), "period_end": end.isoformat(),
-            "instalment": float(schedule[0][1]) if schedule else 0.0,
-            "scheduled": float(due), "paid": float(paid), "paid_in_advance": float(min(advance, due)),
-            "short": float(max(due - covered, zero)), "status": status,
-            "pending_count": pending_count, "pending_amount": float(pending_amount),
-            "pending_since": pending_since.isoformat() if pending_since else None,
-            "last_paid_on": last[0].isoformat() if last else None, "last_paid_amount": float(last[1]) if last else None,
+            "mobile": client.get("mobile", ""), "area": code, "area_name": area_names.get(code, code), "borrow_date": loan.get("borrow_date"),
+            "frequency": cycle["plan"], "unit": cycle["unit"], "period": cycle["period"], "period_start": cycle["period_start"], "period_end": cycle["period_end"],
+            "instalment": cycle["instalment"], "scheduled": cycle["due"], "paid": cycle["paid"], "short": cycle["short"], "status": cycle["status"] if cycle["status"] != "Closed" else None,
+            "pending_count": cycle["pending_count"], "pending_amount": cycle["pending_amount"], "pending_since": cycle["pending_since"],
+            "next_due_date": cycle["next_due_date"], "last_paid_on": cycle["last_paid_on"], "last_paid_amount": cycle["last_paid_amount"],
             "existing_loan": bool(loan.get("existing_loan")),
         })
-    order = {"Not paid": 0, "Less paid": 1, "Upcoming": 2, "Paid": 3}
-    rows.sort(key=lambda r: (order.get(r["status"], 4), r["customer_name"]))
+    order = {"Not paid": 0, "Less paid": 1, "Upcoming": 2, "Paid early": 3, "Paid": 4}
+    rows = [r for r in rows if r["status"] or r["pending_count"]]
+    rows.sort(key=lambda r: (order.get(r["status"], 5), r["customer_name"]))
     return {"date": selected.isoformat(), "today": today.isoformat(), "rows": rows}
 
 

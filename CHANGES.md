@@ -168,3 +168,12 @@ Files: server/main.py, client/src/main.jsx, client/src/styles.css
 - Payment status: that day's instalment for daily loans, that week's for weekly, that month's for monthly - Paid / Less paid / Not paid / Upcoming.
 - Speed: previous results stay on screen while a new date loads (no blank flash), long lists show 50 rows at a time, the main dashboard no longer computes the old unused pending list.
 - Fix: MongoDB list reads were capped at 10,000 records, so with many payments the paid totals and statuses were silently understated across the app. The cap is removed.
+
+## Round 10 - Payment status reworked across the app - DONE
+
+- One payment-status rule used everywhere (Collections, Customer 360, Loans, Dashboard): money paid in a day / week / month first pays that period's instalment; anything extra clears older unpaid instalments, then pays the next ones early.
+- Paying this month's EMI marks the month "Paid this month" and moves the next due date to next month (daily: paid today -> next due tomorrow). Older unpaid periods are shown separately as "N days / weeks / months pending".
+- Prepayment ("paid early") now works: money paid ahead moves the next due date forward and the covered period shows "Paid early".
+- A shortfall of Rs 1 or less (rounding) counts as paid.
+- Collections: shows the borrow date under the customer, and "Paid this month / Not paid today / Less paid this week" instead of "No payment recorded today", with next due date and pending count.
+- Customer 360 and Loans: each loan shows its status for the current period and how much is pending.
